@@ -317,12 +317,16 @@ struct IntegrationSuite: AsyncParsableCommand {
         // container on the failure path too (see RuncTests), or this unlinks
         // the clones out from under a still-running VM.
         if self.maxConcurrency == 1 {
-            let preserve = fsPath.absolutePath()
+            // contentsOfDirectory reports paths under /private, while testDir is
+            // built from FileManager's /var view of the same directory, so both
+            // sides are resolved before comparing.
+            let preserve = fsPath.resolvingSymlinksInPathWithPrivate().absolutePath()
             if let entries = try? FileManager.default.contentsOfDirectory(
                 at: Self.testDir,
                 includingPropertiesForKeys: nil
             ) {
-                for url in entries where url.absolutePath() != preserve {
+                for url in entries
+                where url.resolvingSymlinksInPathWithPrivate().absolutePath() != preserve {
                     try? FileManager.default.removeItem(at: url)
                 }
             }
