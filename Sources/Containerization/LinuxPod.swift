@@ -148,6 +148,10 @@ public final class LinuxPod: Sendable {
         /// Run the container with a minimal init process that handles signal
         /// forwarding and zombie reaping.
         public var useInit: Bool = false
+        /// Hooks the runtime specification carries for the container. An OCI
+        /// runtime is what runs them, so they take effect when the pod is
+        /// given an ``Configuration/ociRuntimePath``.
+        public var hooks: ContainerizationOCI.Hooks? = nil
 
         public init() {}
     }
@@ -423,6 +427,7 @@ public final class LinuxPod: Sendable {
         if let hostname = config.hostname ?? self.config.hostname {
             spec.hostname = hostname
         }
+        spec.hooks = config.hooks
 
         // Linux toggles
         spec.linux?.sysctl = config.sysctl
