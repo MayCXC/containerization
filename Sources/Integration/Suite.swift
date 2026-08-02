@@ -484,6 +484,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             // Process basics
             Test("process true", testProcessTrue),
             Test("process false", testProcessFalse),
+            Test("container cgroup delegation", testContainerCgroupDelegation),
             Test("process echo hi", testProcessEchoHi),
             Test("process no executable", testProcessNoExecutable),
             Test("process user", testProcessUser),
@@ -595,6 +596,7 @@ struct IntegrationSuite: AsyncParsableCommand {
 
             // Pods
             Test("pod single container", testPodSingleContainer),
+            Test("pod cgroup delegation", testPodCgroupDelegation),
             Test("pod multiple containers", testPodMultipleContainers),
             Test("pod container output", testPodContainerOutput),
             Test("pod concurrent containers", testPodConcurrentContainers),

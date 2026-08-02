@@ -92,6 +92,11 @@ public final class LinuxPod: Sendable {
         public var cpus: Int = 4
         /// The container's memory cgroup limit in bytes. May exceed the pod's VM for oversubscription.
         public var memoryInBytes: UInt64 = 1024.mib()
+        /// Hand this container's cgroup to the user it runs as, so that what
+        /// runs inside can place its own work under limits of its own. The
+        /// user is given the cgroup it is placed in and nothing above it, so
+        /// the limits the pod and this container were given still bind.
+        public var cgroupDelegation: Bool = false
         /// The hostname for the container.
         public var hostname: String?
         /// The system control options for the container.
@@ -394,6 +399,11 @@ public final class LinuxPod: Sendable {
         }
 
         // Linux toggles
+        if config.cgroupDelegation {
+            var annotations = spec.annotations ?? [:]
+            annotations[AnnotationKeys.containerizationCgroupDelegation] = "true"
+            spec.annotations = annotations
+        }
         spec.linux?.sysctl = config.sysctl
         spec.linux?.maskedPaths = config.maskedPaths
         spec.linux?.readonlyPaths = config.readonlyPaths
