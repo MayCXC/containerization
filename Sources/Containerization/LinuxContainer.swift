@@ -133,6 +133,13 @@ public final class LinuxContainer: Container, Sendable {
         /// when the container runs under an external OCI runtime. The default
         /// launcher is not one, so they have no effect on that path.
         public var hooks: ContainerizationOCI.Hooks? = nil
+        /// Devices the container should be given, with the permissions it
+        /// should see them under.
+        ///
+        /// A device already present in the container's /dev arrives with the
+        /// kernel's permissions, which are stricter than the ones a machine
+        /// running udev would show. Naming it here is how those are asked for.
+        public var devices: [ContainerizationOCI.LinuxDevice] = []
 
         /// Optional swap area for the container, as a block device mount.
         ///
@@ -487,6 +494,7 @@ public final class LinuxContainer: Container, Sendable {
         spec.process = config.process.toOCI()
 
         spec.hooks = config.hooks
+        spec.linux?.devices = config.devices
 
         // Wrap with init process if requested.
         if config.useInit {
