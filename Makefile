@@ -491,6 +491,19 @@ cleancontent:
 	@echo Cleaning the content...
 	@rm -rf ~/Library/Application\ Support/com.apple.containerization
 
+# What fetch-default-kernel downloaded and unpacked, which is the archive, the
+# tree taken out of it, and the kernel copied from that tree. Fetching again
+# rebuilds all of it. The source checkouts under .local are left alone: this
+# project asks for those to be cloned deliberately and refuses to build without
+# them, so they are not ours to remove.
+.PHONY: cleankernel
+cleankernel:
+	@echo Cleaning the fetched kernel...
+	@rm -f .local/kata.tar .local/kata.tar.gz
+	@rm -rf .local/opt
+	@rm -f .local/vmlinux-$(KERNEL_ARCH)
+	@rm -f bin/vmlinux-$(KERNEL_ARCH)
+
 .PHONY: examples
 examples:
 	@echo Building examples...
