@@ -1,0 +1,138 @@
+From e6daf5dc98b8621817e163e423339046dfd0789f Mon Sep 17 00:00:00 2001
+From: Aaron Paterson <apaterson@pm.me>
+Date: Wed, 5 Aug 2026 02:32:51 +0000
+Subject: [PATCH] virtiofs: report a request refused for a live nodeid as stale
+
+A request naming a nodeid and nothing else is only sent for an inode the
+client has looked up and holds a reference to, and the server owes the
+client that inode until it is sent FUSE_FORGET. ENOENT to such a request
+describes a handle the server was obliged to honour rather than
+something that has gone away, and the caller cannot tell the difference.
+
+Report it at request completion so the caller can recover.
+
+The opens say EOPENSTALE, which is what an open says when the cached
+information it started from has gone stale. path_openat() decides what
+that means for the walk in progress, answering ECHILD under LOOKUP_RCU
+so it drops to REF-walk and ESTALE otherwise so the name is resolved
+again under LOOKUP_REVAL. NFS reports its own stale opens the same way.
+
+The rest say ESTALE, which retry_estale() answers by repeating the
+lookup once under LOOKUP_REVAL. fs/namei.c, fs/open.c, fs/stat.c,
+fs/statfs.c, fs/utimes.c and fs/xattr.c all reach it. EOPENSTALE would
+be wrong for these, since path_openat() is the only place that
+translates it and nothing would outside an open.
+
+Converted: FUSE_OPEN, FUSE_OPENDIR, FUSE_GETATTR, FUSE_SETATTR,
+FUSE_READLINK and FUSE_STATFS, the last sending no payload beside the
+nodeid.
+
+Not converted:
+
+- Requests carrying a name, where ENOENT is ambiguous and is often what
+  the caller asked to be told. FUSE_LOOKUP reports a missing name in a
+  living directory and the directory operations carry a parent nodeid
+  beside one. The xattr requests carry an attribute name, and a server
+  answering ENOENT rather than ENODATA for a missing attribute would
+  have a correct reply turned into a retry that cannot succeed.
+
+- Requests against an already open descriptor, which have no equivalent
+  retry to reach, and FUSE_IOCTL and FUSE_POLL, which hand the server's
+  errno to userspace verbatim.
+
+commit 68b69fa0edb2 ("virtiofs: add FUSE protocol validation") already inspects
+replies at this point for servers that break the protocol. Nodeid
+lifetime is another rule a server can break.
+
+Found with a server that releases an inode as soon as a rename displaces
+the name it was looked up by, where roughly one open in eight during a
+rename race is refused while stat continues to describe the file.
+
+Signed-off-by: Aaron Paterson <apaterson@pm.me>
+---
+ fs/fuse/virtio_fs.c | 62 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
+
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+index df25d4faca41..b15152478a58 100644
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -780,6 +780,66 @@ static bool virtio_fs_verify_response(struct fuse_req *req, unsigned int len)
+ 	return true;
+ }
+ 
++/*
++ * Report a request refused for a live nodeid as stale.
++ *
++ * These requests carry a nodeid and no name, so the client only sends them for
++ * an inode it has already looked up and holds a reference to, and a server owes
++ * the client that inode until it is sent FUSE_FORGET. A server answering with
++ * ENOENT is describing a handle it was obliged to honour rather than a name
++ * that has gone away, and the caller has no reason to doubt it.
++ *
++ * Saying the handle is stale is something the caller knows how to answer: it
++ * repeats the lookup under LOOKUP_REVAL and acts on whatever the name refers to
++ * now. A name that genuinely has gone fails the retried lookup, so a caller
++ * still learns it is gone. retry_estale() is what does this, and fs/namei.c,
++ * fs/open.c, fs/stat.c, fs/statfs.c, fs/utimes.c and fs/xattr.c all reach it,
++ * which is what makes the conversion useful rather than a rename of the error.
++ *
++ * A request that names something which can itself be absent is left alone,
++ * because ENOENT is then ambiguous and is frequently the answer the caller
++ * asked for. FUSE_LOOKUP reports a missing name in a living directory and the
++ * directory operations carry a parent nodeid beside one, so neither can be
++ * read as a statement about the inode. The extended attribute requests belong
++ * with them: they carry an attribute name, and while a server should report a
++ * missing attribute as ENODATA, one that answers ENOENT instead would have a
++ * correct reply turned into a retry that cannot succeed.
++ *
++ * Requests against an already open descriptor are also left alone, since there
++ * is no equivalent retry to reach and converting the error would rename a
++ * failure rather than repair it, and FUSE_IOCTL and FUSE_POLL hand the
++ * server's errno to userspace verbatim.
++ */
++static void virtio_fs_fixup_stale_error(struct fuse_req *req)
++{
++	if (req->out.h.error != -ENOENT)
++		return;
++
++	switch (req->in.h.opcode) {
++	case FUSE_OPEN:
++	case FUSE_OPENDIR:
++		/*
++		 * An open says EOPENSTALE, and path_openat() decides what the
++		 * walk in progress should make of it: ECHILD under LOOKUP_RCU
++		 * so it drops to REF-walk, ESTALE otherwise so the name is
++		 * resolved again under LOOKUP_REVAL. Naming ESTALE here would
++		 * take the second in both cases and skip a cheaper retry.
++		 */
++		req->out.h.error = -EOPENSTALE;
++		break;
++	case FUSE_GETATTR:
++	case FUSE_SETATTR:
++	case FUSE_READLINK:
++	case FUSE_STATFS:
++		/*
++		 * Nothing translates EOPENSTALE outside the open path, so
++		 * these say ESTALE directly, which retry_estale() answers.
++		 */
++		req->out.h.error = -ESTALE;
++		break;
++	}
++}
++
+ /* Work function for request completion */
+ static void virtio_fs_request_complete(struct fuse_req *req,
+ 				       struct virtio_fs_vq *fsvq)
+@@ -810,6 +870,8 @@ static void virtio_fs_request_complete(struct fuse_req *req,
+ 
+ 	clear_bit(FR_SENT, &req->flags);
+ 
++	virtio_fs_fixup_stale_error(req);
++
+ 	fuse_request_end(req);
+ 	spin_lock(&fsvq->lock);
+ 	dec_in_flight_req(fsvq);
+-- 
+2.55.0.553.g4ad8c266be
+
