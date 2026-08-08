@@ -245,6 +245,7 @@ private final class StubVirtualMachineAgent: VirtualMachineAgent {
 
     func standardSetup() async throws {}
     func filesystemOperation(operation: FilesystemOperation, path: String, containerID: String?) async throws {}
+    func sysctl(settings: [String: String]) async throws {}
     func getenv(key: String) async throws -> String { "" }
     func setenv(key: String, value: String) async throws {}
     func mount(_ mount: ContainerizationOCI.Mount) async throws {}
