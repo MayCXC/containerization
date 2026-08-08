@@ -76,6 +76,14 @@ public final class LinuxPod: Sendable {
         /// The default hosts file configuration for all containers in the pod.
         /// Individual containers can override this by setting their own `hosts` configuration.
         public var hosts: Hosts?
+        /// The system control options for the pod.
+        ///
+        /// Its containers share one kernel, so a container cannot set a kernel
+        /// parameter for itself alone: the runtime interface carries sysctls on
+        /// the sandbox for that reason, and they are applied once, before any
+        /// container in the pod starts.
+        /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+        public var sysctl: [String: String] = [:]
         /// Volumes attached to the pod. Can be shared with multiple containers.
         public var volumes: [PodVolume] = []
         /// EXPERIMENTAL: Path in the root filesystem for the virtual machine
@@ -1004,6 +1012,13 @@ extension LinuxPod {
                                 agent: agent
                             )
                         }
+                    }
+
+                    // The pod's kernel parameters are set once, before any of
+                    // its containers start, because they share the kernel these
+                    // apply to.
+                    if !self.config.sysctl.isEmpty {
+                        try await agent.sysctl(settings: self.config.sysctl)
                     }
 
                     // For every interface asked for:
