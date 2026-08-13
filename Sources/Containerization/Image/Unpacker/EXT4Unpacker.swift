@@ -139,11 +139,16 @@ public struct EXT4Unpacker: Unpacker {
 
         try filesystem.close()
         unpacked = true
+
+        // The filesystem lives in a sparse file that only gives freed blocks
+        // back to the host when the guest discards them, so the mount asks for
+        // continuous discard from birth. A read-only mount of it parses the
+        // option and leaves it idle.
         return .block(
             format: "ext4",
             source: cleanedPath,
             destination: "/",
-            options: []
+            options: ["discard"]
         )
     }
 
