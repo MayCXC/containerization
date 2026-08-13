@@ -828,9 +828,9 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
         let containerInode = finfo.st_ino
 
         if selfInode == containerInode {
-            try doFilesystemOperation(path: path, operation: operation)
+            return try doFilesystemOperation(path: path, operation: operation)
         } else {
-            try await self.runOnDedicatedThread {
+            return try await self.runOnDedicatedThread {
                 if unshare(CLONE_FS) != 0 {
                     let error = self.swiftErrno("unshare(CLONE_FS)")
                     throw RPCError(code: .internalError, message: "failed to unshare filesystem namespace", cause: error)
@@ -839,17 +839,17 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
                     let error = self.swiftErrno("setns(CLONE_NEWNS)")
                     throw RPCError(code: .internalError, message: "failed to enter container mount namespace", cause: error)
                 }
-                try self.doFilesystemOperation(path: path, operation: operation)
+                return try self.doFilesystemOperation(path: path, operation: operation)
             }
         }
-
-        return .init()
     }
 
+    /// Perform the operation on the path as seen from the calling thread's
+    /// mount namespace, answering with what the filesystem reported.
     private func doFilesystemOperation(
         path: FilePath,
         operation: Com_Apple_Containerization_Sandbox_V3_FilesystemOperationRequest.OneOf_Operation
-    ) throws {
+    ) throws -> Com_Apple_Containerization_Sandbox_V3_FilesystemOperationResponse {
         var finfo = _stat_struct()
         let rc = _stat(path.string, &finfo)
         if rc != 0 {
@@ -872,12 +872,15 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
             switch operation {
             case .freeze(_):
                 try freezeFilesystem(fd: fd)
+                return .init()
             case .thaw(_):
                 try thawFilesystem(fd: fd)
+                return .init()
             case .trim(let params):
                 switch params.schedule {
                 case .oneShot(_):
-                    try trimFilesystem(fd: fd)
+                    let trimmed = try trimFilesystem(fd: fd)
+                    return .with { $0.trim = .with { $0.trimmedBytes = trimmed } }
                 case .none:
                     throw RPCError(code: .invalidArgument, message: "trim schedule must be specified")
                 }
@@ -916,7 +919,14 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
         var min_len: UInt64
     }
 
-    private func trimFilesystem(fd: Int32) throws {
+    /// Discard the filesystem's free blocks, answering with the bytes it
+    /// reported discarding.
+    ///
+    /// The ioctl writes the count back into the range it was given, which is
+    /// the filesystem's own account of what the trim returned and the only
+    /// one there is.
+    /// https://man7.org/linux/man-pages/man2/ioctl_fitrim.2.html
+    private func trimFilesystem(fd: Int32) throws -> UInt64 {
         let FITRIM: UInt = 0xC018_5879
         var trange = fitrim_range(start: 0, len: UInt64.max, min_len: 0)
         let rc: CInt = ioctl(fd, FITRIM, &trange)
@@ -924,6 +934,7 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
             let error = swiftErrno("ioctl(FITRIM)")
             throw RPCError(code: .internalError, message: "trim failed", cause: error)
         }
+        return trange.len
     }
 
     public func umount(request: Com_Apple_Containerization_Sandbox_V3_UmountRequest, context: GRPCCore.ServerContext)
