@@ -142,6 +142,15 @@ public final class LinuxContainer: Container, Sendable {
         /// on top of the container's configured `memoryInBytes` value.
         /// The total is aligned to a 1 MiB boundary.
         public var memoryOverhead: UInt64 = 128.mib()
+        /// Return memory the guest has freed to the host while the container
+        /// runs, instead of leaving it held until the host is under pressure.
+        /// A loop watches what the container holds and asks the machine to
+        /// hold that plus headroom, backing off when the guest refaults. The
+        /// cloud-hypervisor backend reports freed pages to the host
+        /// continuously whether or not this is set.
+        public var proactiveMemoryReclaim: Bool = false
+        /// How often the reclaim loop looks at the guest.
+        public var memoryReclaimInterval: Duration = .seconds(10)
 
         /// Optional swap area for the container, as a block device mount.
         ///
@@ -227,6 +236,8 @@ public final class LinuxContainer: Container, Sendable {
             let vm: any VirtualMachineInstance
             let relayManager: UnixSocketRelayManager
             var fileMountContext: FileMountContext
+            let reclaimer: MemoryReclaimer?
+            let reclaimTask: Task<Void, Never>?
         }
 
         struct StartedState: Sendable {
@@ -235,6 +246,8 @@ public final class LinuxContainer: Container, Sendable {
             let relayManager: UnixSocketRelayManager
             var vendedProcesses: [String: LinuxProcess]
             let fileMountContext: FileMountContext
+            let reclaimer: MemoryReclaimer?
+            let reclaimTask: Task<Void, Never>?
 
             init(_ state: CreatedState, process: LinuxProcess) {
                 self.vm = state.vm
@@ -242,6 +255,8 @@ public final class LinuxContainer: Container, Sendable {
                 self.process = process
                 self.vendedProcesses = [:]
                 self.fileMountContext = state.fileMountContext
+                self.reclaimer = state.reclaimer
+                self.reclaimTask = state.reclaimTask
             }
 
             init(_ state: PausedState) {
@@ -250,6 +265,8 @@ public final class LinuxContainer: Container, Sendable {
                 self.process = state.process
                 self.vendedProcesses = state.vendedProcesses
                 self.fileMountContext = state.fileMountContext
+                self.reclaimer = state.reclaimer
+                self.reclaimTask = state.reclaimTask
             }
         }
 
@@ -259,6 +276,8 @@ public final class LinuxContainer: Container, Sendable {
             let process: LinuxProcess
             var vendedProcesses: [String: LinuxProcess]
             let fileMountContext: FileMountContext
+            let reclaimer: MemoryReclaimer?
+            let reclaimTask: Task<Void, Never>?
 
             init(_ state: StartedState) {
                 self.vm = state.vm
@@ -266,6 +285,8 @@ public final class LinuxContainer: Container, Sendable {
                 self.process = state.process
                 self.vendedProcesses = state.vendedProcesses
                 self.fileMountContext = state.fileMountContext
+                self.reclaimer = state.reclaimer
+                self.reclaimTask = state.reclaimTask
             }
         }
 
@@ -865,7 +886,40 @@ extension LinuxContainer {
                     }
 
                 }
-                state = .created(.init(vm: vm, relayManager: relayManager, fileMountContext: fileMountContextHolder.withLock { $0 }))
+                var reclaimer: MemoryReclaimer? = nil
+                var reclaimTask: Task<Void, Never>? = nil
+                if self.config.proactiveMemoryReclaim {
+                    let machineReclaimer = MemoryReclaimer(ceiling: vmMemory)
+                    reclaimer = machineReclaimer
+                    let interval = self.config.memoryReclaimInterval
+                    let containerID = self.id
+                    reclaimTask = Task {
+                        await machineReclaimer.run(interval: interval) {
+                            let stats = try await vm.withAgent { agent in
+                                try await agent.containerStatistics(containerIDs: [containerID], categories: .memory)
+                            }
+                            var anon: UInt64 = 0
+                            var refaultAnon: UInt64 = 0
+                            for stat in stats {
+                                guard let memory = stat.memory else { continue }
+                                anon += memory.anon
+                                refaultAnon += memory.workingsetRefaultAnon
+                            }
+                            return (anon, refaultAnon)
+                        } apply: { target in
+                            try await self.setTargetMemorySize(target)
+                        }
+                    }
+                }
+                state = .created(
+                    .init(
+                        vm: vm,
+                        relayManager: relayManager,
+                        fileMountContext: fileMountContextHolder.withLock { $0 },
+                        reclaimer: reclaimer,
+                        reclaimTask: reclaimTask
+                    )
+                )
             } catch {
                 try? await relayManager.stopAll()
                 try? await vm.stop()
@@ -971,16 +1025,20 @@ extension LinuxContainer {
 
             let vm: any VirtualMachineInstance
             let relayManager: UnixSocketRelayManager
+            let reclaimTask: Task<Void, Never>?
 
             let startedState = try? state.startedState("stop")
             if let startedState {
                 vm = startedState.vm
                 relayManager = startedState.relayManager
+                reclaimTask = startedState.reclaimTask
             } else {
                 let createdState = try state.createdState("stop")
                 vm = createdState.vm
                 relayManager = createdState.relayManager
+                reclaimTask = createdState.reclaimTask
             }
+            reclaimTask?.cancel()
 
             var firstError: Error?
             do {
@@ -1213,6 +1271,44 @@ extension LinuxContainer {
             try state.vm("withVirtualMachineInstance")
         }
         return try await fn(vm)
+    }
+
+    /// Ask the machine to hold no more than `bytes`. The balloon takes the
+    /// difference from the guest, and hands it back when the target is raised
+    /// again, so nothing changes until the guest has acted on the request.
+    ///
+    /// The guest's free memory is gathered together first, which is what
+    /// Virtualization asks for before the device is driven.
+    public func setTargetMemorySize(_ bytes: UInt64) async throws {
+        let vm = try await self.state.withLock { state in
+            try state.vm("setTargetMemorySize")
+        }
+        try await vm.compactGuestMemory()
+        try await vm.setTargetMemorySize(bytes)
+    }
+
+    /// How the machine's proactive reclaim has been going, or nil when the
+    /// container runs without it.
+    public func memoryReclaimReport() async throws -> MemoryReclaimer.Report? {
+        let reclaimer = try await self.state.withLock { state -> MemoryReclaimer? in
+            switch state {
+            case .created(let createdState):
+                return createdState.reclaimer
+            case .started(let startedState):
+                return startedState.reclaimer
+            case .paused(let pausedState):
+                return pausedState.reclaimer
+            case .errored(let err):
+                throw err
+            default:
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "failed to memoryReclaimReport: container must be created"
+                )
+            }
+        }
+        guard let reclaimer else { return nil }
+        return await reclaimer.currentReport()
     }
 
     /// Close the containers standard input to signal no more input is

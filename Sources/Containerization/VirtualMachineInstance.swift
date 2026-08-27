@@ -96,6 +96,15 @@ public protocol VirtualMachineInstance: Sendable {
     /// Release virtiofs shares for a container.
     /// - Parameter id: The container ID whose virtiofs shares should be released
     func releaseVirtioFS(id: String) async throws
+
+    /// Set how much memory the running virtual machine should hold.
+    ///
+    /// Lowering it hands memory back to the host, which is the only way to
+    /// recover pages the guest has touched and since freed. Raising it returns
+    /// memory to the guest. Throws if the VMM has no memory balloon.
+    /// - Parameter bytes: The size the virtual machine should hold, which must
+    ///   not exceed the size it was created with.
+    func setTargetMemorySize(_ bytes: UInt64) async throws
 }
 
 extension VirtualMachineInstance {
@@ -120,5 +129,19 @@ extension VirtualMachineInstance {
     }
     public func releaseVirtioFS(id: String) async throws {
         // no-op default
+    }
+    public func setTargetMemorySize(_ bytes: UInt64) async throws {
+        throw ContainerizationError(.unsupported, message: "memory balloon not supported")
+    }
+
+    /// Gather the guest's free memory into contiguous runs.
+    ///
+    /// Virtualization asks for this before the balloon is driven, so that the
+    /// pages the guest gives up sit together well enough to be worth taking.
+    /// https://developer.apple.com/documentation/virtualization/vzvirtiotraditionalmemoryballoondevice
+    public func compactGuestMemory() async throws {
+        try await withAgent { agent in
+            try await agent.sysctl(settings: ["vm.compact_memory": "1"])
+        }
     }
 }

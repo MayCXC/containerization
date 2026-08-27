@@ -552,6 +552,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("container mount propagation", testContainerMountPropagation),
             Test("container systemd", testContainerSystemd),
             Test("declared devices", testContainerDeclaredDevices),
+            Test("container memory balloon", testContainerMemoryBalloon),
             Test("process echo hi", testProcessEchoHi),
             Test("process no executable", testProcessNoExecutable),
             Test("process user", testProcessUser),
@@ -732,6 +733,11 @@ struct IntegrationSuite: AsyncParsableCommand {
 
                 // Nested virtualization (VZ-only feature)
                 Test("nested virt", testNestedVirtualizationEnabled),
+
+                // Proactive memory reclaim (VZ balloon loop), asserted on the
+                // reclaimer's own report of what it saw and did
+                Test("pod reclaim follows the guest", testPodReclaimFollowsTheGuest),
+                Test("pod reclaim busy", testPodReclaimBusy),
 
                 // Filesystem operations (TODO: promote to cross-platform once verified on CH)
                 Test("container frozen ext4 clone", testFrozenExt4Clone),

@@ -53,6 +53,15 @@ public final class LinuxPod: Sendable {
         /// their own. The `destination` field is ignored, as the area is
         /// enabled rather than mounted.
         public var swapLayer: Mount? = nil
+        /// Return memory the guest has freed to the host while the pod runs,
+        /// instead of leaving it held until the host is under pressure. A
+        /// loop watches what the pod's containers hold and asks the machine
+        /// to hold that plus headroom, backing off when the guest refaults.
+        /// The cloud-hypervisor backend reports freed pages to the host
+        /// continuously whether or not this is set.
+        public var proactiveMemoryReclaim: Bool = false
+        /// How often the reclaim loop looks at the guest.
+        public var memoryReclaimInterval: Duration = .seconds(10)
         /// The network interfaces for the pod.
         public var interfaces: [any Interface] = []
         /// Whether nested virtualization should be turned on for the pod.
@@ -279,6 +288,8 @@ public final class LinuxPod: Sendable {
         struct CreatedState: Sendable {
             let vm: any VirtualMachineInstance
             let relayManager: UnixSocketRelayManager
+            let reclaimer: MemoryReclaimer?
+            let reclaimTask: Task<Void, Never>?
         }
 
         func createdState(_ operation: String) throws -> CreatedState {
@@ -1043,7 +1054,29 @@ extension LinuxPod {
                     state.containers[id]?.state = .created
                 }
 
-                state.phase = .created(.init(vm: vm, relayManager: relayManager))
+                var reclaimer: MemoryReclaimer? = nil
+                var reclaimTask: Task<Void, Never>? = nil
+                if self.config.proactiveMemoryReclaim {
+                    let machineReclaimer = MemoryReclaimer(ceiling: self.config.memoryInBytes)
+                    reclaimer = machineReclaimer
+                    let interval = self.config.memoryReclaimInterval
+                    reclaimTask = Task {
+                        await machineReclaimer.run(interval: interval) {
+                            let stats = try await self.statistics(categories: .memory)
+                            var anon: UInt64 = 0
+                            var refaultAnon: UInt64 = 0
+                            for stat in stats {
+                                guard let memory = stat.memory else { continue }
+                                anon += memory.anon
+                                refaultAnon += memory.workingsetRefaultAnon
+                            }
+                            return (anon, refaultAnon)
+                        } apply: { target in
+                            try await self.setTargetMemorySize(target)
+                        }
+                    }
+                }
+                state.phase = .created(.init(vm: vm, relayManager: relayManager, reclaimer: reclaimer, reclaimTask: reclaimTask))
             } catch {
                 try? await relayManager.stopAll()
                 try? await vm.stop()
@@ -1334,6 +1367,7 @@ extension LinuxPod {
             let createdState = try state.phase.createdState("stop")
 
             do {
+                createdState.reclaimTask?.cancel()
                 try await createdState.relayManager.stopAll()
 
                 // Stop all containers
@@ -1530,6 +1564,16 @@ extension LinuxPod {
         return stats
     }
 
+    /// How the machine's proactive reclaim has been going, or nil when the
+    /// pod runs without it.
+    public func memoryReclaimReport() async throws -> MemoryReclaimer.Report? {
+        let createdState = try await self.state.withLock { state in
+            try state.phase.createdState("memoryReclaimReport")
+        }
+        guard let reclaimer = createdState.reclaimer else { return nil }
+        return await reclaimer.currentReport()
+    }
+
     /// Dial a vsock port in the pod's VM.
     public func dialVsock(port: UInt32) async throws -> FileHandle {
         try await self.state.withLock { state in
@@ -1550,6 +1594,22 @@ extension LinuxPod {
             try state.phase.createdState("withVirtualMachineInstance").vm
         }
         return try await fn(vm)
+    }
+
+    /// Ask the machine to hold no more than `bytes`. The balloon takes the
+    /// difference from the guest, and hands it back when the target is raised
+    /// again, so nothing changes until the guest has acted on the request.
+    ///
+    /// The pod's containers share the machine's memory, so this bounds all of
+    /// them together rather than any one of them. The guest's free memory is
+    /// gathered together first, which is what Virtualization asks for before
+    /// the device is driven.
+    public func setTargetMemorySize(_ bytes: UInt64) async throws {
+        let vm = try await self.state.withLock { state in
+            try state.phase.createdState("setTargetMemorySize").vm
+        }
+        try await vm.compactGuestMemory()
+        try await vm.setTargetMemorySize(bytes)
     }
 
     // Perform filesystem operations in a container.
