@@ -2445,4 +2445,205 @@ extension IntegrationSuite {
         }
     }
     #endif
+
+    /// A container in a pod given a writable layer writes into it, and the
+    /// image it was built from is left as it is for the pod's others.
+    /// Add a container with a writable layer to a pod whose machine is
+    /// already running: the overlay assembles from the two disks attached
+    /// while it runs, and writes land in the layer.
+    func testPodHotplugWritableLayer() async throws {
+        let id = "test-pod-hotplug-writable-layer"
+        let bs = try await bootstrap(id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 4
+            config.memoryInBytes = 1024.mib()
+            config.bootLog = bs.bootLog
+        }
+
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+        }
+
+        try await pod.create()
+
+        let writableLayerPath = Self.testDir.appending(component: "\(id)-writable.ext4")
+        try? FileManager.default.removeItem(at: writableLayerPath)
+        let filesystem = try EXT4.Formatter(FilePath(writableLayerPath.absolutePath()), minDiskSize: 512.mib())
+        try filesystem.close()
+        let writableLayer = Mount.block(
+            format: "ext4",
+            source: writableLayerPath.absolutePath(),
+            destination: "/",
+            options: []
+        )
+
+        let buffer = BufferWriter()
+        try await pod.addContainer(
+            "hot",
+            rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "hot"),
+            writableLayer: writableLayer
+        ) { config in
+            config.process.arguments = ["/bin/sh", "-c", "echo 'written into a layer added while running' > /written && cat /written"]
+            config.process.stdout = buffer
+        }
+
+        do {
+            try await pod.startContainer("hot")
+            let status = try await pod.waitContainer("hot")
+
+            try await pod.stopContainer("hot")
+            try await pod.stop()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "hot container status \(status) != 0")
+            }
+            let expected = "written into a layer added while running"
+            guard let output = String(data: buffer.data, encoding: .utf8),
+                output.trimmingCharacters(in: .whitespacesAndNewlines) == expected
+            else {
+                throw IntegrationError.assert(
+                    msg: "expected '\(expected)', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
+            }
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    func testPodWritableLayer() async throws {
+        let id = "test-pod-writable-layer"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 4
+            config.memoryInBytes = 1024.mib()
+            config.bootLog = bs.bootLog
+        }
+
+        let writableLayerPath = Self.testDir.appending(component: "\(id)-writable.ext4")
+        try? FileManager.default.removeItem(at: writableLayerPath)
+        let filesystem = try EXT4.Formatter(FilePath(writableLayerPath.absolutePath()), minDiskSize: 512.mib())
+        try filesystem.close()
+        let writableLayer = Mount.block(
+            format: "ext4",
+            source: writableLayerPath.absolutePath(),
+            destination: "/",
+            options: []
+        )
+
+        let buffer = BufferWriter()
+        try await pod.addContainer(
+            "layered",
+            rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "layered"),
+            writableLayer: writableLayer
+        ) { config in
+            config.process.arguments = ["/bin/sh", "-c", "echo 'writable layer test' > /tmp/testfile && cat /tmp/testfile"]
+            config.process.stdout = buffer
+        }
+
+        do {
+            try await pod.create()
+            try await pod.startContainer("layered")
+            let status = try await pod.waitContainer("layered")
+            try await pod.stop()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "process failed with status \(status)")
+            }
+            guard let output = String(data: buffer.data, encoding: .utf8) else {
+                throw IntegrationError.assert(msg: "failed to convert stdout to UTF8")
+            }
+            guard output.trimmingCharacters(in: .whitespacesAndNewlines) == "writable layer test" else {
+                throw IntegrationError.assert(msg: "unexpected output: \(output)")
+            }
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// A file copied into one container in a pod arrives in that container and
+    /// nowhere else, and comes back out with what it held.
+    func testPodCopyRoundTrip() async throws {
+        let id = "test-pod-copy-round-trip"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 4
+            config.memoryInBytes = 1024.mib()
+            config.bootLog = bs.bootLog
+        }
+
+        let testContent = "Hello from the host! This is a pod copy test."
+        let hostDirectory = FileManager.default.uniqueTemporaryDirectory(create: true)
+        let hostFile = hostDirectory.appendingPathComponent("test-input.txt")
+        try testContent.write(to: hostFile, atomically: true, encoding: .utf8)
+
+        try await pod.addContainer("holder", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "holder")) { config in
+            config.process.arguments = ["sleep", "100"]
+        }
+        try await pod.addContainer("bystander", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "bystander")) { config in
+            config.process.arguments = ["sleep", "100"]
+        }
+
+        do {
+            try await pod.create()
+            try await pod.startContainer("holder")
+            try await pod.startContainer("bystander")
+
+            try await pod.copyIn(
+                "holder",
+                from: hostFile,
+                to: URL(filePath: "/tmp/copied-file.txt")
+            )
+
+            let buffer = BufferWriter()
+            let exec = try await pod.execInContainer("holder", processID: "verify-copy") { config in
+                config.arguments = ["cat", "/tmp/copied-file.txt"]
+                config.stdout = buffer
+            }
+            try await exec.start()
+            let status = try await exec.wait()
+            try await exec.delete()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "cat in the container copied into failed with status \(status)")
+            }
+            guard String(data: buffer.data, encoding: .utf8) == testContent else {
+                throw IntegrationError.assert(
+                    msg: "expected '\(testContent)', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
+            }
+
+            // The containers share a machine and not a filesystem, so the copy
+            // reached one of them alone.
+            let bystander = try await pod.execInContainer("bystander", processID: "verify-absent") { config in
+                config.arguments = ["test", "-e", "/tmp/copied-file.txt"]
+            }
+            try await bystander.start()
+            let bystanderStatus = try await bystander.wait()
+            try await bystander.delete()
+
+            guard bystanderStatus.exitCode != 0 else {
+                throw IntegrationError.assert(msg: "the copy reached a container it was not addressed to")
+            }
+
+            let returned = hostDirectory.appendingPathComponent("test-output.txt")
+            try await pod.copyOut(
+                "holder",
+                from: URL(filePath: "/tmp/copied-file.txt"),
+                to: returned
+            )
+
+            let returnedContent = try String(contentsOf: returned, encoding: .utf8)
+            guard returnedContent == testContent else {
+                throw IntegrationError.assert(msg: "expected '\(testContent)' back, got '\(returnedContent)'")
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
 }

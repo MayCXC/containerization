@@ -636,47 +636,16 @@ extension LinuxContainer {
         rootfsPath: String,
         agent: VirtualMachineAgent
     ) async throws {
-        let rootfsAttachment = attached.rootfs
-
         if let writableAttachment = attached.writableLayer {
-            // Set up overlayfs with image as lower layer and writable layer as upper.
-            let lowerPath = "/run/container/\(self.id)/lower"
-            let upperMountPath = "/run/container/\(self.id)/upper"
-            let upperPath = "/run/container/\(self.id)/upper/diff"
-            let workPath = "/run/container/\(self.id)/upper/work"
-
-            // Mount the image (lower layer) as read-only.
-            var lowerMount = rootfsAttachment.to
-            lowerMount.destination = lowerPath
-            if !lowerMount.options.contains("ro") {
-                lowerMount.options.append("ro")
-            }
-            try await agent.mount(lowerMount)
-
-            // Mount the writable layer.
-            var upperMount = writableAttachment.to
-            upperMount.destination = upperMountPath
-            try await agent.mount(upperMount)
-
-            // Create the upper and work directories inside the writable layer.
-            try await agent.mkdir(path: upperPath, all: true, perms: 0o755)
-            try await agent.mkdir(path: workPath, all: true, perms: 0o755)
-
-            // Mount the overlay.
-            let overlayMount = ContainerizationOCI.Mount(
-                type: "overlay",
-                source: "overlay",
-                destination: rootfsPath,
-                options: [
-                    "lowerdir=\(lowerPath)",
-                    "upperdir=\(upperPath)",
-                    "workdir=\(workPath)",
-                ]
+            try await agent.mountOverlayRootfs(
+                containerID: self.id,
+                rootfsAttachment: attached.rootfs,
+                writableAttachment: writableAttachment,
+                rootfsPath: rootfsPath
             )
-            try await agent.mount(overlayMount)
         } else {
             // No writable layer. Mount rootfs directly.
-            var rootfs = rootfsAttachment.to
+            var rootfs = attached.rootfs.to
             rootfs.destination = rootfsPath
             try await agent.mount(rootfs)
         }
@@ -730,8 +699,8 @@ extension LinuxContainer {
             let vm = try await self.vmm.create(config: creationConfig)
             let relayManager = UnixSocketRelayManager(vm: vm, log: self.logger)
 
+            try await vm.start()
             do {
-                try await vm.start()
                 let storageForAgent = containerStorage
                 try await vm.withAgent { agent in
                     try await agent.standardSetup()
@@ -1271,7 +1240,7 @@ extension LinuxContainer {
     }
 
     /// Default chunk size for file transfers (1MiB).
-    public static let defaultCopyChunkSize = 1024 * 1024
+    public static let defaultCopyChunkSize = GuestFileTransfer.defaultChunkSize
 
     /// Copy a file or directory from the host into the container.
     ///
@@ -1287,148 +1256,14 @@ extension LinuxContainer {
     ) async throws {
         try await self.state.withLock {
             let state = try $0.startedState("copyIn")
-
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDirectory) else {
-                throw ContainerizationError(.notFound, message: "copyIn: source not found '\(source.path)'")
-            }
-            let isArchive = isDirectory.boolValue
-
-            let guestPath: URL = try await state.vm.withAgent { agent in
-                guard let vminitd = agent as? Vminitd else {
-                    throw ContainerizationError(.unsupported, message: "copyIn requires Vminitd agent")
-                }
-
-                return try await self.resolveCopyInGuestPath(
-                    from: source,
-                    to: destination,
-                    sourceIsDirectory: isArchive,
-                    using: vminitd
-                )
-            }
-
-            let port = self.hostVsockPorts.wrappingAdd(1, ordering: .relaxed).oldValue
-            let listener = try state.vm.listen(port)
-
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    try await state.vm.withAgent { agent in
-                        guard let vminitd = agent as? Vminitd else {
-                            throw ContainerizationError(.unsupported, message: "copyIn requires Vminitd agent")
-                        }
-                        try await vminitd.copy(
-                            direction: .copyIn,
-                            guestPath: guestPath,
-                            vsockPort: port,
-                            mode: mode,
-                            createParents: createParents,
-                            isArchive: isArchive
-                        )
-                    }
-                }
-
-                group.addTask {
-                    guard let conn = await listener.first(where: { _ in true }) else {
-                        throw ContainerizationError(.internalError, message: "copyIn: vsock connection not established")
-                    }
-                    try listener.finish()
-
-                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                        self.copyQueue.async {
-                            do {
-                                defer { conn.closeFile() }
-
-                                if isArchive {
-                                    let writer = try ArchiveWriter(configuration: .init(format: .pax, filter: .gzip))
-                                    try writer.open(fileDescriptor: conn.fileDescriptor)
-                                    try writer.archiveDirectory(source)
-                                    try writer.finishEncoding()
-                                } else {
-                                    let srcFd = open(source.path, O_RDONLY)
-                                    guard srcFd != -1 else {
-                                        throw ContainerizationError(
-                                            .internalError,
-                                            message: "copyIn: failed to open '\(source.path)': \(String(cString: strerror(errno)))"
-                                        )
-                                    }
-                                    defer { close(srcFd) }
-
-                                    var buf = [UInt8](repeating: 0, count: chunkSize)
-                                    while true {
-                                        let n = read(srcFd, &buf, buf.count)
-                                        if n == 0 { break }
-                                        guard n > 0 else {
-                                            throw ContainerizationError(
-                                                .internalError,
-                                                message: "copyIn: read error: \(String(cString: strerror(errno)))"
-                                            )
-                                        }
-                                        var written = 0
-                                        while written < n {
-                                            let w = buf.withUnsafeBytes { ptr in
-                                                write(conn.fileDescriptor, ptr.baseAddress! + written, n - written)
-                                            }
-                                            guard w > 0 else {
-                                                throw ContainerizationError(
-                                                    .internalError,
-                                                    message: "copyIn: vsock write error: \(String(cString: strerror(errno)))"
-                                                )
-                                            }
-                                            written += w
-                                        }
-                                    }
-                                }
-                                continuation.resume()
-                            } catch {
-                                continuation.resume(throwing: error)
-                            }
-                        }
-                    }
-                }
-
-                try await group.waitForAll()
-            }
+            try await self.transfer(vm: state.vm).copyIn(
+                from: source,
+                to: destination,
+                mode: mode,
+                createParents: createParents,
+                chunkSize: chunkSize
+            )
         }
-    }
-
-    private func resolveCopyInGuestPath(
-        from source: URL,
-        to destination: URL,
-        sourceIsDirectory: Bool,
-        using vminitd: Vminitd
-    ) async throws -> URL {
-        let guestDestination = URL(filePath: self.root).appending(path: destination.path)
-
-        let stat: ContainerizationOS.Stat?
-        do {
-            stat = try await vminitd.stat(path: guestDestination)
-        } catch let error as ContainerizationError where error.code == .notFound {
-            stat = nil
-        }
-        // Any other error propagates so transport and permission failures are visible.
-
-        guard let stat else {
-            if destination.hasDirectoryPath && !sourceIsDirectory {
-                throw ContainerizationError(
-                    .invalidArgument,
-                    message: "destination directory does not exist: \(destination.path)"
-                )
-            }
-            return guestDestination
-        }
-
-        let destinationIsDirectory = (stat.mode & UInt32(S_IFMT)) == UInt32(S_IFDIR)
-        guard destinationIsDirectory else {
-            if sourceIsDirectory {
-                throw ContainerizationError(
-                    .invalidArgument,
-                    message: "cannot copy directory over existing file: \(destination.path)"
-                )
-            }
-            return guestDestination
-        }
-
-        return guestDestination.appendingPathComponent(source.lastPathComponent)
     }
 
     /// Copy a file or directory from the container to the host.
@@ -1444,103 +1279,23 @@ extension LinuxContainer {
     ) async throws {
         try await self.state.withLock {
             let state = try $0.startedState("copyOut")
-
-            if createParents {
-                let parentDir = destination.deletingLastPathComponent()
-                try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
-            }
-
-            let guestPath = URL(filePath: self.root).appending(path: source.path)
-            let port = self.hostVsockPorts.wrappingAdd(1, ordering: .relaxed).oldValue
-            let listener = try state.vm.listen(port)
-
-            let (metadataStream, metadataCont) = AsyncStream.makeStream(of: Vminitd.CopyMetadata.self)
-
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    defer { metadataCont.finish() }
-                    try await state.vm.withAgent { agent in
-                        guard let vminitd = agent as? Vminitd else {
-                            throw ContainerizationError(.unsupported, message: "copyOut requires Vminitd agent")
-                        }
-                        try await vminitd.copy(
-                            direction: .copyOut,
-                            guestPath: guestPath,
-                            vsockPort: port,
-                            onMetadata: { meta in
-                                metadataCont.yield(meta)
-                                metadataCont.finish()
-                            }
-                        )
-                    }
-                }
-
-                group.addTask {
-                    guard let metadata = await metadataStream.first(where: { _ in true }) else {
-                        throw ContainerizationError(.internalError, message: "copyOut: no metadata received")
-                    }
-
-                    guard let conn = await listener.first(where: { _ in true }) else {
-                        throw ContainerizationError(.internalError, message: "copyOut: vsock connection not established")
-                    }
-                    try listener.finish()
-
-                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                        self.copyQueue.async {
-                            do {
-                                defer { conn.closeFile() }
-
-                                if metadata.isArchive {
-                                    try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-                                    let fh = FileHandle(fileDescriptor: dup(conn.fileDescriptor), closeOnDealloc: true)
-                                    let reader = try ArchiveReader(format: .pax, filter: .gzip, fileHandle: fh)
-                                    _ = try reader.extractContents(to: destination)
-                                } else {
-                                    let destFd = open(destination.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-                                    guard destFd != -1 else {
-                                        throw ContainerizationError(
-                                            .internalError,
-                                            message: "copyOut: failed to open '\(destination.path)': \(String(cString: strerror(errno)))"
-                                        )
-                                    }
-                                    defer { close(destFd) }
-
-                                    var buf = [UInt8](repeating: 0, count: chunkSize)
-                                    while true {
-                                        let n = read(conn.fileDescriptor, &buf, buf.count)
-                                        if n == 0 { break }
-                                        guard n > 0 else {
-                                            throw ContainerizationError(
-                                                .internalError,
-                                                message: "copyOut: vsock read error: \(String(cString: strerror(errno)))"
-                                            )
-                                        }
-                                        var written = 0
-                                        while written < n {
-                                            let w = buf.withUnsafeBytes { ptr in
-                                                write(destFd, ptr.baseAddress! + written, n - written)
-                                            }
-                                            guard w > 0 else {
-                                                throw ContainerizationError(
-                                                    .internalError,
-                                                    message: "copyOut: write error: \(String(cString: strerror(errno)))"
-                                                )
-                                            }
-                                            written += w
-                                        }
-                                    }
-                                }
-                                continuation.resume()
-                            } catch {
-                                continuation.resume(throwing: error)
-                            }
-                        }
-                    }
-                }
-
-                try await group.waitForAll()
-            }
+            try await self.transfer(vm: state.vm).copyOut(
+                from: source,
+                to: destination,
+                createParents: createParents,
+                chunkSize: chunkSize
+            )
         }
+    }
+
+    /// A transfer against this container's filesystem, on a port of its own.
+    private func transfer(vm: any VirtualMachineInstance) -> GuestFileTransfer {
+        GuestFileTransfer(
+            vm: vm,
+            guestRoot: self.root,
+            port: self.hostVsockPorts.wrappingAdd(1, ordering: .relaxed).oldValue,
+            queue: self.copyQueue
+        )
     }
 }
 
