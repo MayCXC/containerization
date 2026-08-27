@@ -4932,8 +4932,10 @@ extension IntegrationSuite {
         let id = "test-ipv6-address"
         let bs = try await bootstrap(id)
 
-        // Pin the v6 prefix so the allocator's first allocation yields fd00::2.
-        var network = try VmnetNetwork(prefixV6: try CIDRv6("fd00::/64"))
+        // Pin the v6 prefix so the allocator's first allocation yields fd10::2.
+        // Every network test claims addresses of its own, so two tests running
+        // at once never contend for the same address on the shared bridge.
+        var network = try VmnetNetwork(prefixV6: try CIDRv6("fd10::/64"))
         defer {
             try? network.releaseInterface(id)
         }
@@ -4971,9 +4973,9 @@ extension IntegrationSuite {
                 throw IntegrationError.assert(msg: "failed to convert output to UTF8")
             }
 
-            guard output.contains("fd00::2") else {
+            guard output.contains("fd10::2") else {
                 throw IntegrationError.assert(
-                    msg: "expected fd00::2 in output, got: \(output)")
+                    msg: "expected fd10::2 in output, got: \(output)")
             }
 
             try await container.kill(.kill)
@@ -4990,9 +4992,9 @@ extension IntegrationSuite {
         let id = "test-ipv6-default-route"
         let bs = try await bootstrap(id)
 
-        // Pin the network's v6 prefix so the gateway is deterministically fd00::1
-        // and the allocator's first allocation yields fd00::2.
-        var network = try VmnetNetwork(prefixV6: try CIDRv6("fd00::/64"))
+        // Pin the network's v6 prefix so the gateway is deterministically fd11::1
+        // and the allocator's first allocation yields fd11::2.
+        var network = try VmnetNetwork(prefixV6: try CIDRv6("fd11::/64"))
         defer {
             try? network.releaseInterface(id)
         }
@@ -5031,9 +5033,9 @@ extension IntegrationSuite {
             }
 
             // The default v6 route must point at the gateway we configured, on eth0.
-            guard output.contains("default via fd00::1 dev eth0") else {
+            guard output.contains("default via fd11::1 dev eth0") else {
                 throw IntegrationError.assert(
-                    msg: "expected 'default via fd00::1 dev eth0' in v6 routes, got: \(output)")
+                    msg: "expected 'default via fd11::1 dev eth0' in v6 routes, got: \(output)")
             }
 
             try await container.kill(.kill)
@@ -5050,16 +5052,16 @@ extension IntegrationSuite {
         let id = "test-ipv6-gateway-outside-subnet"
         let bs = try await bootstrap(id)
 
-        // Address in fd00::/120, gateway in fd01::/120 — subnets don't overlap, so the
+        // Address in fd12::/120, gateway in fd13::/120 — subnets don't overlap, so the
         // LinuxContainer wiring must add a /128 link route to the gateway before the
         // default route. The two prefixes are independent so we drive this directly
         // via NATInterface rather than the VmnetNetwork allocator (which always
         // derives the gateway from the network's own prefix).
         let interface = NATInterface(
-            ipv4Address: try CIDRv4("192.0.2.2/24"),
+            ipv4Address: try CIDRv4("192.0.2.11/24"),
             ipv4Gateway: try IPv4Address("192.0.2.1"),
-            ipv6Address: try CIDRv6("fd00::2/120"),
-            ipv6Gateway: try IPv6Address("fd01::1"))
+            ipv6Address: try CIDRv6("fd12::2/120"),
+            ipv6Gateway: try IPv6Address("fd13::1"))
 
         let buffer = BufferWriter()
         let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
@@ -5094,14 +5096,14 @@ extension IntegrationSuite {
             // Match the link route on a line that starts with the gateway address (no "via")
             // so it can't be satisfied by a substring of the default-via line.
             let lines = output.split(separator: "\n").map(String.init)
-            let hasLinkRoute = lines.contains { $0.hasPrefix("fd01::1 ") && $0.contains("dev eth0") && !$0.contains("via") }
+            let hasLinkRoute = lines.contains { $0.hasPrefix("fd13::1 ") && $0.contains("dev eth0") && !$0.contains("via") }
             guard hasLinkRoute else {
                 throw IntegrationError.assert(
-                    msg: "expected an on-link route 'fd01::1 ... dev eth0' (no 'via') in v6 routes, got: \(output)")
+                    msg: "expected an on-link route 'fd13::1 ... dev eth0' (no 'via') in v6 routes, got: \(output)")
             }
-            guard output.contains("default via fd01::1 dev eth0") else {
+            guard output.contains("default via fd13::1 dev eth0") else {
                 throw IntegrationError.assert(
-                    msg: "expected 'default via fd01::1 dev eth0' in v6 routes, got: \(output)")
+                    msg: "expected 'default via fd13::1 dev eth0' in v6 routes, got: \(output)")
             }
 
             try await container.kill(.kill)
@@ -5122,10 +5124,10 @@ extension IntegrationSuite {
         // LinuxContainer takes the no-v4-gateway branch in setupInterface. The v4
         // address comes from TEST-NET-1; nothing in the test traffics over v4.
         let interface = NATInterface(
-            ipv4Address: try CIDRv4("192.0.2.2/24"),
+            ipv4Address: try CIDRv4("192.0.2.12/24"),
             ipv4Gateway: nil,
-            ipv6Address: try CIDRv6("fd00::2/64"),
-            ipv6Gateway: try IPv6Address("fd00::1"))
+            ipv6Address: try CIDRv6("fd14::2/64"),
+            ipv6Gateway: try IPv6Address("fd14::1"))
 
         let buffer = BufferWriter()
         let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
@@ -5155,9 +5157,9 @@ extension IntegrationSuite {
                 throw IntegrationError.assert(msg: "failed to convert output to UTF8")
             }
 
-            guard output.contains("default via fd00::1 dev eth0") else {
+            guard output.contains("default via fd14::1 dev eth0") else {
                 throw IntegrationError.assert(
-                    msg: "expected 'default via fd00::1 dev eth0' in v6 routes when ipv4Gateway is nil, got: \(output)")
+                    msg: "expected 'default via fd14::1 dev eth0' in v6 routes when ipv4Gateway is nil, got: \(output)")
             }
 
             try await container.kill(.kill)
@@ -5178,10 +5180,10 @@ extension IntegrationSuite {
         // setupInterface's "no v4 gateway, but v6 link route required before
         // v6 default route" branch — the exact bug the helper extraction fixed.
         let interface = NATInterface(
-            ipv4Address: try CIDRv4("192.0.2.2/24"),
+            ipv4Address: try CIDRv4("192.0.2.13/24"),
             ipv4Gateway: nil,
-            ipv6Address: try CIDRv6("fd00::2/120"),
-            ipv6Gateway: try IPv6Address("fd01::1"))
+            ipv6Address: try CIDRv6("fd15::2/120"),
+            ipv6Gateway: try IPv6Address("fd16::1"))
 
         let buffer = BufferWriter()
         let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
@@ -5214,14 +5216,14 @@ extension IntegrationSuite {
             // Both the on-link route to the gateway AND the default via it must be present.
             // Without the link route the kernel rejects the default — that was the bug.
             let lines = output.split(separator: "\n").map(String.init)
-            let hasLinkRoute = lines.contains { $0.hasPrefix("fd01::1 ") && $0.contains("dev eth0") && !$0.contains("via") }
+            let hasLinkRoute = lines.contains { $0.hasPrefix("fd16::1 ") && $0.contains("dev eth0") && !$0.contains("via") }
             guard hasLinkRoute else {
                 throw IntegrationError.assert(
-                    msg: "expected an on-link route 'fd01::1 ... dev eth0' (no 'via') in v6 routes, got: \(output)")
+                    msg: "expected an on-link route 'fd16::1 ... dev eth0' (no 'via') in v6 routes, got: \(output)")
             }
-            guard output.contains("default via fd01::1 dev eth0") else {
+            guard output.contains("default via fd16::1 dev eth0") else {
                 throw IntegrationError.assert(
-                    msg: "expected 'default via fd01::1 dev eth0' in v6 routes, got: \(output)")
+                    msg: "expected 'default via fd16::1 dev eth0' in v6 routes, got: \(output)")
             }
 
             try await container.kill(.kill)
@@ -5238,9 +5240,9 @@ extension IntegrationSuite {
         let id = "test-ipv6-dual-stack"
         let bs = try await bootstrap(id)
 
-        // Pin the network's v6 prefix so the gateway is deterministically fd00::1
-        // and the allocator's first allocation yields fd00::2.
-        var network = try VmnetNetwork(prefixV6: try CIDRv6("fd00::/64"))
+        // Pin the network's v6 prefix so the gateway is deterministically fd17::1
+        // and the allocator's first allocation yields fd17::2.
+        var network = try VmnetNetwork(prefixV6: try CIDRv6("fd17::/64"))
         defer {
             try? network.releaseInterface(id)
         }
@@ -5285,9 +5287,9 @@ extension IntegrationSuite {
                 throw IntegrationError.assert(
                     msg: "expected v4 address \(expectedV4) on eth0, got: \(addrOutput)")
             }
-            guard addrOutput.contains("fd00::2") else {
+            guard addrOutput.contains("fd17::2") else {
                 throw IntegrationError.assert(
-                    msg: "expected v6 address fd00::2 on eth0, got: \(addrOutput)")
+                    msg: "expected v6 address fd17::2 on eth0, got: \(addrOutput)")
             }
 
             // The dual-stack default routes must both be installed.
@@ -5307,9 +5309,9 @@ extension IntegrationSuite {
                 throw IntegrationError.assert(msg: "failed to convert route output to UTF8")
             }
 
-            guard routeOutput.contains("default via fd00::1 dev eth0") else {
+            guard routeOutput.contains("default via fd17::1 dev eth0") else {
                 throw IntegrationError.assert(
-                    msg: "expected 'default via fd00::1 dev eth0' in v6 routes, got: \(routeOutput)")
+                    msg: "expected 'default via fd17::1 dev eth0' in v6 routes, got: \(routeOutput)")
             }
 
             try await container.kill(.kill)
