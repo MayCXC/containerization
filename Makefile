@@ -491,10 +491,22 @@ docs:
 	@rm -rf _site
 	@scripts/make-docs.sh _site containerization
 
+# The Linux dev container keeps its content beside the repository rather than
+# under a home directory of its own, which does not survive a `container run`.
+# It is the same store either way, so cleaning the content means both of them.
 .PHONY: cleancontent
 cleancontent:
 	@echo Cleaning the content...
 	@rm -rf ~/Library/Application\ Support/com.apple.containerization
+	@rm -rf $(ROOT_DIR)/.local/integration-cache
+
+# The integration suite takes its files away as it goes, so this is for what a
+# run that was interrupted, or one asked to keep them, has left behind. The
+# directory is the one IntegrationSuite.testRootName names.
+.PHONY: cleantests
+cleantests:
+	@echo Cleaning the integration test files...
+	@rm -rf "$${TMPDIR:-/tmp}/containerization-integration"
 
 # What fetch-default-kernel downloaded and unpacked, which is the archive, the
 # tree taken out of it, and the kernel copied from that tree. Fetching again
