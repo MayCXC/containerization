@@ -118,6 +118,23 @@ public final class LinuxContainer: Container, Sendable {
         /// Prepare the container for a service manager to run as its init,
         /// which needs somewhere writable to keep runtime state.
         public var systemd: SystemdMode = .disabled
+        /// Programs the runtime runs at points in the container's lifecycle,
+        /// as described by the runtime specification.
+        ///
+        /// The paths are resolved inside the guest, because that is where the
+        /// runtime that would run them lives.
+        ///
+        /// NOTE: these reach the bundle's config.json but are only acted on
+        /// when the container runs under an external OCI runtime. The default
+        /// launcher is not one, so they have no effect on that path.
+        public var hooks: ContainerizationOCI.Hooks? = nil
+        /// Devices the container should be given, with the permissions it
+        /// should see them under.
+        ///
+        /// A device already present in the container's /dev arrives with the
+        /// kernel's permissions, which are stricter than the ones a machine
+        /// running udev would show. Naming it here is how those are asked for.
+        public var devices: [ContainerizationOCI.LinuxDevice] = []
         /// Additional CPU cores to allocate for the virtual machine on top
         /// of the container's configured `cpus` value.
         public var cpuOverhead: Int = 1
@@ -125,6 +142,16 @@ public final class LinuxContainer: Container, Sendable {
         /// on top of the container's configured `memoryInBytes` value.
         /// The total is aligned to a 1 MiB boundary.
         public var memoryOverhead: UInt64 = 128.mib()
+
+        /// Optional swap area for the container, as a block device mount.
+        ///
+        /// Swap lets a workload whose resident set exceeds `memoryInBytes`
+        /// reclaim rather than meet the out of memory killer. The area is a
+        /// block device rather than a file in the guest, because no filesystem
+        /// the agent can write to exists when the sandbox starts: its root is
+        /// mounted read only. The `destination` field is ignored, as the area
+        /// is enabled rather than mounted.
+        public var swapLayer: Mount? = nil
 
         public init() {}
 
@@ -422,6 +449,9 @@ public final class LinuxContainer: Container, Sendable {
         // Process toggles.
         spec.process = config.process.toOCI()
 
+        spec.hooks = config.hooks
+        spec.linux?.devices = config.devices
+
         // Wrap with init process if requested.
         if config.useInit {
             let originalArgs = spec.process?.args ?? []
@@ -631,6 +661,30 @@ extension LinuxContainer {
         config.interfaces
     }
 
+    /// Enable the container's swap area, if it has one.
+    ///
+    /// The device is attached with the container's other block devices, so the
+    /// agent is told the guest path the VMM allocated it. It is enabled rather
+    /// than mounted, which is why it travels as a mount of type `swap`.
+    private func enableSwap(
+        attached: ContainerAttachments,
+        agent: VirtualMachineAgent
+    ) async throws {
+        guard self.config.swapLayer != nil else {
+            return
+        }
+        guard let swap = attached.swap else {
+            throw ContainerizationError(.notFound, message: "swap mount not found")
+        }
+        try await agent.mount(
+            ContainerizationOCI.Mount(
+                type: Swap.mountType,
+                source: swap.source,
+                destination: "",
+                options: swap.options
+            ))
+    }
+
     private func mountRootfs(
         attached: ContainerAttachments,
         rootfsPath: String,
@@ -680,10 +734,13 @@ extension LinuxContainer {
             // This is dumb, but alas.
             let fileMountContextHolder = Mutex<FileMountContext>(fileMountContext)
 
-            // Build the container's storage to attach to the VM.
+            // Build the container's storage to attach to the VM. The swap
+            // device is attached with the container's other block devices so
+            // the guest is told the /dev path the VMM allocates it.
             let containerStorage = ContainerMounts(
                 rootfs: modifiedRootfs,
                 writableLayer: self.writableLayer,
+                swap: self.config.swapLayer,
                 mounts: fileMountContext.transformedMounts
             )
 
@@ -762,6 +819,7 @@ extension LinuxContainer {
                     }
                     let rootfsPath = Self.guestRootfsPath(self.id)
                     try await self.mountRootfs(attached: attached, rootfsPath: rootfsPath, agent: agent)
+                    try await self.enableSwap(attached: attached, agent: agent)
 
                     // Mount file mount holding directories under /run.
                     if fileMountContext.hasFileMounts {

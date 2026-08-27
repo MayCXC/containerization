@@ -29,9 +29,16 @@ public final class VZVirtualMachineInstance: Sendable {
     public typealias Agent = Vminitd
 
     /// The machine's attached storage.
+    ///
+    /// Where a hotplug provider is installed it holds the registry, so a disk
+    /// taken while the machine runs is registered with the ones it booted
+    /// with. The machine's own copy answers only where there is no provider.
     private let _storage: Mutex<MachineAttachments>
     public var storage: MachineAttachments {
-        _storage.withLock { $0 }
+        if let hotplugProvider {
+            return hotplugProvider.storage
+        }
+        return _storage.withLock { $0 }
     }
 
     /// The underlying Virtualization framework virtual machine.
@@ -42,7 +49,10 @@ public final class VZVirtualMachineInstance: Sendable {
 
     /// Mutate the storage registry.
     public func withStorage<T: Sendable>(_ body: (inout sending MachineAttachments) throws -> sending T) rethrows -> T {
-        try _storage.withLock(body)
+        if let hotplugProvider {
+            return try hotplugProvider.withStorage(body)
+        }
+        return try _storage.withLock(body)
     }
 
     /// Serialize VM operations with the instance lock.
@@ -74,7 +84,7 @@ public final class VZVirtualMachineInstance: Sendable {
         /// Toggle nested virtualization support.
         public var nestedVirtualization: Bool
         /// The machine's storage: each container's mounts by role, and the
-        /// volumes its containers share.
+        /// volumes and swap its containers share.
         public var storage: MachineMounts
         /// Network interface attachments.
         public var interfaces: [any Interface]
@@ -139,6 +149,17 @@ public final class VZVirtualMachineInstance: Sendable {
             configuration: try config.toVZ(allocator: allocator),
             queue: self.queue
         )
+
+        // A disk can be attached while the machine runs, so the machine has
+        // somewhere to send the request.
+        if #available(macOS 15.0, *) {
+            self.hotplugProvider = VZHotplugProvider(
+                vm: self.vm,
+                queue: self.queue,
+                initialStorage: mountAttachments,
+                logger: logger
+            )
+        }
 
         for ext in config.extensions.compactMap({ $0 as? any VZInstanceExtension }) {
             try ext.didCreate(self)
@@ -525,6 +546,13 @@ extension VZVirtualMachineInstance.Configuration {
         platform.isNestedVirtualizationEnabled = self.nestedVirtualization
         config.platform = platform
 
+        // The machine's storage devices are fixed once it boots, so a disk
+        // that arrives later arrives over USB. The controller has to be in
+        // the configuration for one to exist to attach to.
+        if #available(macOS 15.0, *) {
+            config.usbControllers = [VZXHCIControllerConfiguration()]
+        }
+
         for ext in self.extensions.compactMap({ $0 as? any VZInstanceExtension }) {
             try ext.configureVZ(&config, allocator: allocator, storageDeviceCount: storageDeviceCount, storage: self.storage)
         }
@@ -567,8 +595,9 @@ extension VZVirtualMachineInstance.Configuration {
             guard let mount = self.storage.volumes[name] else { continue }
             volumes[name] = try attach(mount)
         }
+        let swap = try self.storage.swap.map(attach)
 
-        return (MachineAttachments(containers: containers, volumes: volumes), storageDeviceCount)
+        return (MachineAttachments(containers: containers, volumes: volumes, swap: swap), storageDeviceCount)
     }
 }
 

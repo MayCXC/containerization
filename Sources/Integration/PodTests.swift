@@ -59,45 +59,6 @@ extension IntegrationSuite {
         }
     }
 
-    /// Delegation reaches a pod's containers too, so one container's user can
-    /// limit its own work without touching what the pod gave any other.
-    func testPodCgroupDelegation() async throws {
-        let id = "test-pod-cgroup-delegation"
-
-        let bs = try await bootstrap(id)
-        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
-            config.cpus = 4
-            config.memoryInBytes = 1024.mib()
-            config.bootLog = bs.bootLog
-        }
-
-        let buffer = BufferWriter()
-        try await pod.addContainer("delegated", rootfs: bs.rootfs) { config in
-            config.cgroupDelegation = true
-            config.process.user = ContainerizationOCI.User(uid: 1000, gid: 1000)
-            config.process.arguments = [
-                "/bin/sh", "-c",
-                "mkdir -p /sys/fs/cgroup/init /sys/fs/cgroup/work && "
-                    + "echo $$ > /sys/fs/cgroup/init/cgroup.procs && "
-                    + "echo '+memory' > /sys/fs/cgroup/cgroup.subtree_control && "
-                    + "echo 64000000 > /sys/fs/cgroup/work/memory.max && "
-                    + "echo LIMIT=$(cat /sys/fs/cgroup/work/memory.max)",
-            ]
-            config.process.stdout = buffer
-        }
-
-        try await pod.create()
-        try await pod.startContainer("delegated")
-        _ = try await pod.waitContainer("delegated")
-        try await pod.stop()
-
-        let out = String(data: buffer.data, encoding: .utf8) ?? ""
-        guard out.contains("LIMIT=64000000") else {
-            throw IntegrationError.assert(
-                msg: "pod container could not limit its own work: '\(out)'")
-        }
-    }
-
     func testPodMultipleContainers() async throws {
         let id = "test-pod-multiple-containers"
 
@@ -177,6 +138,234 @@ extension IntegrationSuite {
         }
 
         try await pod.stop()
+    }
+
+    /// Delegation reaches a pod's containers too, so one container's user can
+    /// limit its own work without touching what the pod gave any other.
+    func testPodCgroupDelegation() async throws {
+        let id = "test-pod-cgroup-delegation"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 4
+            config.memoryInBytes = 1024.mib()
+            config.bootLog = bs.bootLog
+        }
+
+        let buffer = BufferWriter()
+        try await pod.addContainer("delegated", rootfs: bs.rootfs) { config in
+            config.cgroupDelegation = true
+            config.process.user = ContainerizationOCI.User(uid: 1000, gid: 1000)
+            config.process.arguments = [
+                "/bin/sh", "-c",
+                "mkdir -p /sys/fs/cgroup/init /sys/fs/cgroup/work && "
+                    + "echo $$ > /sys/fs/cgroup/init/cgroup.procs && "
+                    + "echo '+memory' > /sys/fs/cgroup/cgroup.subtree_control && "
+                    + "echo 64000000 > /sys/fs/cgroup/work/memory.max && "
+                    + "echo LIMIT=$(cat /sys/fs/cgroup/work/memory.max)",
+            ]
+            config.process.stdout = buffer
+        }
+
+        try await pod.create()
+        try await pod.startContainer("delegated")
+        _ = try await pod.waitContainer("delegated")
+        try await pod.stop()
+
+        let out = String(data: buffer.data, encoding: .utf8) ?? ""
+        guard out.contains("LIMIT=64000000") else {
+            throw IntegrationError.assert(
+                msg: "pod container could not limit its own work: '\(out)'")
+        }
+    }
+
+    func testPodRestartStoppedContainer() async throws {
+        let id = "test-pod-restart-stopped-container"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 4
+            config.memoryInBytes = 1024.mib()
+            config.bootLog = bs.bootLog
+        }
+
+        // The holder keeps the machine up while the other member is stopped and
+        // restarted, the way a sibling holds a live pod up.
+        try await pod.addContainer("holder", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "holder")) { config in
+            config.process.arguments = ["/bin/sleep", "600"]
+        }
+        try await pod.addContainer("restarted", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "restarted")) { config in
+            config.process.arguments = ["/bin/sleep", "600"]
+        }
+
+        try await pod.create()
+        try await pod.startContainer("holder")
+        try await pod.startContainer("restarted")
+
+        // Prove the restart reuses the member's rootfs rather than attaching a
+        // fresh one: a file written before the stop is read back after.
+        let marker = try await pod.execInContainer("restarted", processID: "mark") { config in
+            config.arguments = ["/bin/sh", "-c", "echo kept > /marker"]
+        }
+        try await marker.start()
+        let markerStatus = try await marker.wait()
+        try await marker.delete()
+        guard markerStatus.exitCode == 0 else {
+            throw IntegrationError.assert(msg: "marker write status \(markerStatus) != 0")
+        }
+
+        // Stop one member. Its process is torn down and its guest rootfs
+        // unmounted, while its block devices stay attached and its mount
+        // registry entry stays: stopping keeps the member's place, removal is
+        // what gives it up. The machine stays up because the holder is still
+        // running.
+        try await pod.stopContainer("restarted")
+
+        // Start it again into the running machine. This is the resume path: the
+        // rootfs is re-attached and the mounts re-registered, reusing the shares
+        // that persisted, and a fresh process is started on the reused rootfs.
+        try await pod.startContainer("restarted")
+
+        // The restarted member is alive, and the marker written before the stop
+        // is still there: the same rootfs came back.
+        let buffer = BufferWriter()
+        let exec = try await pod.execInContainer("restarted", processID: "exec1") { config in
+            config.arguments = ["/bin/cat", "/marker"]
+            config.stdout = buffer
+        }
+        try await exec.start()
+        let status = try await exec.wait()
+        try await exec.delete()
+
+        try await pod.killContainer("restarted", signal: .kill)
+        try await pod.waitContainer("restarted")
+        try await pod.killContainer("holder", signal: .kill)
+        try await pod.waitContainer("holder")
+        try await pod.stop()
+
+        guard status.exitCode == 0 else {
+            throw IntegrationError.assert(msg: "exec after restart status \(status) != 0")
+        }
+
+        guard String(data: buffer.data, encoding: .utf8) == "kept\n" else {
+            throw IntegrationError.assert(
+                msg: "marker after restart should have read 'kept' != '\(String(data: buffer.data, encoding: .utf8) ?? "")'")
+        }
+    }
+
+    func testPodSharedSwap() async throws {
+        let id = "test-pod-shared-swap"
+
+        let bs = try await bootstrap(id)
+        let swapPath = Self.binPath(name: "\(id)-swap.raw")
+        let swap = try Self.makeSwapDevice(at: swapPath, size: 512.mib())
+        defer { try? FileManager.default.removeItem(at: swapPath) }
+
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 2
+            config.memoryInBytes = 512.mib()
+            config.bootLog = bs.bootLog
+            config.swapLayer = swap
+        }
+
+        // Both containers report the same area, because the pod owns it and
+        // the guest kernel decides whose pages are reclaimed to it.
+        let names = ["swap1", "swap2"]
+        let buffers = [names[0]: BufferWriter(), names[1]: BufferWriter()]
+        for name in names {
+            let buffer = buffers[name]!
+            try await pod.addContainer(
+                name,
+                rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: name)
+            ) { config in
+                config.process.arguments = [
+                    "/bin/sh", "-c",
+                    "awk '/SwapTotal/ { print $2 }' /proc/meminfo",
+                ]
+                config.process.stdout = buffer
+            }
+        }
+
+        try await pod.create()
+
+        var totals: [UInt64] = []
+        for name in names {
+            try await pod.startContainer(name)
+            let status = try await pod.waitContainer(name)
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "\(name) status \(status) != 0")
+            }
+            let out = String(data: buffers[name]!.data, encoding: .utf8) ?? ""
+            guard let total = UInt64(out.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                throw IntegrationError.assert(msg: "\(name) reported no swap total: '\(out)'")
+            }
+            totals.append(total)
+        }
+
+        try await pod.stop()
+
+        guard totals[0] > 0 else {
+            throw IntegrationError.assert(msg: "pod swap area was not enabled: \(totals)")
+        }
+        guard totals[0] == totals[1] else {
+            throw IntegrationError.assert(
+                msg: "containers saw different swap areas: \(totals)")
+        }
+    }
+
+    /// A container's cap names the swap alone while the runtime spec carries the
+    /// memory and swap total, so the guest has to take the memory back out of it
+    /// before the kernel will hold the container to it. Read the cap back from
+    /// the kernel, because a spec the guest ignores leaves the container drawing
+    /// on the whole pod area with nothing to show it.
+    func testPodContainerSwapLimit() async throws {
+        let id = "test-pod-container-swap-limit"
+
+        let bs = try await bootstrap(id)
+        let swapPath = Self.binPath(name: "\(id)-swap.raw")
+        let swap = try Self.makeSwapDevice(at: swapPath, size: 512.mib())
+        defer { try? FileManager.default.removeItem(at: swapPath) }
+
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 2
+            config.memoryInBytes = 512.mib()
+            config.bootLog = bs.bootLog
+            config.swapLayer = swap
+        }
+
+        let capped: UInt64 = 64.mib()
+        let buffer = BufferWriter()
+        try await pod.addContainer(
+            "capped",
+            rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "capped")
+        ) { config in
+            config.memoryInBytes = 128.mib()
+            config.swapInBytes = capped
+            config.process.arguments = [
+                "/bin/sh", "-c", "cat /sys/fs/cgroup/memory.swap.max",
+            ]
+            config.process.stdout = buffer
+        }
+
+        try await pod.create()
+        try await pod.startContainer("capped")
+        let status = try await pod.waitContainer("capped")
+        try await pod.stop()
+        guard status.exitCode == 0 else {
+            throw IntegrationError.assert(msg: "capped status \(status) != 0")
+        }
+
+        let reported =
+            String(data: buffer.data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let limit = UInt64(reported) else {
+            throw IntegrationError.assert(
+                msg: "swap cap never reached the kernel, memory.swap.max is '\(reported)'")
+        }
+        guard limit == capped else {
+            throw IntegrationError.assert(
+                msg: "expected a \(capped) byte swap cap, kernel holds \(limit)")
+        }
     }
 
     func testPodContainerOutput() async throws {
@@ -2342,8 +2531,9 @@ extension IntegrationSuite {
     }
 
     /// Hotplug a container with a virtiofs (directory-share) rootfs into a
-    /// running pod VM, plus an additional virtiofs file-mount. CH-only: VZ has
-    /// no runtime hotplug.
+    /// running pod VM, plus an additional virtiofs file-mount. CH-only: a
+    /// virtiofs rootfs rides its own device, which cloud-hypervisor alone
+    /// adds to a running machine.
     func testPodHotplugVirtiofsRootfs() async throws {
         let id = "test-pod-hotplug-virtiofs-rootfs"
         let bs = try await bootstrap(id)
@@ -2400,9 +2590,11 @@ extension IntegrationSuite {
         }
     }
 
-    /// Hotplug a container with a block rootfs into a running pod VM. Guards
-    /// the existing block hotplug path against the registry-consolidation
-    /// change. CH-only.
+    #endif
+
+    /// Add a container with a block rootfs to a pod whose machine is already
+    /// running. Both backends attach a disk to a running machine, so both are
+    /// held to it.
     func testPodHotplugBlockRootfs() async throws {
         let id = "test-pod-hotplug-block-rootfs"
         let bs = try await bootstrap(id)
@@ -2421,7 +2613,7 @@ extension IntegrationSuite {
 
         let buffer = BufferWriter()
         try await pod.addContainer("hot", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "hot")) { config in
-            config.process.arguments = ["/bin/echo", "hello from block rootfs"]
+            config.process.arguments = ["/bin/echo", "hello from a disk added while running"]
             config.process.stdout = buffer
         }
 
@@ -2435,19 +2627,17 @@ extension IntegrationSuite {
             guard status.exitCode == 0 else {
                 throw IntegrationError.assert(msg: "hot container status \(status) != 0")
             }
-            guard String(data: buffer.data, encoding: .utf8) == "hello from block rootfs\n" else {
+            let expected = "hello from a disk added while running\n"
+            guard String(data: buffer.data, encoding: .utf8) == expected else {
                 throw IntegrationError.assert(
-                    msg: "expected 'hello from block rootfs', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
+                    msg: "expected '\(expected)', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
             }
         } catch {
             try? await pod.stop()
             throw error
         }
     }
-    #endif
 
-    /// A container in a pod given a writable layer writes into it, and the
-    /// image it was built from is left as it is for the pod's others.
     /// Add a container with a writable layer to a pod whose machine is
     /// already running: the overlay assembles from the two disks attached
     /// while it runs, and writes land in the layer.
@@ -2511,6 +2701,183 @@ extension IntegrationSuite {
         }
     }
 
+    /// Add a container with a directory-share mount to a pod whose machine is
+    /// already running. Both backends export a directory to a running machine,
+    /// so both are held to it.
+    func testPodHotplugVirtiofsShare() async throws {
+        let id = "test-pod-hotplug-virtiofs-share"
+        let bs = try await bootstrap(id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 4
+            config.memoryInBytes = 1024.mib()
+            config.bootLog = bs.bootLog
+        }
+
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+        }
+
+        try await pod.create()
+
+        let content = "hello from a directory exported while running"
+        let hostDir = FileManager.default.uniqueTemporaryDirectory(create: true)
+        try content.write(to: hostDir.appendingPathComponent("hot.txt"), atomically: true, encoding: .utf8)
+
+        let buffer = BufferWriter()
+        try await pod.addContainer("hot", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "hot")) { config in
+            config.process.arguments = ["/bin/cat", "/shared/hot.txt"]
+            config.mounts.append(.share(source: hostDir.absolutePath(), destination: "/shared"))
+            config.process.stdout = buffer
+        }
+
+        do {
+            try await pod.startContainer("hot")
+            let status = try await pod.waitContainer("hot")
+
+            try await pod.stopContainer("hot")
+            try await pod.stop()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "hot container status \(status) != 0")
+            }
+            guard String(data: buffer.data, encoding: .utf8) == content else {
+                throw IntegrationError.assert(
+                    msg: "expected '\(content)', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
+            }
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// Add a container sharing the host directory a booted container already
+    /// mounts. The machine exports a directory once, so the added container
+    /// takes the export the machine booted with.
+    func testPodHotplugVirtiofsSameShare() async throws {
+        let id = "test-pod-hotplug-virtiofs-same-share"
+        let bs = try await bootstrap(id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 4
+            config.memoryInBytes = 1024.mib()
+            config.bootLog = bs.bootLog
+        }
+
+        let content = "hello from a directory the machine booted with"
+        let hostDir = FileManager.default.uniqueTemporaryDirectory(create: true)
+        try content.write(to: hostDir.appendingPathComponent("seed.txt"), atomically: true, encoding: .utf8)
+
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+            config.mounts.append(.share(source: hostDir.absolutePath(), destination: "/shared"))
+        }
+
+        try await pod.create()
+
+        let buffer = BufferWriter()
+        try await pod.addContainer("hot", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "hot")) { config in
+            config.process.arguments = ["/bin/cat", "/shared/seed.txt"]
+            config.mounts.append(.share(source: hostDir.absolutePath(), destination: "/shared"))
+            config.process.stdout = buffer
+        }
+
+        do {
+            try await pod.startContainer("hot")
+            let status = try await pod.waitContainer("hot")
+
+            try await pod.stopContainer("hot")
+            try await pod.stop()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "hot container status \(status) != 0")
+            }
+            guard String(data: buffer.data, encoding: .utf8) == content else {
+                throw IntegrationError.assert(
+                    msg: "expected '\(content)', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
+            }
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// A booted container keeps its directory share through another
+    /// container's whole hotplug lifecycle: a second container takes the
+    /// same export, stops (releasing its shares), the booted container
+    /// still reads the directory, and a third container takes the export
+    /// again.
+    func testPodHotplugVirtiofsShareLifecycle() async throws {
+        let id = "test-pod-hotplug-virtiofs-share-lifecycle"
+        let bs = try await bootstrap(id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 4
+            config.memoryInBytes = 1024.mib()
+            config.bootLog = bs.bootLog
+        }
+
+        let content = "hello from a directory shared across lifecycles"
+        let hostDir = FileManager.default.uniqueTemporaryDirectory(create: true)
+        try content.write(to: hostDir.appendingPathComponent("data.txt"), atomically: true, encoding: .utf8)
+
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+            config.mounts.append(.share(source: hostDir.absolutePath(), destination: "/shared"))
+        }
+
+        try await pod.create()
+        try await pod.startContainer("seed")
+
+        do {
+            for hot in ["hot1", "hot2"] {
+                let buffer = BufferWriter()
+                try await pod.addContainer(hot, rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: hot)) { config in
+                    config.process.arguments = ["/bin/cat", "/shared/data.txt"]
+                    config.mounts.append(.share(source: hostDir.absolutePath(), destination: "/shared"))
+                    config.process.stdout = buffer
+                }
+                try await pod.startContainer(hot)
+                let status = try await pod.waitContainer(hot)
+                try await pod.stopContainer(hot)
+                guard status.exitCode == 0 else {
+                    throw IntegrationError.assert(msg: "\(hot) container status \(status) != 0")
+                }
+                guard String(data: buffer.data, encoding: .utf8) == content else {
+                    throw IntegrationError.assert(
+                        msg: "\(hot): expected '\(content)', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
+                }
+
+                // The stopped container's shares were released; the booted
+                // container's export stays.
+                let execBuffer = BufferWriter()
+                let exec = try await pod.execInContainer("seed", processID: "check-\(hot)") { config in
+                    config.arguments = ["/bin/cat", "/shared/data.txt"]
+                    config.stdout = execBuffer
+                }
+                try await exec.start()
+                let execStatus = try await exec.wait()
+                try await exec.delete()
+                guard execStatus.exitCode == 0 else {
+                    throw IntegrationError.assert(msg: "seed read after \(hot) stop: status \(execStatus) != 0")
+                }
+                guard String(data: execBuffer.data, encoding: .utf8) == content else {
+                    throw IntegrationError.assert(
+                        msg: "seed after \(hot) stop: expected '\(content)', got '\(String(data: execBuffer.data, encoding: .utf8) ?? "nil")'")
+                }
+            }
+
+            try await pod.killContainer("seed", signal: .kill)
+            try await pod.waitContainer("seed")
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// A container in a pod given a writable layer writes into it, and the
+    /// image it was built from is left as it is for the pod's others.
     func testPodWritableLayer() async throws {
         let id = "test-pod-writable-layer"
 
