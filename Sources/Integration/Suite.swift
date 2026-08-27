@@ -513,6 +513,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("process false", testProcessFalse),
             Test("container trim reports bytes", testContainerTrimReportsBytes),
             Test("container cgroup delegation", testContainerCgroupDelegation),
+            Test("container mount propagation", testContainerMountPropagation),
             Test("process echo hi", testProcessEchoHi),
             Test("process no executable", testProcessNoExecutable),
             Test("process user", testProcessUser),
