@@ -344,12 +344,16 @@ struct IntegrationSuite: AsyncParsableCommand {
         // a ~2GB rootfs and a ~512MB initfs, so without reaping the dev
         // container fills its CoW layer in ~10 tests.
         if self.maxConcurrency == 1 {
-            let preserve = fsPath.absolutePath()
+            // contentsOfDirectory reports paths under /private, while testDir is
+            // built from FileManager's /var view of the same directory, so both
+            // sides are resolved before comparing.
+            let preserve = fsPath.resolvingSymlinksInPathWithPrivate().absolutePath()
             if let entries = try? FileManager.default.contentsOfDirectory(
                 at: Self.testDir,
                 includingPropertiesForKeys: nil
             ) {
-                for url in entries where url.absolutePath() != preserve {
+                for url in entries
+                where url.resolvingSymlinksInPathWithPrivate().absolutePath() != preserve {
                     try? FileManager.default.removeItem(at: url)
                 }
             }
@@ -508,6 +512,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("process true", testProcessTrue),
             Test("process false", testProcessFalse),
             Test("container trim reports bytes", testContainerTrimReportsBytes),
+            Test("container cgroup delegation", testContainerCgroupDelegation),
             Test("process echo hi", testProcessEchoHi),
             Test("process no executable", testProcessNoExecutable),
             Test("process user", testProcessUser),
@@ -616,6 +621,7 @@ struct IntegrationSuite: AsyncParsableCommand {
 
             // Pods
             Test("pod single container", testPodSingleContainer),
+            Test("pod cgroup delegation", testPodCgroupDelegation),
             Test("pod multiple containers", testPodMultipleContainers),
             Test("pod rootless containers", testPodRootlessContainers),
             Test("pod container output", testPodContainerOutput),
