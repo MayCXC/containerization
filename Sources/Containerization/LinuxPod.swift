@@ -88,6 +88,9 @@ public final class LinuxPod: Sendable {
         public var sysctl: [String: String] = [:]
         /// The mounts for the container.
         public var mounts: [Mount] = LinuxContainer.defaultMounts()
+        /// Prepare this container for a service manager to run as its init,
+        /// which needs somewhere writable to keep runtime state.
+        public var systemd: SystemdMode = .disabled
         /// Paths inside the container that vmexec hides from the workload.
         /// Defaults to the OCI standard set (``LinuxContainer/defaultMaskedPaths()``),
         /// matching the restricted capability baseline. Set to `[]` to opt out,
@@ -400,7 +403,10 @@ extension LinuxPod {
             var config = ContainerConfiguration()
             try configuration(&config)
 
-            let fileMountContext = try FileMountContext.prepare(mounts: config.mounts)
+            let fileMountContext = try FileMountContext.prepare(
+                mounts: LinuxContainer.systemdAwareMounts(
+                    config.mounts, systemd: config.systemd,
+                    arguments: config.process.arguments))
 
             switch state.phase {
             case .initialized:
