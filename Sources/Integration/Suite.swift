@@ -501,6 +501,8 @@ struct IntegrationSuite: AsyncParsableCommand {
             return [
                 Test("container interface custom MTU", testInterfaceMTU),
                 Test("container networking disabled", testNetworkingDisabled),
+                Test("dind rootless", testDindRootless),
+                Test("dind limits", testDindLimits),
                 Test("container networking enabled", testNetworkingEnabled),
                 Test("container networking enabled ipv6", testNetworkingEnabledIPv6),
                 Test("container IPv6 address", testIPv6AddressAdd),
