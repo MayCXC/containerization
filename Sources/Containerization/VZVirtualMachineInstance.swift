@@ -105,6 +105,9 @@ public final class VZVirtualMachineInstance: Sendable {
     private let ownsGroup: Bool
     private let timeSyncer: TimeSyncer
     private let logger: Logger?
+    /// The balloon this process implements (`VZVirtioBalloon`), where
+    /// Virtualization lets it; nil when the machine has none.
+    private nonisolated(unsafe) let balloon: AnyObject?
 
     public convenience init(
         group: EventLoopGroup? = nil,
@@ -135,8 +138,10 @@ public final class VZVirtualMachineInstance: Sendable {
         let (mountAttachments, _) = try config.mountAttachments(allocator: allocator)
         self._storage = Mutex(mountAttachments)
 
+        let balloon = Self.makeBalloon(config: config, logger: logger)
+        self.balloon = balloon
         self.vm = VZVirtualMachine(
-            configuration: try config.toVZ(allocator: allocator),
+            configuration: try config.toVZ(allocator: allocator, balloon: balloon),
             queue: self.queue
         )
 
@@ -251,6 +256,47 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
             try await self.vm.resume(queue: self.queue)
             await self.timeSyncer.resume()
         }
+    }
+
+    public func setTargetMemorySize(_ bytes: UInt64) async throws {
+        guard bytes <= self.config.memoryInBytes else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "cannot hold \(bytes) bytes, the machine was created with \(self.config.memoryInBytes)"
+            )
+        }
+        guard #available(macOS 27, *) else {
+            throw ContainerizationError(.unsupported, message: "memory balloon not supported")
+        }
+        try await lock.withLock { _ in
+            try await self.virtioBalloon().setTargetMemorySize(bytes)
+        }
+    }
+
+    public func memoryStatistics() async throws -> VirtualMachineMemoryStatistics {
+        guard #available(macOS 27, *) else {
+            throw ContainerizationError(.unsupported, message: "memory balloon not supported")
+        }
+        return try self.virtioBalloon().statistics()
+    }
+
+    @available(macOS 27, *)
+    private func virtioBalloon() throws -> VZVirtioBalloon {
+        guard let balloon = self.balloon as? VZVirtioBalloon else {
+            throw ContainerizationError(.unsupported, message: "memory balloon not supported")
+        }
+        return balloon
+    }
+
+    /// The balloon to attach, where Virtualization lets this process implement
+    /// one. Virtualization's own balloon releases nothing to macOS, so none is
+    /// attached before macOS 27.
+    private static func makeBalloon(config: Configuration, logger: Logger?) -> AnyObject? {
+        guard #available(macOS 27, *) else {
+            return nil
+        }
+        let mib: UInt64 = 1 << 20
+        return VZVirtioBalloon(memorySize: (config.memoryInBytes + mib - 1) & ~(mib - 1), logger: logger)
     }
 
     public func dialAgent() async throws -> Vminitd {
@@ -411,7 +457,7 @@ extension VZVirtualMachineInstance.Configuration {
         return [c]
     }
 
-    func toVZ(allocator: any AddressAllocator<Character>) throws -> VZVirtualMachineConfiguration {
+    func toVZ(allocator: any AddressAllocator<Character>, balloon: AnyObject? = nil) throws -> VZVirtualMachineConfiguration {
         var config = VZVirtualMachineConfiguration()
 
         config.cpuCount = self.cpus
@@ -419,6 +465,14 @@ extension VZVirtualMachineInstance.Configuration {
         config.memorySize = (self.memoryInBytes + mib - 1) & ~(mib - 1)
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
+        // A balloon lets the host take back memory the guest has stopped using.
+        // Nothing else can: the guest has no way to report a page it has freed,
+        // so without one those pages stay with the machine until the host runs
+        // short and compresses them as it would any cold memory, keeping pages
+        // the guest would have given up for nothing.
+        if #available(macOS 27, *), let balloon = balloon as? VZVirtioBalloon {
+            config.customVirtioDevices = [balloon.configuration]
+        }
 
         if let bootLog = self.bootLog {
             config.serialPorts = try serialPort(destination: bootLog)

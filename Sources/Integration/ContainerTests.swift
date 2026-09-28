@@ -315,6 +315,130 @@ extension IntegrationSuite {
         }
     }
 
+    func testContainerMemoryBalloon() async throws {
+        let id = "test-container-memory-balloon"
+        let bs = try await bootstrap(id)
+
+        let memory: UInt64 = 2048.mib()
+        let target: UInt64 = 1024.mib()
+        let filled: UInt64 = 768.mib()
+        let buffer = BufferWriter()
+        let helpersBefore = try VirtualMachineHelper.running()
+        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
+            // Memory a guest has never touched is not backed on the host, so a
+            // balloon that takes only those pages moves nothing. The guest fills
+            // a tmpfs to put real pages behind its memory and frees them again,
+            // leaving the machine holding pages the guest no longer wants, which
+            // is the state the balloon exists to resolve. The fill is random so
+            // that no page is one macOS could store for free.
+            config.mounts.append(
+                .any(
+                    type: "tmpfs", source: "tmpfs", destination: "/fill",
+                    options: ["rw", "size=1g"]))
+            config.process.arguments = [
+                "/bin/sh", "-c",
+                "dd if=/dev/urandom of=/fill/pages bs=1M count=\(filled / 1.mib()) 2>/dev/null; "
+                    + "echo filled; sleep 3; rm /fill/pages; "
+                    + "awk '/MemFree/ { print $2 }' /proc/meminfo; sleep 30; "
+                    + "awk '/MemFree/ { print $2 }' /proc/meminfo",
+            ]
+            config.process.stdout = buffer
+            config.memoryInBytes = memory
+            config.bootLog = bs.bootLog
+        }
+
+        func lines() -> [Substring] {
+            (String(data: buffer.data, encoding: .utf8) ?? "").split(separator: "\n")
+        }
+        func waitForLines(_ count: Int) async throws {
+            let deadline = ContinuousClock.now + .seconds(120)
+            while lines().count < count {
+                guard ContinuousClock.now < deadline else {
+                    throw IntegrationError.assert(msg: "workload printed \(lines()) before timing out")
+                }
+                try await Task.sleep(for: .milliseconds(200))
+            }
+        }
+
+        do {
+            try await container.create()
+            try await container.start()
+            // The helper's footprint is a record of what reached macOS; it is
+            // kept only when this machine's helper can be told apart.
+            let helper = try await VirtualMachineHelper.started(after: helpersBefore)
+            func sample(_ label: String) throws -> UInt64 {
+                guard let helper else {
+                    return 0
+                }
+                let described = try helper.describe()
+                log.info("balloon \(label): \(described)")
+                return try helper.footprint()
+            }
+            let booted = try sample("booted")
+
+            try await waitForLines(1)
+            let full = try sample("filled")
+            try await waitForLines(2)
+            try await Task.sleep(for: .seconds(1))
+            let freed = try sample("freed")
+
+            // The balloon asks for the guest's statistics each time they are
+            // read, so a report is there by the time the balloon has filled.
+            _ = try await container.memoryStatistics()
+            try await container.setTargetMemorySize(target)
+            var ballooned = freed
+            var statistics = try await container.memoryStatistics()
+            for second in 1...20 {
+                try await Task.sleep(for: .seconds(1))
+                ballooned = min(ballooned, try sample("+\(second)s"))
+                statistics = try await container.memoryStatistics()
+            }
+
+            let status = try await container.wait()
+            try await container.stop()
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "workload did not complete: \(status)")
+            }
+
+            let readings = lines().compactMap {
+                UInt64($0.trimmingCharacters(in: .whitespaces))
+            }
+            guard readings.count == 2 else {
+                throw IntegrationError.assert(msg: "expected two readings, got '\(lines())'")
+            }
+            let mib: UInt64 = 1.mib()
+            log.info(
+                "balloon host footprint MiB: booted=\(booted / mib) filled=\(full / mib) freed=\(freed / mib) ballooned=\(ballooned / mib); guest MemFree kB before=\(readings[0]) after=\(readings[1]); balloon=\(statistics.balloonSize / mib) reclaimable=\(statistics.reclaimableSize / mib) guest free=\((statistics.guest?.freeMemory ?? 0) / mib) MiB"
+            )
+            // The balloon holds what it takes, so the guest goes on reporting the
+            // same total while the memory it has free drops by close to the
+            // amount asked for. The driver keeps those pages accounted for in
+            // case it has to give them back, which is why the total does not
+            // move.
+            let takenByBalloon = Int64(readings[0]) - Int64(readings[1])
+            let asked = Int64((memory - target) / 1024)
+            guard takenByBalloon > asked / 2 else {
+                throw IntegrationError.assert(
+                    msg: "balloon took \(takenByBalloon) kB of the \(asked) kB asked for: "
+                        + "free before=\(readings[0]) after=\(readings[1])")
+            }
+            // What the guest gives up has to be memory macOS can take back: gone
+            // from its ledger already, or discarded rather than compressed the
+            // next time it needs memory. When that happens depends on the host,
+            // so the footprint above is a record, and this is the check.
+            guard statistics.balloonSize >= (memory - target) * 3 / 4, statistics.reclaimableSize >= statistics.balloonSize * 3 / 4 else {
+                throw IntegrationError.assert(
+                    msg: "balloon holds \(statistics.balloonSize / mib) MiB of which \(statistics.reclaimableSize / mib) MiB is reclaimable")
+            }
+            guard let free = statistics.guest?.freeMemory, free < readings[0] * 1024 else {
+                throw IntegrationError.assert(msg: "guest statistics never arrived or did not follow the balloon: \(String(describing: statistics.guest))")
+            }
+        } catch {
+            try? await container.stop()
+            throw error
+        }
+    }
+
     func testProcessEchoHi() async throws {
         let id = "test-process-echo-hi"
         let bs = try await bootstrap(id)
