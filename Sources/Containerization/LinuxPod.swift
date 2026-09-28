@@ -53,6 +53,10 @@ public final class LinuxPod: Sendable {
         /// their own. The `destination` field is ignored, as the area is
         /// enabled rather than mounted.
         public var swapLayer: Mount? = nil
+        /// Move the machine's balloon by this policy while the pod runs, so
+        /// that memory the guest is not using goes back to the host when the
+        /// host is short. Nil leaves the balloon empty.
+        public var memoryBalloonPolicy: MemoryBalloonPolicy? = nil
         /// The network interfaces for the pod.
         public var interfaces: [any Interface] = []
         /// Whether nested virtualization should be turned on for the pod.
@@ -249,6 +253,7 @@ public final class LinuxPod: Sendable {
         struct CreatedState: Sendable {
             let vm: any VirtualMachineInstance
             let relayManager: UnixSocketRelayManager
+            let balloon: (controller: MemoryBalloonController, task: Task<Void, Never>)?
         }
 
         func createdState(_ operation: String) throws -> CreatedState {
@@ -940,7 +945,25 @@ extension LinuxPod {
                     state.containers[id]?.state = .created
                 }
 
-                state.phase = .created(.init(vm: vm, relayManager: relayManager))
+                var balloon: (controller: MemoryBalloonController, task: Task<Void, Never>)?
+                if let policy = self.config.memoryBalloonPolicy, (try? await vm.memoryStatistics()) != nil {
+                    let controller = MemoryBalloonController(policy: policy)
+                    let task = Task {
+                        await controller.run {
+                            try await vm.memoryStatistics()
+                        } apply: { target, current in
+                            // Virtualization asks for the guest to be compacted
+                            // before the balloon takes pages, not before it
+                            // gives them back.
+                            if target < current {
+                                try await vm.compactGuestMemory()
+                            }
+                            try await vm.setTargetMemorySize(target)
+                        }
+                    }
+                    balloon = (controller, task)
+                }
+                state.phase = .created(.init(vm: vm, relayManager: relayManager, balloon: balloon))
             } catch {
                 try? await relayManager.stopAll()
                 try? await vm.stop()
@@ -1212,6 +1235,7 @@ extension LinuxPod {
             let createdState = try state.phase.createdState("stop")
 
             do {
+                createdState.balloon?.task.cancel()
                 try await createdState.relayManager.stopAll()
 
                 // Stop all containers
@@ -1433,6 +1457,14 @@ extension LinuxPod {
             try state.phase.createdState("memoryStatistics").vm
         }
         return try await vm.memoryStatistics()
+    }
+
+    /// What the balloon controller has done, or nil when the pod runs without one.
+    public func memoryBalloonReport() async throws -> MemoryBalloonController.Report? {
+        let createdState = try await self.state.withLock { state in
+            try state.phase.createdState("memoryBalloonReport")
+        }
+        return await createdState.balloon?.controller.currentReport()
     }
 
     // Perform filesystem operations in a container.

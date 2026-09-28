@@ -59,6 +59,44 @@ extension IntegrationSuite {
         }
     }
 
+    func testPodMemoryBalloonPolicy() async throws {
+        let id = "test-pod-memory-balloon-policy"
+
+        let bs = try await bootstrap(id)
+        // A threshold above every possible free fraction keeps the host under
+        // pressure whatever it really has, and short intervals let the policy
+        // take several steps within the test.
+        var policy = MemoryBalloonPolicy()
+        policy.pressureThreshold = 1.01
+        policy.sampleInterval = .milliseconds(500)
+        policy.decisionInterval = .seconds(1)
+        policy.sampleHistory = 2
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.cpus = 2
+            config.memoryInBytes = 2048.mib()
+            config.bootLog = bs.bootLog
+            config.memoryBalloonPolicy = policy
+        }
+
+        try await pod.addContainer("container1", rootfs: bs.rootfs) { config in
+            config.process.arguments = ["/bin/sleep", "20"]
+        }
+
+        try await pod.create()
+        try await pod.startContainer("container1")
+        try await Task.sleep(for: .seconds(12))
+        let statistics = try await pod.memoryStatistics()
+        let report = try await pod.memoryBalloonReport()
+        try await pod.stop()
+
+        log.info(
+            "balloon policy: \(String(describing: report)) balloon=\(statistics.balloonSize >> 20) MiB reclaimable=\(statistics.reclaimableSize >> 20) MiB"
+        )
+        guard let report, report.applied >= 3, statistics.balloonSize > 0 else {
+            throw IntegrationError.assert(msg: "the policy did not shrink the machine: \(String(describing: report)), balloon \(statistics.balloonSize)")
+        }
+    }
+
     func testPodMultipleContainers() async throws {
         let id = "test-pod-multiple-containers"
 
