@@ -970,13 +970,7 @@ extension LinuxPod {
                                     try await agent.memoryInfo()
                                 }
                             },
-                            apply: { target, current in
-                                // Gathering the guest's free memory helps the
-                                // balloon take whole host pages, and does
-                                // nothing for giving pages back.
-                                if target < current {
-                                    try await vm.compactGuestMemory()
-                                }
+                            apply: { target, _ in
                                 try await vm.setTargetMemorySize(target)
                             }
                         )
