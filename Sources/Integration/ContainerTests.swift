@@ -315,6 +315,7 @@ extension IntegrationSuite {
         }
     }
 
+    #if os(macOS)
     func testContainerMemoryBalloon() async throws {
         let id = "test-container-memory-balloon"
         let bs = try await bootstrap(id)
@@ -533,6 +534,7 @@ extension IntegrationSuite {
             throw error
         }
     }
+    #endif
 
     func testProcessEchoHi() async throws {
         let id = "test-process-echo-hi"
