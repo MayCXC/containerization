@@ -417,6 +417,19 @@ struct IntegrationSuite: AsyncParsableCommand {
         }
         return []
     }
+
+    /// The balloon is a Virtio device this process implements, which
+    /// Virtualization allows from macOS 27.
+    private func macOS27Tests() -> [Test] {
+        if #available(macOS 27.0, *) {
+            return [
+                Test("container memory balloon", testContainerMemoryBalloon),
+                Test("container memory balloon keeps guest data", testContainerMemoryBalloonKeepsGuestData),
+                Test("container memory compaction", testContainerMemoryCompaction),
+            ]
+        }
+        return []
+    }
     #endif
 
     // Why does this exist?
@@ -439,9 +452,6 @@ struct IntegrationSuite: AsyncParsableCommand {
             // Process basics
             Test("process true", testProcessTrue),
             Test("process false", testProcessFalse),
-            Test("container memory balloon", testContainerMemoryBalloon),
-            Test("container memory balloon keeps guest data", testContainerMemoryBalloonKeepsGuestData),
-            Test("container memory compaction", testContainerMemoryCompaction),
             Test("process echo hi", testProcessEchoHi),
             Test("process no executable", testProcessNoExecutable),
             Test("process user", testProcessUser),
@@ -648,7 +658,7 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("container swap", testContainerSwap),
                 Test("container swap under pressure", testContainerSwapUnderPressure),
                 Test("container swap reclaims freed blocks", testContainerSwapReclaimsFreedBlocks),
-            ] + macOS26Tests()
+            ] + macOS26Tests() + macOS27Tests()
         let tests: [Test] = crossPlatformTests + macOSOnlyTests
         #else
         // Hotplug into a running pod VM is CH-only (VZ has no runtime hotplug),
