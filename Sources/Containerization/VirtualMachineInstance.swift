@@ -139,16 +139,20 @@ extension VirtualMachineInstance {
         throw ContainerizationError(.unsupported, message: "memory balloon not supported")
     }
 
-    /// Gather the guest's free memory into contiguous runs.
+    /// Gather the guest's free memory into contiguous runs, if `policy`
+    /// calls for it now.
     ///
     /// The balloon can hand the host only whole host pages, and the guest's
     /// pages are smaller, so the pages the guest gives up are worth most when
-    /// they sit together. Virtualization asks for the same before its own
-    /// balloon is driven:
-    /// https://developer.apple.com/documentation/virtualization/vzvirtiotraditionalmemoryballoondevice
-    public func compactGuestMemory() async throws {
+    /// they sit together. Compacting costs the guest time, so the guest
+    /// decides as Kata's mem-agent does whether it is worth it, and stops if
+    /// its workloads start to stall (see ``MemoryCompactionPolicy``). The
+    /// kernel has to report pressure stall information for that, which a
+    /// machine with a balloon boots with.
+    @discardableResult
+    public func compactGuestMemory(policy: MemoryCompactionPolicy = .init()) async throws -> MemoryCompactionPolicy.Outcome {
         try await withAgent { agent in
-            try await agent.sysctl(settings: ["vm.compact_memory": "1"])
+            try await agent.compactMemory(policy: policy)
         }
     }
 }

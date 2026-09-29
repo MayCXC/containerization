@@ -441,6 +441,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("process false", testProcessFalse),
             Test("container memory balloon", testContainerMemoryBalloon),
             Test("container memory balloon keeps guest data", testContainerMemoryBalloonKeepsGuestData),
+            Test("container memory compaction", testContainerMemoryCompaction),
             Test("process echo hi", testProcessEchoHi),
             Test("process no executable", testProcessNoExecutable),
             Test("process user", testProcessUser),

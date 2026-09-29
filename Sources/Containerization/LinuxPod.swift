@@ -1460,14 +1460,11 @@ extension LinuxPod {
     /// again, so nothing changes until the guest has acted on the request.
     ///
     /// The pod's containers share the machine's memory, so this bounds all of
-    /// them together rather than any one of them. The guest's free memory is
-    /// gathered together first, so that what the guest gives up fills whole
-    /// host pages.
+    /// them together rather than any one of them.
     public func setTargetMemorySize(_ bytes: UInt64) async throws {
         let vm = try await self.state.withLock { state in
             try state.phase.createdState("setTargetMemorySize").vm
         }
-        try await vm.compactGuestMemory()
         try await vm.setTargetMemorySize(bytes)
     }
 
