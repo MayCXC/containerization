@@ -309,6 +309,19 @@ public enum Com_Apple_Containerization_Sandbox_V3_SandboxContext: Sendable {
                 type: .unary
             )
         }
+        /// Namespace for "MemoryInfo" metadata.
+        public enum MemoryInfo: Sendable {
+            /// Request type for "MemoryInfo".
+            public typealias Input = Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest
+            /// Response type for "MemoryInfo".
+            public typealias Output = Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse
+            /// Descriptor for "MemoryInfo".
+            public static let descriptor = GRPCCore.MethodDescriptor(
+                service: GRPCCore.ServiceDescriptor(fullyQualifiedService: "com.apple.containerization.sandbox.v3.SandboxContext"),
+                method: "MemoryInfo",
+                type: .unary
+            )
+        }
         /// Namespace for "ProxyVsock" metadata.
         public enum ProxyVsock: Sendable {
             /// Request type for "ProxyVsock".
@@ -462,6 +475,7 @@ public enum Com_Apple_Containerization_Sandbox_V3_SandboxContext: Sendable {
             ResizeProcess.descriptor,
             CloseProcessStdin.descriptor,
             ContainerStatistics.descriptor,
+            MemoryInfo.descriptor,
             ProxyVsock.descriptor,
             StopVsockProxy.descriptor,
             IpLinkSet.descriptor,
@@ -881,6 +895,24 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext {
             request: GRPCCore.StreamingServerRequest<Com_Apple_Containerization_Sandbox_V3_ContainerStatisticsRequest>,
             context: GRPCCore.ServerContext
         ) async throws -> GRPCCore.StreamingServerResponse<Com_Apple_Containerization_Sandbox_V3_ContainerStatisticsResponse>
+
+        /// Handle the "MemoryInfo" method.
+        ///
+        /// > Source IDL Documentation:
+        /// >
+        /// > Get the guest kernel's account of its memory from /proc/meminfo.
+        ///
+        /// - Parameters:
+        ///   - request: A streaming request of `Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest` messages.
+        ///   - context: Context providing information about the RPC.
+        /// - Throws: Any error which occurred during the processing of the request. Thrown errors
+        ///     of type `RPCError` are mapped to appropriate statuses. All other errors are converted
+        ///     to an internal error.
+        /// - Returns: A streaming response of `Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse` messages.
+        func memoryInfo(
+            request: GRPCCore.StreamingServerRequest<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>,
+            context: GRPCCore.ServerContext
+        ) async throws -> GRPCCore.StreamingServerResponse<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse>
 
         /// Handle the "ProxyVsock" method.
         ///
@@ -1456,6 +1488,24 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext {
             context: GRPCCore.ServerContext
         ) async throws -> GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_ContainerStatisticsResponse>
 
+        /// Handle the "MemoryInfo" method.
+        ///
+        /// > Source IDL Documentation:
+        /// >
+        /// > Get the guest kernel's account of its memory from /proc/meminfo.
+        ///
+        /// - Parameters:
+        ///   - request: A request containing a single `Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest` message.
+        ///   - context: Context providing information about the RPC.
+        /// - Throws: Any error which occurred during the processing of the request. Thrown errors
+        ///     of type `RPCError` are mapped to appropriate statuses. All other errors are converted
+        ///     to an internal error.
+        /// - Returns: A response containing a single `Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse` message.
+        func memoryInfo(
+            request: GRPCCore.ServerRequest<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>,
+            context: GRPCCore.ServerContext
+        ) async throws -> GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse>
+
         /// Handle the "ProxyVsock" method.
         ///
         /// > Source IDL Documentation:
@@ -2029,6 +2079,24 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext {
             context: GRPCCore.ServerContext
         ) async throws -> Com_Apple_Containerization_Sandbox_V3_ContainerStatisticsResponse
 
+        /// Handle the "MemoryInfo" method.
+        ///
+        /// > Source IDL Documentation:
+        /// >
+        /// > Get the guest kernel's account of its memory from /proc/meminfo.
+        ///
+        /// - Parameters:
+        ///   - request: A `Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest` message.
+        ///   - context: Context providing information about the RPC.
+        /// - Throws: Any error which occurred during the processing of the request. Thrown errors
+        ///     of type `RPCError` are mapped to appropriate statuses. All other errors are converted
+        ///     to an internal error.
+        /// - Returns: A `Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse` to respond with.
+        func memoryInfo(
+            request: Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest,
+            context: GRPCCore.ServerContext
+        ) async throws -> Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse
+
         /// Handle the "ProxyVsock" method.
         ///
         /// > Source IDL Documentation:
@@ -2447,6 +2515,17 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext.StreamingServiceP
             }
         )
         router.registerHandler(
+            forMethod: Com_Apple_Containerization_Sandbox_V3_SandboxContext.Method.MemoryInfo.descriptor,
+            deserializer: GRPCProtobuf.ProtobufDeserializer<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>(),
+            serializer: GRPCProtobuf.ProtobufSerializer<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse>(),
+            handler: { request, context in
+                try await self.memoryInfo(
+                    request: request,
+                    context: context
+                )
+            }
+        )
+        router.registerHandler(
             forMethod: Com_Apple_Containerization_Sandbox_V3_SandboxContext.Method.ProxyVsock.descriptor,
             deserializer: GRPCProtobuf.ProtobufDeserializer<Com_Apple_Containerization_Sandbox_V3_ProxyVsockRequest>(),
             serializer: GRPCProtobuf.ProtobufSerializer<Com_Apple_Containerization_Sandbox_V3_ProxyVsockResponse>(),
@@ -2787,6 +2866,17 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext.ServiceProtocol {
         context: GRPCCore.ServerContext
     ) async throws -> GRPCCore.StreamingServerResponse<Com_Apple_Containerization_Sandbox_V3_ContainerStatisticsResponse> {
         let response = try await self.containerStatistics(
+            request: GRPCCore.ServerRequest(stream: request),
+            context: context
+        )
+        return GRPCCore.StreamingServerResponse(single: response)
+    }
+
+    public func memoryInfo(
+        request: GRPCCore.StreamingServerRequest<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>,
+        context: GRPCCore.ServerContext
+    ) async throws -> GRPCCore.StreamingServerResponse<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse> {
+        let response = try await self.memoryInfo(
             request: GRPCCore.ServerRequest(stream: request),
             context: context
         )
@@ -3177,6 +3267,19 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServiceProt
     ) async throws -> GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_ContainerStatisticsResponse> {
         return GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_ContainerStatisticsResponse>(
             message: try await self.containerStatistics(
+                request: request.message,
+                context: context
+            ),
+            metadata: [:]
+        )
+    }
+
+    public func memoryInfo(
+        request: GRPCCore.ServerRequest<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>,
+        context: GRPCCore.ServerContext
+    ) async throws -> GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse> {
+        return GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse>(
+            message: try await self.memoryInfo(
                 request: request.message,
                 context: context
             ),
@@ -3812,6 +3915,29 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext {
             deserializer: some GRPCCore.MessageDeserializer<Com_Apple_Containerization_Sandbox_V3_ContainerStatisticsResponse>,
             options: GRPCCore.CallOptions,
             onResponse handleResponse: @Sendable @escaping (GRPCCore.ClientResponse<Com_Apple_Containerization_Sandbox_V3_ContainerStatisticsResponse>) async throws -> Result
+        ) async throws -> Result where Result: Sendable
+
+        /// Call the "MemoryInfo" method.
+        ///
+        /// > Source IDL Documentation:
+        /// >
+        /// > Get the guest kernel's account of its memory from /proc/meminfo.
+        ///
+        /// - Parameters:
+        ///   - request: A request containing a single `Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest` message.
+        ///   - serializer: A serializer for `Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest` messages.
+        ///   - deserializer: A deserializer for `Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse` messages.
+        ///   - options: Options to apply to this RPC.
+        ///   - handleResponse: A closure which handles the response, the result of which is
+        ///       returned to the caller. Returning from the closure will cancel the RPC if it
+        ///       hasn't already finished.
+        /// - Returns: The result of `handleResponse`.
+        func memoryInfo<Result>(
+            request: GRPCCore.ClientRequest<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>,
+            serializer: some GRPCCore.MessageSerializer<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>,
+            deserializer: some GRPCCore.MessageDeserializer<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse>,
+            options: GRPCCore.CallOptions,
+            onResponse handleResponse: @Sendable @escaping (GRPCCore.ClientResponse<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse>) async throws -> Result
         ) async throws -> Result where Result: Sendable
 
         /// Call the "ProxyVsock" method.
@@ -4780,6 +4906,40 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext {
             )
         }
 
+        /// Call the "MemoryInfo" method.
+        ///
+        /// > Source IDL Documentation:
+        /// >
+        /// > Get the guest kernel's account of its memory from /proc/meminfo.
+        ///
+        /// - Parameters:
+        ///   - request: A request containing a single `Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest` message.
+        ///   - serializer: A serializer for `Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest` messages.
+        ///   - deserializer: A deserializer for `Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse` messages.
+        ///   - options: Options to apply to this RPC.
+        ///   - handleResponse: A closure which handles the response, the result of which is
+        ///       returned to the caller. Returning from the closure will cancel the RPC if it
+        ///       hasn't already finished.
+        /// - Returns: The result of `handleResponse`.
+        public func memoryInfo<Result>(
+            request: GRPCCore.ClientRequest<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>,
+            serializer: some GRPCCore.MessageSerializer<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>,
+            deserializer: some GRPCCore.MessageDeserializer<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse>,
+            options: GRPCCore.CallOptions = .defaults,
+            onResponse handleResponse: @Sendable @escaping (GRPCCore.ClientResponse<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse>) async throws -> Result = { response in
+                try response.message
+            }
+        ) async throws -> Result where Result: Sendable {
+            try await self.client.unary(
+                request: request,
+                descriptor: Com_Apple_Containerization_Sandbox_V3_SandboxContext.Method.MemoryInfo.descriptor,
+                serializer: serializer,
+                deserializer: deserializer,
+                options: options,
+                onResponse: handleResponse
+            )
+        }
+
         /// Call the "ProxyVsock" method.
         ///
         /// > Source IDL Documentation:
@@ -5730,6 +5890,35 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext.ClientProtocol {
             request: request,
             serializer: GRPCProtobuf.ProtobufSerializer<Com_Apple_Containerization_Sandbox_V3_ContainerStatisticsRequest>(),
             deserializer: GRPCProtobuf.ProtobufDeserializer<Com_Apple_Containerization_Sandbox_V3_ContainerStatisticsResponse>(),
+            options: options,
+            onResponse: handleResponse
+        )
+    }
+
+    /// Call the "MemoryInfo" method.
+    ///
+    /// > Source IDL Documentation:
+    /// >
+    /// > Get the guest kernel's account of its memory from /proc/meminfo.
+    ///
+    /// - Parameters:
+    ///   - request: A request containing a single `Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest` message.
+    ///   - options: Options to apply to this RPC.
+    ///   - handleResponse: A closure which handles the response, the result of which is
+    ///       returned to the caller. Returning from the closure will cancel the RPC if it
+    ///       hasn't already finished.
+    /// - Returns: The result of `handleResponse`.
+    public func memoryInfo<Result>(
+        request: GRPCCore.ClientRequest<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>,
+        options: GRPCCore.CallOptions = .defaults,
+        onResponse handleResponse: @Sendable @escaping (GRPCCore.ClientResponse<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse>) async throws -> Result = { response in
+            try response.message
+        }
+    ) async throws -> Result where Result: Sendable {
+        try await self.memoryInfo(
+            request: request,
+            serializer: GRPCProtobuf.ProtobufSerializer<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>(),
+            deserializer: GRPCProtobuf.ProtobufDeserializer<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse>(),
             options: options,
             onResponse: handleResponse
         )
@@ -6717,6 +6906,39 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext.ClientProtocol {
             metadata: metadata
         )
         return try await self.containerStatistics(
+            request: request,
+            options: options,
+            onResponse: handleResponse
+        )
+    }
+
+    /// Call the "MemoryInfo" method.
+    ///
+    /// > Source IDL Documentation:
+    /// >
+    /// > Get the guest kernel's account of its memory from /proc/meminfo.
+    ///
+    /// - Parameters:
+    ///   - message: request message to send.
+    ///   - metadata: Additional metadata to send, defaults to empty.
+    ///   - options: Options to apply to this RPC, defaults to `.defaults`.
+    ///   - handleResponse: A closure which handles the response, the result of which is
+    ///       returned to the caller. Returning from the closure will cancel the RPC if it
+    ///       hasn't already finished.
+    /// - Returns: The result of `handleResponse`.
+    public func memoryInfo<Result>(
+        _ message: Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest,
+        metadata: GRPCCore.Metadata = [:],
+        options: GRPCCore.CallOptions = .defaults,
+        onResponse handleResponse: @Sendable @escaping (GRPCCore.ClientResponse<Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse>) async throws -> Result = { response in
+            try response.message
+        }
+    ) async throws -> Result where Result: Sendable {
+        let request = GRPCCore.ClientRequest<Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest>(
+            message: message,
+            metadata: metadata
+        )
+        return try await self.memoryInfo(
             request: request,
             options: options,
             onResponse: handleResponse
