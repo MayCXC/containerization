@@ -23,7 +23,10 @@ import Darwin
 #endif
 
 /// How much memory a machine's balloon should leave it, and how fast to get
-/// there.
+/// there: a line-by-line translation of `MemoryBalloonPolicy.rules`, the
+/// policy written in the language of oVirt's Memory Overcommitment Manager.
+/// MoM's own engine runs that file to record the decisions the unit tests
+/// hold this translation to (scripts/memory-balloon-policy-decisions.py).
 ///
 /// The target is Hyper-V Dynamic Memory's: what the guest needs plus a buffer
 /// of `buffer` times that, whether the host is short or not, so a machine
@@ -50,20 +53,23 @@ import Darwin
 /// grows to its target at once, as MoM grows a guest short of its desired free
 /// memory, and changes under `minChange` are skipped.
 public struct MemoryBalloonPolicy: Sendable, Equatable {
-    /// Hyper-V's memory buffer, as a fraction of what the guest needs.
+    /// Hyper-V's memory buffer, as a fraction of what the guest needs, the
+    /// policy's `memory_buffer`.
     public var buffer: Double = 0.20
-    /// The host free fraction below which the buffer narrows.
+    /// The host free fraction below which the buffer narrows,
+    /// `pressure_threshold`.
     public var pressureThreshold: Double = 0.20
     /// The host free fraction at or below which the guest is held under what
-    /// it needs.
+    /// it needs, `pressure_critical`.
     public var pressureCritical: Double = 0.05
     /// The largest shrink in one decision, as a fraction of what the machine
-    /// holds.
+    /// holds, `max_balloon_change_percent`.
     public var maxShrink: Double = 0.05
     /// Changes smaller than this fraction of what the machine holds are
-    /// skipped.
+    /// skipped, `min_balloon_change_percent`.
     public var minChange: Double = 0.0025
-    /// The least a machine is asked to hold, Hyper-V's minimum memory.
+    /// The least a machine is asked to hold, Hyper-V's minimum memory and the
+    /// policy's `balloon_min`.
     public var minimum: UInt64 = 0
     /// How often the guest and host are sampled, and how many samples are
     /// averaged, `guest-monitor-interval` and `sample-history-length` of
@@ -130,46 +136,54 @@ public struct MemoryBalloonPolicy: Sendable, Equatable {
         }
     }
 
-    /// The size to ask the machine to hold next, or nil to leave it.
+    /// The size to ask the machine to hold next, or nil to leave it: the
+    /// policy's main script and `balloon_guest`.
     /// - Parameters:
-    ///   - samples: The latest readings, oldest first. The host's free memory
-    ///     and the guest's needs are averaged over them, as MoM averages its
-    ///     statistics, except that a latest need above the average is taken
-    ///     as it is: a guest that comes to need more gets it at the next
-    ///     decision, as Kubernetes' autoscaler scales up with no stabilization
-    ///     window and smooths only its scaling down:
+    ///   - samples: The latest readings, oldest first, the statistics MoM
+    ///     averages with `StatAvg` and reads the last of with `Stat`. A latest
+    ///     need above the average is taken as it is, as Kubernetes' autoscaler
+    ///     scales up with no stabilization window and smooths only its scaling
+    ///     down:
     ///     https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/#stabilization-window
-    ///     The machine moves from what it holds in the last.
-    ///   - maximum: The size the machine was created with.
+    ///   - maximum: The size the machine was created with, `balloon_max`.
     public func nextTarget(samples: [Sample], maximum: UInt64) -> UInt64? {
         guard let latest = samples.last else {
             return nil
         }
         let count = Double(samples.count)
-        let hostFree = samples.map(\.hostFree).reduce(0, +) / count
-        let needs = max(samples.map { Double($0.needs) }.reduce(0, +) / count, Double(latest.needs))
-        let current = Double(latest.current)
+        let hostFreePercent = samples.map(\.hostFree).reduce(0, +) / count
+        let balloonCur = Double(latest.current)
 
-        let share: Double
-        if hostFree >= pressureThreshold {
-            share = buffer
-        } else if hostFree > pressureCritical {
-            share = buffer * (hostFree / pressureThreshold)
-        } else {
-            // MoM's "Force guest to swap by making free memory negative".
-            share = -0.05 + hostFree
-        }
-        var size = min(max(needs * (1 + share), Double(minimum)), Double(maximum))
-        if size < current {
+        let guestNeeds = max(samples.map { Double($0.needs) }.reduce(0, +) / count, Double(latest.needs))
+        var balloonSize = min(max(guestNeeds * (1 + bufferShare(hostFreePercent)), Double(minimum)), Double(maximum))
+        if balloonSize < balloonCur {
             // hv_balloon's balloon_up refuses to take the guest's available
             // memory below its floor; virtio_balloon leaves that to the host.
             let spare = Double(latest.available - min(latest.floor, latest.available))
-            size = max(size, current * (1 - maxShrink), current - spare)
+            balloonSize = max(balloonSize, balloonCur * (1 - maxShrink), balloonCur - spare)
         }
-        guard abs(size - current) > minChange * current else {
+        guard changeBigEnough(balloonSize, balloonCur: balloonCur) else {
             return nil
         }
-        return UInt64(size)
+        return UInt64(balloonSize)
+    }
+
+    /// The policy's `buffer_share`: the buffer, scaled back according to host
+    /// pressure as MoM scales a guest's free memory, and made negative to hold
+    /// the guest under its needs when the pressure is critical.
+    func bufferShare(_ hostFreePercent: Double) -> Double {
+        if hostFreePercent >= pressureThreshold {
+            return buffer
+        } else if hostFreePercent > pressureCritical {
+            return buffer * (hostFreePercent / pressureThreshold)
+        } else {
+            return -0.05 + hostFreePercent
+        }
+    }
+
+    /// The policy's `change_big_enough`.
+    func changeBigEnough(_ newValue: Double, balloonCur: Double) -> Bool {
+        abs(newValue - balloonCur) > minChange * balloonCur
     }
 
     /// hv_balloon's `compute_balloon_floor` for a kernel holding `bytes`: a
