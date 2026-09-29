@@ -20,6 +20,7 @@ import Containerization
 import ContainerizationError
 import ContainerizationOS
 import Foundation
+import LCShim
 import Logging
 import Synchronization
 
@@ -160,13 +161,13 @@ actor MemoryCompactor {
     /// Free memory and fragments now. `MemFree` is the kernel's count of free
     /// pages, which sysinfo(2) reports as `freeram`.
     private static func reading(_ policy: MemoryCompactionPolicy) throws -> MemoryCompactionPolicy.Reading {
-        var info = sysinfo()
-        guard sysinfo(&info) == 0 else {
+        var freeBytes: UInt64 = 0
+        guard CZ_free_ram(&freeBytes) == 0 else {
             throw POSIXError(.init(rawValue: errno) ?? .EINVAL)
         }
         let pagetypeinfo = try String(contentsOfFile: "/proc/pagetypeinfo", encoding: .utf8)
         return .init(
-            freeBytes: UInt64(info.freeram) * UInt64(info.mem_unit),
+            freeBytes: freeBytes,
             fragmentedPages: policy.fragmentedPages(pagetypeinfo: pagetypeinfo)
         )
     }
