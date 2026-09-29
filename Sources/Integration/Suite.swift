@@ -425,6 +425,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             return [
                 Test("container memory balloon", testContainerMemoryBalloon),
                 Test("container memory balloon keeps guest data", testContainerMemoryBalloonKeepsGuestData),
+                Test("pod memory balloon policy", testPodMemoryBalloonPolicy),
             ]
         }
         return []
@@ -559,7 +560,6 @@ struct IntegrationSuite: AsyncParsableCommand {
 
             // Pods
             Test("pod single container", testPodSingleContainer),
-            Test("pod memory balloon policy", testPodMemoryBalloonPolicy),
             Test("pod multiple containers", testPodMultipleContainers),
             Test("pod container output", testPodContainerOutput),
             Test("pod concurrent containers", testPodConcurrentContainers),
