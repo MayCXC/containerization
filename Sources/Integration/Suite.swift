@@ -351,7 +351,8 @@ struct IntegrationSuite: AsyncParsableCommand {
         return VZVirtualMachineManager(
             kernel: kernel,
             initialFilesystem: initialFilesystem,
-            group: Self.eventLoop
+            group: Self.eventLoop,
+            logger: log
         )
         #elseif os(Linux)
         return try CHVirtualMachineManager(
@@ -438,6 +439,8 @@ struct IntegrationSuite: AsyncParsableCommand {
             // Process basics
             Test("process true", testProcessTrue),
             Test("process false", testProcessFalse),
+            Test("container memory balloon", testContainerMemoryBalloon),
+            Test("container memory balloon keeps guest data", testContainerMemoryBalloonKeepsGuestData),
             Test("process echo hi", testProcessEchoHi),
             Test("process no executable", testProcessNoExecutable),
             Test("process user", testProcessUser),
