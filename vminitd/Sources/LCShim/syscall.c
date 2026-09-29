@@ -18,6 +18,7 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <unistd.h>
 
 #include "syscall.h"
@@ -48,5 +49,14 @@ int CZ_setrlimit(int resource, unsigned long long soft,
   limit.rlim_cur = (rlim_t)soft;
   limit.rlim_max = (rlim_t)hard;
   return setrlimit(resource, &limit);
+}
+
+int CZ_free_ram(unsigned long long *bytes) {
+  struct sysinfo info;
+  if (sysinfo(&info) != 0) {
+    return -1;
+  }
+  *bytes = (unsigned long long)info.freeram * info.mem_unit;
+  return 0;
 }
 #endif

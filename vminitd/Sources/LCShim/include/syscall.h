@@ -101,4 +101,9 @@ int CZ_pidfd_getfd(int pidfd, int targetfd, unsigned int flags);
 
 int CZ_prctl_set_no_new_privs();
 
+// The kernel's count of free memory in bytes, sysinfo(2)'s freeram, which
+// /proc/meminfo prints as MemFree. glibc's Swift module does not export
+// sysinfo.
+int CZ_free_ram(unsigned long long *bytes);
+
 #endif
