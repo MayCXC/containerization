@@ -577,6 +577,15 @@ extension IntegrationSuite {
                 try await vm.compactGuestMemory(policy: policy)
             }
         }
+        /// Free movable pages in blocks of orders 0 and 1, what the guest
+        /// counts as fragments.
+        func fragmentedPages() async throws -> UInt64 {
+            let output = try await run("pagetypeinfo", "awk '$6 == \"Movable\" { s += $7 + 2 * $8 } END { print s }' /proc/pagetypeinfo")
+            guard let pages = UInt64(output.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                throw IntegrationError.assert(msg: "no movable free pages in /proc/pagetypeinfo: '\(output)'")
+            }
+            return pages
+        }
 
         do {
             try await container.create()
@@ -593,8 +602,30 @@ extension IntegrationSuite {
             // file removed.
             _ = try await run(
                 "fragment",
-                "cd /fill && i=0; while [ $i -lt 20000 ]; do printf x > $i; i=$((i + 1)); done; rm -f *[02468]"
+                "set -e; cd /fill; i=0; while [ $i -lt 20000 ]; do printf x > $i; i=$((i + 1)); done; rm -f -- *[02468]"
             )
+            // Freed pages wait in per-CPU lists, which /proc/pagetypeinfo
+            // leaves out and which the kernel drains an eighth at a time each
+            // second (decay_pcp_high in mm/page_alloc.c), so the scattered
+            // pages reach the free lists the guest compacts by over tens of
+            // seconds. The attempts start once those lists stop growing.
+            var fragmented = try await fragmentedPages()
+            let deadline = ContinuousClock.now + .seconds(120)
+            while true {
+                try await Task.sleep(for: .seconds(2))
+                let now = try await fragmentedPages()
+                let settled = now < fragmented + 64
+                fragmented = now
+                if settled {
+                    break
+                }
+                guard ContinuousClock.now < deadline else {
+                    throw IntegrationError.assert(msg: "the guest's free lists were still growing after two minutes: \(now) pages")
+                }
+            }
+            guard fragmented > MemoryCompactionPolicy().threshold else {
+                throw IntegrationError.assert(msg: "removing every other page left \(fragmented) scattered free pages")
+            }
             let before = try await migrateScanned()
             let first = try await compact(MemoryCompactionPolicy())
             let after = try await migrateScanned()
