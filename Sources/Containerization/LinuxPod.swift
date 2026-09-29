@@ -1574,6 +1574,19 @@ extension LinuxPod {
         return try await fn(vm)
     }
 
+    /// Ask the machine to hold no more than `bytes`. The balloon takes the
+    /// difference from the guest, and hands it back when the target is raised
+    /// again, so nothing changes until the guest has acted on the request.
+    ///
+    /// The pod's containers share the machine's memory, so this bounds all of
+    /// them together rather than any one of them.
+    public func setTargetMemorySize(_ bytes: UInt64) async throws {
+        let vm = try await self.state.withLock { state in
+            try state.phase.createdState("setTargetMemorySize").vm
+        }
+        try await vm.setTargetMemorySize(bytes)
+    }
+
     // Perform filesystem operations in a container.
     public func filesystemOperation(_ containerID: String, operation: FilesystemOperation, path: String) async throws {
         try await self.state.withLock { state in
