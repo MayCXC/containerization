@@ -134,6 +134,43 @@ struct MemoryBalloonPolicyTests {
         }
     }
 
+    /// What MoM's own engine decided running `MemoryBalloonPolicy.rules`,
+    /// recorded by scripts/memory-balloon-policy-decisions.py.
+    private struct Decisions: Decodable {
+        struct Reading: Decodable {
+            var hostFree: Double
+            var current: UInt64
+            var needs: UInt64
+            var available: UInt64
+            var floor: UInt64
+        }
+
+        struct Case: Decodable {
+            var minimum: UInt64
+            var maximum: UInt64
+            var samples: [Reading]
+            var target: UInt64?
+        }
+
+        var cases: [Case]
+    }
+
+    @Test func decidesAsMoMsEngineDoesRunningThePolicyFile() throws {
+        let url = try #require(Bundle.module.url(forResource: "MemoryBalloonPolicyDecisions", withExtension: "json"))
+        let decisions = try JSONDecoder().decode(Decisions.self, from: Data(contentsOf: url))
+        #expect(decisions.cases.contains { $0.target == nil })
+        #expect(decisions.cases.contains { $0.target != nil })
+        for (index, recorded) in decisions.cases.enumerated() {
+            var policy = MemoryBalloonPolicy()
+            policy.minimum = recorded.minimum
+            let samples = recorded.samples.map {
+                MemoryBalloonPolicy.Sample(hostFree: $0.hostFree, current: $0.current, needs: $0.needs, available: $0.available, floor: $0.floor)
+            }
+            let target = policy.nextTarget(samples: samples, maximum: recorded.maximum)
+            #expect(target == recorded.target, "case \(index): \(recorded)")
+        }
+    }
+
     @Test func balloonFloorFollowsHvBalloonsTable() {
         // The table in the comment of hv_balloon's compute_balloon_floor, in MiB.
         let table: [(memory: UInt64, floor: UInt64)] = [(16, 16), (32, 24), (128, 72), (512, 168), (2048, 360), (8192, 744), (32768, 1512)]
