@@ -97,6 +97,10 @@ public protocol VirtualMachineInstance: Sendable {
     /// - Parameter id: The container ID whose virtiofs shares should be released
     func releaseVirtioFS(id: String) async throws
 
+    /// Whether the virtual machine has a memory balloon, which is what
+    /// `setTargetMemorySize` moves.
+    var hasMemoryBalloon: Bool { get }
+
     /// Set how much memory the running virtual machine should hold.
     ///
     /// Lowering it hands memory back to the host, which is the only way to
@@ -130,6 +134,7 @@ extension VirtualMachineInstance {
     public func releaseVirtioFS(id: String) async throws {
         // no-op default
     }
+    public var hasMemoryBalloon: Bool { false }
     public func setTargetMemorySize(_ bytes: UInt64) async throws {
         throw ContainerizationError(.unsupported, message: "memory balloon not supported")
     }

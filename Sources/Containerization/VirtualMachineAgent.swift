@@ -84,6 +84,8 @@ public protocol VirtualMachineAgent: Sendable {
 
     // Container statistics
     func containerStatistics(containerIDs: [String], categories: StatCategory) async throws -> [ContainerStatistics]
+    /// The guest kernel's account of the whole machine's memory.
+    func memoryInfo() async throws -> LinuxMemoryInfo
 
 }
 
@@ -102,6 +104,10 @@ extension VirtualMachineAgent {
 
     public func containerStatistics(containerIDs: [String], categories: StatCategory) async throws -> [ContainerStatistics] {
         throw ContainerizationError(.unsupported, message: "containerStatistics")
+    }
+
+    public func memoryInfo() async throws -> LinuxMemoryInfo {
+        throw ContainerizationError(.unsupported, message: "memoryInfo")
     }
 
     public func sync() async throws {

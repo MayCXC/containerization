@@ -1655,6 +1655,35 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
         }
     }
 
+    public func memoryInfo(
+        request: Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest,
+        context: GRPCCore.ServerContext
+    ) async throws -> Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse {
+        log.debug("memoryInfo")
+
+        let info: LinuxMemoryInfo
+        do {
+            info = try LinuxMemoryInfo(meminfo: String(contentsOfFile: "/proc/meminfo", encoding: .utf8))
+        } catch {
+            log.error(
+                "memoryInfo",
+                metadata: [
+                    "error": "\(error)"
+                ])
+            throw RPCError(code: .internalError, message: "memoryInfo: failed to read /proc/meminfo", cause: error)
+        }
+
+        return .with {
+            $0.totalBytes = info.totalBytes
+            $0.freeBytes = info.freeBytes
+            $0.availableBytes = info.availableBytes
+            $0.committedBytes = info.committedBytes
+            if let balloonBytes = info.balloonBytes {
+                $0.balloonBytes = balloonBytes
+            }
+        }
+    }
+
     private func swiftErrno(_ msg: Logger.Message) -> POSIXError {
         let error = POSIXError(.init(rawValue: errno)!)
         log.error(
