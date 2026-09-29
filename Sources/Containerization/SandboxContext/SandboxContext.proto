@@ -51,6 +51,8 @@ service SandboxContext {
 
   // Get statistics for containers.
   rpc ContainerStatistics(ContainerStatisticsRequest) returns (ContainerStatisticsResponse);
+  // Get the guest kernel's account of its memory from /proc/meminfo.
+  rpc MemoryInfo(MemoryInfoRequest) returns (MemoryInfoResponse);
 
   // Proxy a vsock port to a unix domain socket in the guest, or vice versa.
   rpc ProxyVsock(ProxyVsockRequest) returns (ProxyVsockResponse);
@@ -490,4 +492,20 @@ message MemoryEventStats {
   uint64 oom_kill = 5;
   // Number of times charge for memory failed because of limit.
   uint64 oom_group_kill = 6;
+}
+
+message MemoryInfoRequest {}
+
+// Fields of the guest's /proc/meminfo, in bytes.
+message MemoryInfoResponse {
+  // MemTotal.
+  uint64 total_bytes = 1;
+  // MemFree.
+  uint64 free_bytes = 2;
+  // MemAvailable.
+  uint64 available_bytes = 3;
+  // Committed_AS.
+  uint64 committed_bytes = 4;
+  // Balloon, absent when the kernel does not print it.
+  optional uint64 balloon_bytes = 5;
 }
