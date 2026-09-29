@@ -43,6 +43,18 @@ public struct Kernel: Sendable, Codable {
             self.initArgs.append(contentsOf: ["--log-level", level.description])
         }
 
+        /// Runs mem-agent beside the Agent with the given settings. mem-agent
+        /// watches pressure stall information, which the kernel keeps only
+        /// when booted with `psi=1`, so this sets it as Kata's runtime does
+        /// for `mem_agent_enable`:
+        /// https://github.com/kata-containers/kata-containers/blob/846c6f80343788a057eedc15fae7f3c91ae2d13a/src/libs/kata-types/src/config/mod.rs#L254-L256
+        mutating public func enableMemoryAgent(_ agent: MemoryAgent = .init()) {
+            self.kernelArgs.removeAll { $0.hasPrefix("psi=") }
+            self.kernelArgs.append("psi=1")
+            self.initArgs.append("--mem-agent")
+            self.initArgs.append(contentsOf: agent.arguments.map { "--mem-agent-arg=\($0)" })
+        }
+
         /// Additional kernel arguments.
         public var kernelArgs: [String]
         /// Additional arguments passed to the Initial Process / Agent.

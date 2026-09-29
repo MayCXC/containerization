@@ -251,7 +251,10 @@ struct IntegrationSuite: AsyncParsableCommand {
 
     static let eventLoop = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
 
-    func bootstrap(_ testID: String) async throws -> (rootfs: Containerization.Mount, vmm: VirtualMachineManager, image: Containerization.Image, bootLog: BootLog) {
+    func bootstrap(
+        _ testID: String,
+        commandLine: Kernel.CommandLine = Kernel.CommandLine(debug: false, panic: 0)
+    ) async throws -> (rootfs: Containerization.Mount, vmm: VirtualMachineManager, image: Containerization.Image, bootLog: BootLog) {
         let reference = "ghcr.io/linuxcontainers/alpine:3.20"
         let store = Self.imageStore
 
@@ -273,7 +276,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             }
         }()
 
-        let testKernel = Kernel(path: .init(filePath: kernel), platform: .linuxArm)
+        let testKernel = Kernel(path: .init(filePath: kernel), platform: .linuxArm, commandline: commandLine)
         // Intentionally NOT adding `debug` or `earlycon=pl011,...` here.
         // Both look free, but each costs real wall-clock per VM boot:
         //   * `debug` floods printk through hvc0 (which CH writes to the
@@ -497,6 +500,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("container statistics", testContainerStatistics),
             Test("container cgroup limits", testCgroupLimits),
             Test("container memory events OOM kill", testMemoryEventsOOMKill),
+            Test("container memory agent", testContainerMemoryAgent),
 
             // Console / boot / lifecycle
             Test("container no serial console", testNoSerialConsole),

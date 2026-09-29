@@ -853,6 +853,117 @@ extension IntegrationSuite {
 
     #endif
 
+    /// A skip when mem-agent-srv was never built. Reads the same
+    /// `bin/mem-agent-srv-<arch>` the Makefile's `$(wildcard $(MEM_AGENT_BIN))`
+    /// stages on, and must stay in sync with it.
+    static func requireMemoryAgent() throws {
+        #if arch(arm64)
+        let hostBinary = "mem-agent-srv-arm64"
+        #else
+        let hostBinary = "mem-agent-srv-x86_64"
+        #endif
+        guard FileManager.default.fileExists(atPath: Self.binPath(name: hostBinary).path) else {
+            throw SkipTest(reason: "bin/\(hostBinary) missing; run 'make build-mem-agent && make init'")
+        }
+    }
+
+    /// mem-agent turns on every component of the multi-gen LRU when it starts,
+    /// and the kernel leaves them off. The kernel keeps only the components
+    /// the hardware supports, which always include the main switch, 0x0001:
+    /// https://docs.kernel.org/admin-guide/mm/multigen_lru.html#kill-switch
+    /// It compacts through a child `sh` and logs each child's exit to the
+    /// console, which the boot log keeps, so a machine asked to compact
+    /// every second shows the agent still running and its shell working.
+    func testContainerMemoryAgent() async throws {
+        try Self.requireMemoryAgent()
+
+        let off = try await probeMemoryAgent("test-container-memory-agent-off", commandLine: Kernel.CommandLine(debug: false, panic: 0))
+        guard off.lruGen == "0x0000" else {
+            throw IntegrationError.assert(msg: "lru_gen enabled \(off.lruGen) != 0x0000 without mem-agent")
+        }
+
+        var agent = MemoryAgent()
+        agent.compactPeriodSecs = 1
+        agent.compactForceTimes = 0
+        var commandLine = Kernel.CommandLine(debug: false, panic: 0)
+        // mem-agent logs a compaction's exit status at debug.
+        commandLine.setAgentLogLevel(level: .debug)
+        commandLine.enableMemoryAgent(agent)
+        let compacted = "compact done with status exit status: 0"
+        let on = try await probeMemoryAgent("test-container-memory-agent", commandLine: commandLine, awaiting: compacted)
+        guard on.lruGen.hasPrefix("0x"), let components = UInt(on.lruGen.dropFirst(2), radix: 16), components & 0x0001 != 0 else {
+            throw IntegrationError.assert(msg: "lru_gen enabled \(on.lruGen) has no main switch with mem-agent")
+        }
+        guard on.bootLog.contains(compacted) else {
+            throw IntegrationError.assert(msg: "mem-agent never logged '\(compacted)' for its compaction's sh")
+        }
+    }
+
+    /// Boots a machine with the given command line and returns what its guest
+    /// reads from /sys/kernel/mm/lru_gen/enabled once that is not 0x0000, or
+    /// after ten seconds, with the machine's boot log once that holds
+    /// `awaiting`, or after twenty seconds.
+    private func probeMemoryAgent(
+        _ id: String,
+        commandLine: Kernel.CommandLine,
+        awaiting: String? = nil
+    ) async throws -> (lruGen: String, bootLog: String) {
+        let bs = try await bootstrap(id, commandLine: commandLine)
+        // Truncated at boot, so everything in it is this machine's.
+        let bootLogURL = URL(filePath: bootlogDir).appendingPathComponent("\(id).log")
+
+        let buffer = BufferWriter()
+        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
+            config.process.arguments = [
+                "/bin/sh", "-c",
+                """
+                for i in 1 2 3 4 5 6 7 8 9 10; do
+                    v=$(cat /sys/kernel/mm/lru_gen/enabled)
+                    [ "$v" != 0x0000 ] && break
+                    sleep 1
+                done
+                echo "$v"
+                exec sleep 60
+                """,
+            ]
+            config.process.stdout = buffer
+            config.bootLog = .file(path: bootLogURL, append: false)
+        }
+
+        func lruGen() -> String {
+            String(decoding: buffer.data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        func bootLog() -> String {
+            String(decoding: (try? Data(contentsOf: bootLogURL)) ?? Data(), as: UTF8.self)
+        }
+        func done() -> Bool {
+            guard !lruGen().isEmpty else {
+                return false
+            }
+            guard let awaiting else {
+                return true
+            }
+            return bootLog().contains(awaiting)
+        }
+
+        do {
+            try await container.create()
+            try await container.start()
+
+            let deadline = ContinuousClock.now + .seconds(20)
+            while !done(), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(200))
+            }
+            try await container.kill(.kill)
+            _ = try await container.wait()
+            try await container.stop()
+        } catch {
+            try? await container.stop()
+            throw error
+        }
+        return (lruGen(), bootLog())
+    }
+
     func testContainerStatistics() async throws {
         let id = "test-container-statistics"
 
