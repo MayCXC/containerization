@@ -261,6 +261,10 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
         }
     }
 
+    public var hasMemoryBalloon: Bool {
+        self.balloon != nil
+    }
+
     public func setTargetMemorySize(_ bytes: UInt64) async throws {
         guard bytes <= self.config.memoryInBytes else {
             throw ContainerizationError(

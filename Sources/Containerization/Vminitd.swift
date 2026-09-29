@@ -182,6 +182,17 @@ extension Vminitd: VirtualMachineAgent {
         }
     }
 
+    public func memoryInfo() async throws -> LinuxMemoryInfo {
+        let response = try await client.memoryInfo(.init())
+        return LinuxMemoryInfo(
+            totalBytes: response.totalBytes,
+            freeBytes: response.freeBytes,
+            availableBytes: response.availableBytes,
+            committedBytes: response.committedBytes,
+            balloonBytes: response.hasBalloonBytes ? response.balloonBytes : nil
+        )
+    }
+
     /// Mount a filesystem in the sandbox's environment.
     public func mount(_ mount: ContainerizationOCI.Mount) async throws {
         _ = try await client.mount(
