@@ -108,6 +108,8 @@ public final class VZVirtualMachineInstance: Sendable {
     /// The balloon this process implements (`VZVirtioBalloon`), where
     /// Virtualization lets it; nil when the machine has none.
     private nonisolated(unsafe) let balloon: AnyObject?
+    /// What the machine was last asked to hold.
+    private let targetMemorySize: Mutex<UInt64>
 
     public convenience init(
         group: EventLoopGroup? = nil,
@@ -140,6 +142,7 @@ public final class VZVirtualMachineInstance: Sendable {
 
         let balloon = Self.makeBalloon(config: config, logger: logger)
         self.balloon = balloon
+        self.targetMemorySize = Mutex(config.memoryInBytes)
         self.vm = VZVirtualMachine(
             configuration: try config.toVZ(allocator: allocator, balloon: balloon),
             queue: self.queue
@@ -268,9 +271,24 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
         guard #available(macOS 27, *) else {
             throw ContainerizationError(.unsupported, message: "memory balloon not supported")
         }
-        try await lock.withLock { _ in
-            try await self.virtioBalloon().setTargetMemorySize(bytes)
+        let balloon = try self.virtioBalloon()
+        // Virtualization asks a guest to compact its memory before the balloon
+        // takes pages, so that what the guest gives up fills whole host pages:
+        // https://developer.apple.com/documentation/virtualization/vzvirtiotraditionalmemoryballoondevice
+        // That only makes the pages taken worth more, so the balloon takes
+        // them whether or not the guest could compact.
+        if bytes < self.targetMemorySize.withLock({ $0 }) {
+            do {
+                let outcome = try await self.compactGuestMemory()
+                self.logger?.debug("guest memory compaction before a shrink", metadata: ["outcome": "\(outcome)"])
+            } catch {
+                self.logger?.warning("guest memory compaction before a shrink failed", metadata: ["error": "\(error)"])
+            }
         }
+        try await lock.withLock { _ in
+            try await balloon.setTargetMemorySize(bytes)
+        }
+        self.targetMemorySize.withLock { $0 = bytes }
     }
 
     @available(macOS 27, *)
@@ -464,8 +482,10 @@ extension VZVirtualMachineInstance.Configuration {
         // so without one those pages stay with the machine until the host runs
         // short and compresses them as it would any cold memory, keeping pages
         // the guest would have given up for nothing.
+        var hasBalloon = false
         if #available(macOS 27, *), let balloon = balloon as? VZVirtioBalloon {
             config.customVirtioDevices = [balloon.configuration]
+            hasBalloon = true
         }
 
         if let bootLog = self.bootLog {
@@ -510,12 +530,22 @@ extension VZVirtualMachineInstance.Configuration {
             #endif
         }
 
-        guard let kernel = self.kernel else {
+        guard var kernel = self.kernel else {
             throw ContainerizationError(.invalidArgument, message: "kernel cannot be nil")
         }
 
         guard let initialFilesystem = self.initialFilesystem else {
             throw ContainerizationError(.invalidArgument, message: "rootfs cannot be nil")
+        }
+
+        // The guest compacts its memory before the balloon takes pages, and
+        // stops when its workloads stall, which it learns from pressure stall
+        // information. Kata's kernels build that in but leave it off unless
+        // booted with psi=1, which Kata's runtime adds for its memory agent:
+        // https://github.com/kata-containers/kata-containers/blob/846c6f80343788a057eedc15fae7f3c91ae2d13a/src/libs/kata-types/src/config/mod.rs#L254-L256
+        // A psi= already on the command line is left as it is.
+        if hasBalloon, !kernel.commandLine.kernelArgs.contains(where: { $0.hasPrefix("psi=") }) {
+            kernel.commandLine.kernelArgs.append("psi=1")
         }
 
         let loader = VZLinuxBootLoader(kernelURL: kernel.path)

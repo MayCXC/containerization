@@ -196,6 +196,46 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
         return .init()
     }
 
+    public func compactMemory(
+        request: Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest,
+        context: GRPCCore.ServerContext
+    ) async throws -> Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse {
+        log.debug("compactMemory")
+
+        var policy = MemoryCompactionPolicy()
+        policy.period = .seconds(request.periodSecs)
+        policy.periodPressureLimit = request.periodPsiPercentLimit
+        policy.compactionPressureLimit = request.compactPsiPercentLimit
+        policy.compactionTimeLimit = .seconds(request.compactSecMax)
+        policy.order = Int(request.compactOrder)
+        policy.threshold = request.compactThreshold
+
+        let outcome: MemoryCompactionPolicy.Outcome
+        do {
+            outcome = try await compactor.compact(policy)
+        } catch {
+            log.error(
+                "compactMemory",
+                metadata: [
+                    "error": "\(error)"
+                ])
+            throw RPCError(code: .internalError, message: "compactMemory: \(error)", cause: error)
+        }
+
+        return .with {
+            switch outcome {
+            case .compacted:
+                $0.outcome = .compacted
+            case .notDue:
+                $0.outcome = .notDue
+            case .underPressure:
+                $0.outcome = .underPressure
+            case .notFragmented:
+                $0.outcome = .notFragmented
+            }
+        }
+    }
+
     public func proxyVsock(
         request: Com_Apple_Containerization_Sandbox_V3_ProxyVsockRequest,
         context: GRPCCore.ServerContext

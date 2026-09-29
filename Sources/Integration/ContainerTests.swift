@@ -537,6 +537,102 @@ extension IntegrationSuite {
         }
     }
 
+    func testContainerMemoryCompaction() async throws {
+        let id = "test-container-memory-compaction"
+        let bs = try await bootstrap(id)
+
+        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
+            config.mounts.append(
+                .any(
+                    type: "tmpfs", source: "tmpfs", destination: "/fill",
+                    options: ["rw", "size=512m"]))
+            config.process.arguments = ["/bin/sleep", "1000"]
+            config.memoryInBytes = 2048.mib()
+            config.bootLog = bs.bootLog
+        }
+        func run(_ name: String, _ script: String) async throws -> String {
+            let buffer = BufferWriter()
+            let exec = try await container.exec(name) { config in
+                config.arguments = ["/bin/sh", "-c", script]
+                config.stdout = buffer
+            }
+            try await exec.start()
+            let status = try await exec.wait()
+            try await exec.delete()
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "\(name) exited with \(status)")
+            }
+            return String(data: buffer.data, encoding: .utf8) ?? ""
+        }
+        func migrateScanned() async throws -> UInt64 {
+            let output = try await run("vmstat", "awk '$1 == \"compact_migrate_scanned\" { print $2 }' /proc/vmstat")
+            guard let pages = UInt64(output.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                throw IntegrationError.assert(msg: "no compact_migrate_scanned in /proc/vmstat: '\(output)'")
+            }
+            return pages
+        }
+        func compact(_ policy: MemoryCompactionPolicy) async throws -> MemoryCompactionPolicy.Outcome {
+            try await container.withVirtualMachineInstance { vm in
+                try await vm.compactGuestMemory(policy: policy)
+            }
+        }
+
+        do {
+            try await container.create()
+            try await container.start()
+
+            // A machine with a balloon boots with pressure stall information,
+            // which compaction reads to stop before workloads stall.
+            let pressure = try await run("pressure", "cat /proc/pressure/memory")
+            guard pressure.hasPrefix("some ") else {
+                throw IntegrationError.assert(msg: "guest reports no memory pressure: '\(pressure)'")
+            }
+
+            // Leave free pages scattered: a page per file, then every other
+            // file removed.
+            _ = try await run(
+                "fragment",
+                "cd /fill && i=0; while [ $i -lt 20000 ]; do printf x > $i; i=$((i + 1)); done; rm -f *[02468]"
+            )
+            let before = try await migrateScanned()
+            let first = try await compact(MemoryCompactionPolicy())
+            let after = try await migrateScanned()
+            guard first == .compacted, after > before else {
+                throw IntegrationError.assert(
+                    msg: "scattered free pages gave \(first), and the kernel scanned \(after.saturatingSubtract(before)) pages to migrate")
+            }
+
+            // mem-agent's period spaces attempts.
+            let second = try await compact(MemoryCompactionPolicy())
+            guard second == .notDue else {
+                throw IntegrationError.assert(msg: "an attempt within the period gave \(second)")
+            }
+
+            // Due again, but nothing has moved since the compaction.
+            var due = MemoryCompactionPolicy()
+            due.period = .zero
+            let third = try await compact(due)
+            guard third == .notFragmented else {
+                throw IntegrationError.assert(msg: "an attempt with nothing moved gave \(third)")
+            }
+
+            // Free memory falling by more than the threshold's pages calls for
+            // another.
+            _ = try await run("allocate", "dd if=/dev/zero of=/fill/allocated bs=1M count=64 2>/dev/null")
+            let fourth = try await compact(due)
+            guard fourth == .compacted else {
+                throw IntegrationError.assert(msg: "an attempt after 64 MiB was allocated gave \(fourth)")
+            }
+
+            try await container.kill(.kill)
+            _ = try await container.wait()
+            try await container.stop()
+        } catch {
+            try? await container.stop()
+            throw error
+        }
+    }
+
     func testProcessEchoHi() async throws {
         let id = "test-process-echo-hi"
         let bs = try await bootstrap(id)
