@@ -90,4 +90,39 @@ final class KernelTests {
         commandLine.setAgentLogLevel(level: .warning)
         #expect(commandLine.kernelArgs == kernelArgsBefore)
     }
+
+    @Test func enableMemoryAgentTurnsOnPressureStallInformation() {
+        var commandLine = Kernel.CommandLine(debug: false, panic: 0, initArgs: ["--log-level", "info"])
+        commandLine.enableMemoryAgent()
+        #expect(commandLine.kernelArgs == ["console=hvc0", "tsc=reliable", "panic=0", "psi=1"])
+        #expect(commandLine.initArgs == ["--log-level", "info", "--mem-agent"])
+    }
+
+    @Test func enableMemoryAgentReplacesAnEarlierPsiSetting() {
+        var commandLine = Kernel.CommandLine(kernelArgs: ["psi=0", "console=hvc0"], initArgs: [])
+        commandLine.enableMemoryAgent()
+        #expect(commandLine.kernelArgs == ["console=hvc0", "psi=1"])
+    }
+
+    @Test func enableMemoryAgentPassesItsSettings() {
+        var agent = MemoryAgent()
+        agent.memcgDisable = true
+        agent.compactPeriodSecs = 30
+        agent.compactOrder = 2
+        agent.compactSecMax = -1
+        var commandLine = Kernel.CommandLine(initArgs: [])
+        commandLine.enableMemoryAgent(agent)
+        #expect(
+            commandLine.initArgs == [
+                "--mem-agent",
+                "--mem-agent-arg=--memcg-disabled=true",
+                "--mem-agent-arg=--compact-period-secs=30",
+                "--mem-agent-arg=--compact-sec-max=-1",
+                "--mem-agent-arg=--compact-order=2",
+            ])
+    }
+
+    @Test func memoryAgentDefaultsPassNoSettings() {
+        #expect(MemoryAgent().arguments.isEmpty)
+    }
 }

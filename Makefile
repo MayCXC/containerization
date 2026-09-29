@@ -70,6 +70,16 @@ CLOUD_HYPERVISOR_URL := https://github.com/cloud-hypervisor/cloud-hypervisor/rel
 # upstream release artifact). Bump alongside CLOUD_HYPERVISOR_URL.
 CLOUD_HYPERVISOR_SHA256 := bf004ddc1a148f47caa87ac49a783b8dbd6bf9bc27abe522ed197df7b982d3b1
 
+# mem-agent-srv, the standalone program of Kata Containers' guest memory
+# manager, statically linked against musl for the guest. Staged into the
+# initfs at /sbin/mem-agent-srv when present. Opt-in: `make build-mem-agent`.
+MEM_AGENT_TARGET := $(if $(filter $(KERNEL_ARCH),arm64),aarch64,$(KERNEL_ARCH))-unknown-linux-musl
+MEM_AGENT_BIN := bin/mem-agent-srv-$(KERNEL_ARCH)
+
+# Staged into the initfs at /bin/busybox, with /bin/sh, when present.
+# Opt-in: `make build-mem-agent` installs it beside mem-agent-srv.
+BUSYBOX_BIN := bin/busybox-$(KERNEL_ARCH)
+
 SWIFT_VERSION := $(shell cat $(ROOT_DIR)/.swift-version)
 SWIFT_SDK_URL := $(shell grep '^SWIFT_SDK_URL' vminitd/Makefile | head -1 | sed 's/.*:= *//')
 SWIFT_SDK_CHECKSUM := $(shell grep '^SWIFT_SDK_CHECKSUM' vminitd/Makefile | head -1 | sed 's/.*:= *//')
@@ -245,6 +255,39 @@ endif
 		cp target/release/virtiofsd /workspace/bin/virtiofsd && \
 		chmod +x /workspace/bin/virtiofsd)
 
+.PHONY: build-mem-agent
+# Build mem-agent-srv from the source at .local/mem-agent and install it to
+# $(MEM_AGENT_BIN). Runs inside the Linux dev container, statically linked
+# against musl because the guest has no C library. Installs rustup and the
+# musl target the first time. mem-agent compacts memory through a child
+# `sh`, so the busybox the dev image's distribution builds statically
+# (Ubuntu's busybox-static) is installed to $(BUSYBOX_BIN) beside it.
+#
+# Prerequisite: clone mem-agent into .local/mem-agent. There is no fetch
+# target; pin the revision deliberately. kata-20250627 is the revision
+# Kata Containers' copy of the library was taken from:
+#   git clone -b kata-20250627 https://github.com/teawater/mem-agent .local/mem-agent
+build-mem-agent:
+ifeq (,$(wildcard .local/mem-agent/Cargo.toml))
+	@echo "missing .local/mem-agent source checkout." >&2
+	@echo "clone the mem-agent repo into .local/mem-agent before running this target, e.g.:" >&2
+	@echo "  git clone -b kata-20250627 https://github.com/teawater/mem-agent .local/mem-agent" >&2
+	@exit 1
+endif
+	$(call linux_run,export HOME=/root && \
+		if ! command -v curl >/dev/null 2>&1 || ! dpkg -s busybox-static >/dev/null 2>&1; then \
+			apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential busybox-static; \
+		fi && \
+		install -m 0755 /bin/busybox /workspace/$(BUSYBOX_BIN) && \
+		if [ ! -x /root/.cargo/bin/cargo ]; then \
+			curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal; \
+		fi && \
+		. /root/.cargo/env && \
+		rustup target add $(MEM_AGENT_TARGET) && \
+		cd /workspace/.local/mem-agent && \
+		cargo build --release --target $(MEM_AGENT_TARGET) --bin mem-agent-srv && \
+		install -m 0755 target/$(MEM_AGENT_TARGET)/release/mem-agent-srv /workspace/$(MEM_AGENT_BIN))
+
 .PHONY: linux-integration
 linux-integration:
 ifeq (,$(wildcard bin/cloud-hypervisor))
@@ -320,7 +363,7 @@ endif
 # variables so `vminitd` (compile only) and `init` (compile + build the initfs
 # in a single container run) don't duplicate the command.
 VMINITD_BUILD_CMD = make -C vminitd BUILD_CONFIGURATION=$(BUILD_CONFIGURATION) WARNINGS_AS_ERRORS=$(WARNINGS_AS_ERRORS)
-INITFS_BUILD_CMD = ./scripts/build-initfs.sh --vminitd vminitd/bin/vminitd --vmexec vminitd/bin/vmexec --ext4 bin/initfs.ext4 --tar bin/init.rootfs.tar.gz
+INITFS_BUILD_CMD = ./scripts/build-initfs.sh --vminitd vminitd/bin/vminitd --vmexec vminitd/bin/vmexec --ext4 bin/initfs.ext4 --tar bin/init.rootfs.tar.gz $(if $(wildcard $(MEM_AGENT_BIN)),--mem-agent $(MEM_AGENT_BIN)) $(if $(wildcard $(BUSYBOX_BIN)),--busybox $(BUSYBOX_BIN))
 
 .PHONY: init
 ifeq ($(UNAME_S),Darwin)

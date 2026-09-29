@@ -46,12 +46,13 @@ public struct AgentCommand: AsyncParsableCommand {
     public static let vsockPort = 1024
 
     @OptionGroup var options: LogLevelOption
+    @OptionGroup var memoryAgent: MemoryAgentOption
 
     public init() {}
 
     /// Bootstrap the vminitd environment and create an Initd server.
     /// Handles mounts, cgroups, memory monitoring, and all pre-serve setup.
-    public static func bootstrap(options: LogLevelOption) async throws -> Initd {
+    public static func bootstrap(options: LogLevelOption, memoryAgent: MemoryAgentOption) async throws -> Initd {
         let log = makeLogger(label: "vminitd", level: options.resolvedLogLevel())
         try adjustLimits(log)
 
@@ -65,7 +66,7 @@ public struct AgentCommand: AsyncParsableCommand {
         log.info("checking for shim var \(foregroundEnvVar)=\(String(describing: foreground))")
 
         if foreground == nil {
-            try runInForeground(log, logLevel: options.logLevel)
+            try runInForeground(log, logLevel: options.logLevel, memoryAgent: memoryAgent)
             _exit(0)
         }
 
@@ -153,6 +154,10 @@ public struct AgentCommand: AsyncParsableCommand {
         }
         t.start()
 
+        if memoryAgent.enabled {
+            try MemoryAgentProcess.start(memoryAgent, logLevel: options.resolvedLogLevel(), log: log)
+        }
+
         let eg = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let blockingPool = NIOThreadPool(numberOfThreads: 2)
         blockingPool.start()
@@ -160,7 +165,7 @@ public struct AgentCommand: AsyncParsableCommand {
     }
 
     public mutating func run() async throws {
-        let server = try await Self.bootstrap(options: options)
+        let server = try await Self.bootstrap(options: options, memoryAgent: memoryAgent)
 
         do {
             server.log.info("serving vminitd API")
@@ -181,10 +186,10 @@ public struct AgentCommand: AsyncParsableCommand {
         }
     }
 
-    private static func runInForeground(_ log: Logger, logLevel: String) throws {
+    private static func runInForeground(_ log: Logger, logLevel: String, memoryAgent: MemoryAgentOption) throws {
         log.info("running vminitd under pid1")
 
-        var command = Command("/sbin/vminitd", arguments: ["agent", "--log-level", logLevel])
+        var command = Command("/sbin/vminitd", arguments: ["agent", "--log-level", logLevel] + memoryAgent.initArgs)
         command.attrs = .init(setsid: true)
         command.stdin = .standardInput
         command.stdout = .standardOutput
