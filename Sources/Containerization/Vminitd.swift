@@ -424,6 +424,30 @@ extension Vminitd {
         _ = try await client.sysctl(request)
     }
 
+    /// Compact the guest's memory if `policy` calls for it now.
+    public func compactMemory(policy: MemoryCompactionPolicy) async throws -> MemoryCompactionPolicy.Outcome {
+        let request = Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest.with {
+            $0.periodSecs = UInt64(clamping: policy.period.components.seconds)
+            $0.periodPsiPercentLimit = policy.periodPressureLimit
+            $0.compactPsiPercentLimit = policy.compactionPressureLimit
+            $0.compactSecMax = UInt64(clamping: policy.compactionTimeLimit.components.seconds)
+            $0.compactOrder = UInt32(clamping: policy.order)
+            $0.compactThreshold = policy.threshold
+        }
+        switch try await client.compactMemory(request).outcome {
+        case .compacted:
+            return .compacted
+        case .notDue:
+            return .notDue
+        case .underPressure:
+            return .underPressure
+        case .notFragmented:
+            return .notFragmented
+        case .UNRECOGNIZED(let value):
+            throw ContainerizationError(.internalError, message: "guest reported an unknown compaction outcome \(value)")
+        }
+    }
+
     /// Add an IP address to the sandbox's network interfaces.
     public func addressAdd(name: String, address: InterfaceAddress) async throws {
         _ = try await client.ipAddrAdd(
