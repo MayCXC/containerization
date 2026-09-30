@@ -425,6 +425,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             return [
                 Test("container memory balloon", testContainerMemoryBalloon),
                 Test("container memory balloon keeps guest data", testContainerMemoryBalloonKeepsGuestData),
+                Test("container memory compaction", testContainerMemoryCompaction),
             ]
         }
         return []

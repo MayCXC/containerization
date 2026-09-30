@@ -35,7 +35,9 @@ final class ProcessSupervisor: Sendable {
     }
 
     private let state: Mutex<State>
-    private let reaperCommandRunner = ReaperCommandRunner()
+    /// Runs commands whose exits the reaper collects, since it reaps every
+    /// child of this process.
+    let reaperCommandRunner = ReaperCommandRunner()
 
     func setLog(_ log: Logger?) {
         self.state.withLock { $0.log = log }

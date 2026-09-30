@@ -114,6 +114,19 @@ public enum Com_Apple_Containerization_Sandbox_V3_SandboxContext: Sendable {
                 type: .unary
             )
         }
+        /// Namespace for "CompactMemory" metadata.
+        public enum CompactMemory: Sendable {
+            /// Request type for "CompactMemory".
+            public typealias Input = Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest
+            /// Response type for "CompactMemory".
+            public typealias Output = Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse
+            /// Descriptor for "CompactMemory".
+            public static let descriptor = GRPCCore.MethodDescriptor(
+                service: GRPCCore.ServiceDescriptor(fullyQualifiedService: "com.apple.containerization.sandbox.v3.SandboxContext"),
+                method: "CompactMemory",
+                type: .unary
+            )
+        }
         /// Namespace for "SetTime" metadata.
         public enum SetTime: Sendable {
             /// Request type for "SetTime".
@@ -434,6 +447,7 @@ public enum Com_Apple_Containerization_Sandbox_V3_SandboxContext: Sendable {
             Getenv.descriptor,
             Mkdir.descriptor,
             Sysctl.descriptor,
+            CompactMemory.descriptor,
             SetTime.descriptor,
             SetupEmulator.descriptor,
             WriteFile.descriptor,
@@ -594,6 +608,24 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext {
             request: GRPCCore.StreamingServerRequest<Com_Apple_Containerization_Sandbox_V3_SysctlRequest>,
             context: GRPCCore.ServerContext
         ) async throws -> GRPCCore.StreamingServerResponse<Com_Apple_Containerization_Sandbox_V3_SysctlResponse>
+
+        /// Handle the "CompactMemory" method.
+        ///
+        /// > Source IDL Documentation:
+        /// >
+        /// > Compact the guest's memory, when Kata's mem-agent would.
+        ///
+        /// - Parameters:
+        ///   - request: A streaming request of `Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest` messages.
+        ///   - context: Context providing information about the RPC.
+        /// - Throws: Any error which occurred during the processing of the request. Thrown errors
+        ///     of type `RPCError` are mapped to appropriate statuses. All other errors are converted
+        ///     to an internal error.
+        /// - Returns: A streaming response of `Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse` messages.
+        func compactMemory(
+            request: GRPCCore.StreamingServerRequest<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>,
+            context: GRPCCore.ServerContext
+        ) async throws -> GRPCCore.StreamingServerResponse<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse>
 
         /// Handle the "SetTime" method.
         ///
@@ -1151,6 +1183,24 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext {
             context: GRPCCore.ServerContext
         ) async throws -> GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_SysctlResponse>
 
+        /// Handle the "CompactMemory" method.
+        ///
+        /// > Source IDL Documentation:
+        /// >
+        /// > Compact the guest's memory, when Kata's mem-agent would.
+        ///
+        /// - Parameters:
+        ///   - request: A request containing a single `Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest` message.
+        ///   - context: Context providing information about the RPC.
+        /// - Throws: Any error which occurred during the processing of the request. Thrown errors
+        ///     of type `RPCError` are mapped to appropriate statuses. All other errors are converted
+        ///     to an internal error.
+        /// - Returns: A response containing a single `Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse` message.
+        func compactMemory(
+            request: GRPCCore.ServerRequest<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>,
+            context: GRPCCore.ServerContext
+        ) async throws -> GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse>
+
         /// Handle the "SetTime" method.
         ///
         /// > Source IDL Documentation:
@@ -1705,6 +1755,24 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext {
             context: GRPCCore.ServerContext
         ) async throws -> Com_Apple_Containerization_Sandbox_V3_SysctlResponse
 
+        /// Handle the "CompactMemory" method.
+        ///
+        /// > Source IDL Documentation:
+        /// >
+        /// > Compact the guest's memory, when Kata's mem-agent would.
+        ///
+        /// - Parameters:
+        ///   - request: A `Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest` message.
+        ///   - context: Context providing information about the RPC.
+        /// - Throws: Any error which occurred during the processing of the request. Thrown errors
+        ///     of type `RPCError` are mapped to appropriate statuses. All other errors are converted
+        ///     to an internal error.
+        /// - Returns: A `Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse` to respond with.
+        func compactMemory(
+            request: Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest,
+            context: GRPCCore.ServerContext
+        ) async throws -> Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse
+
         /// Handle the "SetTime" method.
         ///
         /// > Source IDL Documentation:
@@ -2214,6 +2282,17 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext.StreamingServiceP
             }
         )
         router.registerHandler(
+            forMethod: Com_Apple_Containerization_Sandbox_V3_SandboxContext.Method.CompactMemory.descriptor,
+            deserializer: GRPCProtobuf.ProtobufDeserializer<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>(),
+            serializer: GRPCProtobuf.ProtobufSerializer<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse>(),
+            handler: { request, context in
+                try await self.compactMemory(
+                    request: request,
+                    context: context
+                )
+            }
+        )
+        router.registerHandler(
             forMethod: Com_Apple_Containerization_Sandbox_V3_SandboxContext.Method.SetTime.descriptor,
             deserializer: GRPCProtobuf.ProtobufDeserializer<Com_Apple_Containerization_Sandbox_V3_SetTimeRequest>(),
             serializer: GRPCProtobuf.ProtobufSerializer<Com_Apple_Containerization_Sandbox_V3_SetTimeResponse>(),
@@ -2543,6 +2622,17 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext.ServiceProtocol {
         context: GRPCCore.ServerContext
     ) async throws -> GRPCCore.StreamingServerResponse<Com_Apple_Containerization_Sandbox_V3_SysctlResponse> {
         let response = try await self.sysctl(
+            request: GRPCCore.ServerRequest(stream: request),
+            context: context
+        )
+        return GRPCCore.StreamingServerResponse(single: response)
+    }
+
+    public func compactMemory(
+        request: GRPCCore.StreamingServerRequest<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>,
+        context: GRPCCore.ServerContext
+    ) async throws -> GRPCCore.StreamingServerResponse<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse> {
+        let response = try await self.compactMemory(
             request: GRPCCore.ServerRequest(stream: request),
             context: context
         )
@@ -2888,6 +2978,19 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServiceProt
     ) async throws -> GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_SysctlResponse> {
         return GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_SysctlResponse>(
             message: try await self.sysctl(
+                request: request.message,
+                context: context
+            ),
+            metadata: [:]
+        )
+    }
+
+    public func compactMemory(
+        request: GRPCCore.ServerRequest<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>,
+        context: GRPCCore.ServerContext
+    ) async throws -> GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse> {
+        return GRPCCore.ServerResponse<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse>(
+            message: try await self.compactMemory(
                 request: request.message,
                 context: context
             ),
@@ -3361,6 +3464,29 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext {
             deserializer: some GRPCCore.MessageDeserializer<Com_Apple_Containerization_Sandbox_V3_SysctlResponse>,
             options: GRPCCore.CallOptions,
             onResponse handleResponse: @Sendable @escaping (GRPCCore.ClientResponse<Com_Apple_Containerization_Sandbox_V3_SysctlResponse>) async throws -> Result
+        ) async throws -> Result where Result: Sendable
+
+        /// Call the "CompactMemory" method.
+        ///
+        /// > Source IDL Documentation:
+        /// >
+        /// > Compact the guest's memory, when Kata's mem-agent would.
+        ///
+        /// - Parameters:
+        ///   - request: A request containing a single `Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest` message.
+        ///   - serializer: A serializer for `Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest` messages.
+        ///   - deserializer: A deserializer for `Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse` messages.
+        ///   - options: Options to apply to this RPC.
+        ///   - handleResponse: A closure which handles the response, the result of which is
+        ///       returned to the caller. Returning from the closure will cancel the RPC if it
+        ///       hasn't already finished.
+        /// - Returns: The result of `handleResponse`.
+        func compactMemory<Result>(
+            request: GRPCCore.ClientRequest<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>,
+            serializer: some GRPCCore.MessageSerializer<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>,
+            deserializer: some GRPCCore.MessageDeserializer<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse>,
+            options: GRPCCore.CallOptions,
+            onResponse handleResponse: @Sendable @escaping (GRPCCore.ClientResponse<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse>) async throws -> Result
         ) async throws -> Result where Result: Sendable
 
         /// Call the "SetTime" method.
@@ -4136,6 +4262,40 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext {
             try await self.client.unary(
                 request: request,
                 descriptor: Com_Apple_Containerization_Sandbox_V3_SandboxContext.Method.Sysctl.descriptor,
+                serializer: serializer,
+                deserializer: deserializer,
+                options: options,
+                onResponse: handleResponse
+            )
+        }
+
+        /// Call the "CompactMemory" method.
+        ///
+        /// > Source IDL Documentation:
+        /// >
+        /// > Compact the guest's memory, when Kata's mem-agent would.
+        ///
+        /// - Parameters:
+        ///   - request: A request containing a single `Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest` message.
+        ///   - serializer: A serializer for `Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest` messages.
+        ///   - deserializer: A deserializer for `Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse` messages.
+        ///   - options: Options to apply to this RPC.
+        ///   - handleResponse: A closure which handles the response, the result of which is
+        ///       returned to the caller. Returning from the closure will cancel the RPC if it
+        ///       hasn't already finished.
+        /// - Returns: The result of `handleResponse`.
+        public func compactMemory<Result>(
+            request: GRPCCore.ClientRequest<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>,
+            serializer: some GRPCCore.MessageSerializer<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>,
+            deserializer: some GRPCCore.MessageDeserializer<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse>,
+            options: GRPCCore.CallOptions = .defaults,
+            onResponse handleResponse: @Sendable @escaping (GRPCCore.ClientResponse<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse>) async throws -> Result = { response in
+                try response.message
+            }
+        ) async throws -> Result where Result: Sendable {
+            try await self.client.unary(
+                request: request,
+                descriptor: Com_Apple_Containerization_Sandbox_V3_SandboxContext.Method.CompactMemory.descriptor,
                 serializer: serializer,
                 deserializer: deserializer,
                 options: options,
@@ -5139,6 +5299,35 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext.ClientProtocol {
         )
     }
 
+    /// Call the "CompactMemory" method.
+    ///
+    /// > Source IDL Documentation:
+    /// >
+    /// > Compact the guest's memory, when Kata's mem-agent would.
+    ///
+    /// - Parameters:
+    ///   - request: A request containing a single `Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest` message.
+    ///   - options: Options to apply to this RPC.
+    ///   - handleResponse: A closure which handles the response, the result of which is
+    ///       returned to the caller. Returning from the closure will cancel the RPC if it
+    ///       hasn't already finished.
+    /// - Returns: The result of `handleResponse`.
+    public func compactMemory<Result>(
+        request: GRPCCore.ClientRequest<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>,
+        options: GRPCCore.CallOptions = .defaults,
+        onResponse handleResponse: @Sendable @escaping (GRPCCore.ClientResponse<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse>) async throws -> Result = { response in
+            try response.message
+        }
+    ) async throws -> Result where Result: Sendable {
+        try await self.compactMemory(
+            request: request,
+            serializer: GRPCProtobuf.ProtobufSerializer<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>(),
+            deserializer: GRPCProtobuf.ProtobufDeserializer<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse>(),
+            options: options,
+            onResponse: handleResponse
+        )
+    }
+
     /// Call the "SetTime" method.
     ///
     /// > Source IDL Documentation:
@@ -6032,6 +6221,39 @@ extension Com_Apple_Containerization_Sandbox_V3_SandboxContext.ClientProtocol {
             metadata: metadata
         )
         return try await self.sysctl(
+            request: request,
+            options: options,
+            onResponse: handleResponse
+        )
+    }
+
+    /// Call the "CompactMemory" method.
+    ///
+    /// > Source IDL Documentation:
+    /// >
+    /// > Compact the guest's memory, when Kata's mem-agent would.
+    ///
+    /// - Parameters:
+    ///   - message: request message to send.
+    ///   - metadata: Additional metadata to send, defaults to empty.
+    ///   - options: Options to apply to this RPC, defaults to `.defaults`.
+    ///   - handleResponse: A closure which handles the response, the result of which is
+    ///       returned to the caller. Returning from the closure will cancel the RPC if it
+    ///       hasn't already finished.
+    /// - Returns: The result of `handleResponse`.
+    public func compactMemory<Result>(
+        _ message: Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest,
+        metadata: GRPCCore.Metadata = [:],
+        options: GRPCCore.CallOptions = .defaults,
+        onResponse handleResponse: @Sendable @escaping (GRPCCore.ClientResponse<Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse>) async throws -> Result = { response in
+            try response.message
+        }
+    ) async throws -> Result where Result: Sendable {
+        let request = GRPCCore.ClientRequest<Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest>(
+            message: message,
+            metadata: metadata
+        )
+        return try await self.compactMemory(
             request: request,
             options: options,
             onResponse: handleResponse

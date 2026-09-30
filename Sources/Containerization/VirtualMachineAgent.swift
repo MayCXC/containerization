@@ -54,6 +54,8 @@ public protocol VirtualMachineAgent: Sendable {
     func sync() async throws
     func writeFile(path: String, data: Data, flags: WriteFileFlags, mode: UInt32) async throws
     func sysctl(settings: [String: String]) async throws
+    /// Compact the guest's memory if `policy` calls for it now.
+    func compactMemory(policy: MemoryCompactionPolicy) async throws -> MemoryCompactionPolicy.Outcome
 
     // Process lifecycle
     func createProcess(
@@ -90,6 +92,10 @@ public protocol VirtualMachineAgent: Sendable {
 extension VirtualMachineAgent {
     public func closeProcessStdin(id: String, containerID: String?) async throws {
         throw ContainerizationError(.unsupported, message: "closeProcessStdin")
+    }
+
+    public func compactMemory(policy: MemoryCompactionPolicy) async throws -> MemoryCompactionPolicy.Outcome {
+        throw ContainerizationError(.unsupported, message: "compactMemory")
     }
 
     public func configureHosts(config: Hosts, location: String) async throws {
