@@ -21,6 +21,7 @@ import Foundation
 import Logging
 import Synchronization
 
+import struct ContainerizationOS.Swap
 import struct ContainerizationOS.Terminal
 
 /// NOTE: Experimental API
@@ -42,6 +43,15 @@ public final class LinuxPod: Sendable {
 
     /// The configuration for the LinuxPod.
     public struct Configuration: Sendable {
+        /// Optional swap area shared by every container in the pod, as a block
+        /// device mount.
+        ///
+        /// The area belongs to the pod rather than to any one container, so the
+        /// guest kernel decides which container's pages are reclaimed to it.
+        /// Containers are free to use all of it unless they carry a limit of
+        /// their own. The `destination` field is ignored, as the area is
+        /// enabled rather than mounted.
+        public var swapLayer: Mount? = nil
         /// The network interfaces for the pod.
         public var interfaces: [any Interface] = []
         /// Whether nested virtualization should be turned on for the pod.
@@ -97,6 +107,22 @@ public final class LinuxPod: Sendable {
         /// user is given the cgroup it is placed in and nothing above it, so
         /// the limits the pod and this container were given still bind.
         public var cgroupDelegation: Bool = false
+        /// Optional cap on how much of the pod's swap area this container may
+        /// use, in bytes. Leaving it unset lets the container use the whole
+        /// area, which is what containers sharing a pool usually want.
+        ///
+        /// This counts swap alone. The runtime spec carries memory and swap
+        /// combined, so `memoryInBytes` is added to it when the spec is built.
+        ///
+        /// Kata and docker spell the same limit as the combined figure the spec
+        /// carries, subtracting the memory limit to size the area, so a
+        /// container asking there for 2 GiB against a 1 GiB memory limit is
+        /// asking for 1 GiB of swap and here for 2 GiB. That figure suits a
+        /// container whose swap is sized for it alone; this one is a share of
+        /// an area the pod owns, and how much of that share a container may
+        /// take is what the number says.
+        /// https://github.com/kata-containers/kata-containers/blob/main/docs/how-to/how-to-setup-swap-devices-in-guest-kernel.md
+        public var swapInBytes: UInt64?
         /// The hostname for the container.
         public var hostname: String?
         /// The system control options for the container.
@@ -130,6 +156,17 @@ public final class LinuxPod: Sendable {
         /// Run the container with a minimal init process that handles signal
         /// forwarding and zombie reaping.
         public var useInit: Bool = false
+        /// Devices the container should be given, with the permissions it
+        /// should see them under.
+        ///
+        /// A device already present in the container's /dev arrives with the
+        /// kernel's permissions, which are stricter than the ones a machine
+        /// running udev would show. Naming it here is how those are asked for.
+        public var devices: [ContainerizationOCI.LinuxDevice] = []
+        /// Hooks the runtime specification carries for the container. An OCI
+        /// runtime is what runs them, so they take effect when the pod is
+        /// given an ``Configuration/ociRuntimePath``.
+        public var hooks: ContainerizationOCI.Hooks? = nil
 
         public init() {}
     }
@@ -405,6 +442,7 @@ public final class LinuxPod: Sendable {
         if let hostname = config.hostname ?? self.config.hostname {
             spec.hostname = hostname
         }
+        spec.hooks = config.hooks
 
         // Linux toggles
         if config.cgroupDelegation {
@@ -413,6 +451,7 @@ public final class LinuxPod: Sendable {
             spec.annotations = annotations
         }
         spec.linux?.sysctl = config.sysctl
+        spec.linux?.devices = config.devices
         spec.linux?.maskedPaths = config.maskedPaths
         spec.linux?.readonlyPaths = config.readonlyPaths
 
@@ -425,8 +464,11 @@ public final class LinuxPod: Sendable {
             quota: Int64(config.cpus * 100_000),
             period: 100_000
         )
+        // The runtime spec's `swap` is the memory and swap total, not the
+        // swap alone, so the container's memory limit is folded in here.
         spec.linux?.resources?.memory = LinuxMemory(
-            limit: Int64(config.memoryInBytes)
+            limit: Int64(config.memoryInBytes),
+            swap: config.swapInBytes.map { Int64(config.memoryInBytes + $0) }
         )
 
         // Init spec only. runc installs seccomp for `runc exec` from the
@@ -461,6 +503,30 @@ public final class LinuxPod: Sendable {
         case .profile(let profile):
             return profile
         }
+    }
+
+    /// Re-mount a stopped member's rootfs so a fresh process can run on it. The
+    /// member kept its block devices across the stop, stopContainer leaves them
+    /// attached and the storage entry intact, so only the guest rootfs
+    /// mount was torn down and re-establishing it is all a restart needs. The
+    /// block, its image, and its shares are unchanged.
+    private static func remountRootfs(
+        containerID: String,
+        vm: any VirtualMachineInstance,
+        agent: any VirtualMachineAgent
+    ) async throws {
+        guard let attached = vm.storage.containers[containerID] else {
+            throw ContainerizationError(
+                .invalidState,
+                message: "container \(containerID) has no registered rootfs to re-mount"
+            )
+        }
+        try await agent.mountRootfs(
+            containerID: containerID,
+            rootfsAttachment: attached.rootfs,
+            writableAttachment: attached.writableLayer,
+            rootfsPath: Self.guestRootfsPath(containerID)
+        )
     }
 
     static func guestRootfsPath(_ containerID: String) -> String {
@@ -796,6 +862,9 @@ extension LinuxPod {
             for volume in self.config.volumes {
                 machineStorage.volumes[volume.name] = volume.toMount()
             }
+            // The swap area is attached with the machine's own storage so the
+            // guest is told the /dev path the VMM allocates it.
+            machineStorage.swap = self.config.swapLayer
 
             // Capture into an immutable `let` so the value is safely usable
             // from the concurrent `withAgent` closure below. The container
@@ -826,9 +895,26 @@ extension LinuxPod {
                 let shareProcessNamespace = self.config.shareProcessNamespace
                 let pauseProcessHolder = Mutex<LinuxProcess?>(nil)
                 let fileMountContextUpdates = Mutex<[String: FileMountContext]>([:])
+                let hasSwapLayer = self.config.swapLayer != nil
 
                 try await vm.withAgent { agent in
                     try await agent.standardSetup()
+
+                    // The swap area belongs to the pod rather than to any one
+                    // container, so it is enabled once here and every container
+                    // reclaims to it through the guest's own memory management.
+                    if hasSwapLayer {
+                        guard let swap = vm.storage.swap else {
+                            throw ContainerizationError(.notFound, message: "swap mount not found")
+                        }
+                        try await agent.mount(
+                            ContainerizationOCI.Mount(
+                                type: Swap.mountType,
+                                source: swap.source,
+                                destination: "",
+                                options: swap.options
+                            ))
+                    }
 
                     // Mount the unified virtiofs share at /run/virtiofs only
                     // when at least one container has a virtiofs mount. VZ
@@ -1056,15 +1142,32 @@ extension LinuxPod {
                 )
             }
 
-            guard container.state == .created else {
+            guard container.state == .created || container.state == .stopped else {
                 throw ContainerizationError(
                     .invalidState,
-                    message: "container \(containerID) must be in created state to start"
+                    message: "container \(containerID) must be in created or stopped state to start"
                 )
             }
 
             let agent = try await createdState.vm.dialAgent()
             do {
+                // A member that ran and then stopped kept its place: its block
+                // devices are still attached and registered, but stopContainer
+                // unmounted its rootfs. Re-mount it the way boot did before
+                // starting a fresh process on it, the runtime's "start a new task
+                // on the container, reusing its rootfs" for a pod member.
+                // Re-mounting leaves the member created, exactly as a freshly
+                // placed one, so a failure before the process starts is cleaned
+                // up by the same stopContainer path.
+                if container.state == .stopped {
+                    try await Self.remountRootfs(
+                        containerID: containerID,
+                        vm: createdState.vm,
+                        agent: agent
+                    )
+                    state.containers[containerID]?.state = .created
+                }
+
                 var spec = try self.generateRuntimeSpec(
                     containerID: containerID,
                     config: container.config,
@@ -1209,34 +1312,33 @@ extension LinuxPod {
                 return
             }
 
-            // Handle containers that were hotplugged but never started
-            if container.state == .created {
-                // Release the hotplug device and virtiofs shares
-                try? await createdState.vm.releaseHotplug(id: containerID)
-                try? await createdState.vm.releaseVirtioFS(id: containerID)
-
-                container.state = .stopped
-                state.containers[containerID] = container
-                return
-            }
-
-            guard container.state == .started, let process = container.process else {
+            guard container.state == .created || container.state == .started else {
                 throw ContainerizationError(
                     .invalidState,
-                    message: "container \(containerID) must be in started state to stop"
+                    message: "container \(containerID) must be in created or started state to stop"
                 )
             }
 
             do {
                 // Check if the vm is even still running
                 if createdState.vm.state == .stopped {
+                    container.process = nil
                     container.state = .stopped
                     state.containers[containerID] = container
                     return
                 }
 
-                try await process.kill(.kill)
-                try await process.wait(timeoutInSeconds: 3)
+                // Stopping keeps the member's place: the process is torn down and
+                // the rootfs unmounted, but the block devices stay attached and
+                // the storage entry is kept, so the member can be started
+                // again by re-mounting. Detaching the devices is removeContainer's
+                // job, the separate act the runtime specification names for giving
+                // the place up.
+                // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+                if let process = container.process {
+                    try await process.kill(.kill)
+                    try await process.wait(timeoutInSeconds: 3)
+                }
 
                 let hasWritableLayer = container.writableLayer != nil
                 try await createdState.vm.withAgent { agent in
@@ -1255,21 +1357,15 @@ extension LinuxPod {
                     }
                 }
 
-                // Release the hotplug device and virtiofs shares so they can be reused by new containers
-                try await createdState.vm.releaseHotplug(id: containerID)
-                try await createdState.vm.releaseVirtioFS(id: containerID)
-
                 // Clean up the process resources
-                try await process.delete()
+                if let process = container.process {
+                    try await process.delete()
+                }
 
                 container.process = nil
                 container.state = .stopped
                 state.containers[containerID] = container
             } catch {
-                // Try to release the hotplug device and virtiofs shares even on error
-                try? await createdState.vm.releaseHotplug(id: containerID)
-                try? await createdState.vm.releaseVirtioFS(id: containerID)
-
                 container.state = .errored
                 container.process = nil
                 state.containers[containerID] = container
@@ -1298,6 +1394,14 @@ extension LinuxPod {
             }
             switch container.state {
             case .registered, .stopped, .errored:
+                // Giving the place up detaches the member's block devices and
+                // clears its storage entry, the resources stopContainer
+                // keeps so a stopped member can start again. A member removed
+                // before the machine booted never took a device.
+                if case .created(let createdState) = state.phase {
+                    try? await createdState.vm.releaseHotplug(id: containerID)
+                    try? await createdState.vm.releaseVirtioFS(id: containerID)
+                }
                 state.containers[containerID] = nil
             default:
                 throw ContainerizationError(

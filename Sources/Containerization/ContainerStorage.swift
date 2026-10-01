@@ -29,21 +29,28 @@ public struct ContainerStorage<Value: Sendable>: Sendable {
     /// overlay, when the container has one.
     public var writableLayer: Value?
 
+    /// The swap area enabled for the container, when it has one.
+    public var swap: Value?
+
     /// The container's remaining mounts, in configuration order.
     public var mounts: [Value]
 
-    public init(rootfs: Value, writableLayer: Value? = nil, mounts: [Value] = []) {
+    public init(rootfs: Value, writableLayer: Value? = nil, swap: Value? = nil, mounts: [Value] = []) {
         self.rootfs = rootfs
         self.writableLayer = writableLayer
+        self.swap = swap
         self.mounts = mounts
     }
 
-    /// Every value in the structure: the rootfs, the writable layer when
-    /// present, then the mounts, in that order.
+    /// Every value in the structure: the rootfs, the writable layer and swap
+    /// when present, then the mounts, in that order.
     public var all: [Value] {
         var values = [rootfs]
         if let writableLayer {
             values.append(writableLayer)
+        }
+        if let swap {
+            values.append(swap)
         }
         values.append(contentsOf: mounts)
         return values
@@ -55,6 +62,7 @@ public struct ContainerStorage<Value: Sendable>: Sendable {
         ContainerStorage<U>(
             rootfs: try transform(rootfs),
             writableLayer: try writableLayer.map(transform),
+            swap: try swap.map(transform),
             mounts: try mounts.map(transform)
         )
     }
@@ -75,18 +83,25 @@ public struct MachineStorage<Value: Sendable>: Sendable {
     /// Volumes shared by the machine's containers, by volume name.
     public var volumes: [String: Value]
 
-    public init(containers: [String: ContainerStorage<Value>] = [:], volumes: [String: Value] = [:]) {
+    /// The swap area shared by every container in the machine, when it has
+    /// one.
+    public var swap: Value?
+
+    public init(containers: [String: ContainerStorage<Value>] = [:], volumes: [String: Value] = [:], swap: Value? = nil) {
         self.containers = containers
         self.volumes = volumes
+        self.swap = swap
     }
 
     /// Every value the machine carries: containers sorted by ID, each in
-    /// role order, then volumes sorted by name. Walks that allocate device
-    /// addresses and walks that create the devices use this one order, so an
-    /// address always names the device it was handed out for.
+    /// role order, then volumes sorted by name, then swap. Walks that
+    /// allocate device addresses and walks that create the devices use this
+    /// one order, so an address always names the device it was handed out
+    /// for.
     public var ordered: [Value] {
         containers.keys.sorted().flatMap { containers[$0]?.all ?? [] }
             + volumes.keys.sorted().compactMap { volumes[$0] }
+            + (swap.map { [$0] } ?? [])
     }
 
     /// The storage with `transform` applied to every value, each keeping its
@@ -95,7 +110,8 @@ public struct MachineStorage<Value: Sendable>: Sendable {
     public func map<U: Sendable>(_ transform: (Value) throws -> U) rethrows -> MachineStorage<U> {
         MachineStorage<U>(
             containers: try containers.mapValues { try $0.map(transform) },
-            volumes: try volumes.mapValues(transform)
+            volumes: try volumes.mapValues(transform),
+            swap: try swap.map(transform)
         )
     }
 }
