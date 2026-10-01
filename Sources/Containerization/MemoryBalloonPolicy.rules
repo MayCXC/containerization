@@ -1,0 +1,108 @@
+# Copyright © 2026 Apple Inc. and the Containerization project authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+### Balloon to Hyper-V's target ##############################################
+# A policy in the language of oVirt's Memory Overcommitment Manager, from its
+# doc/balloon.rules and vdsm's static/etc/vdsm/mom.d/02-balloon.policy:
+#   https://github.com/oVirt/mom/blob/master/doc/balloon.rules
+#   https://github.com/oVirt/vdsm/blob/master/static/etc/vdsm/mom.d/02-balloon.policy
+# The target is Hyper-V Dynamic Memory's, what the guest needs plus a buffer
+# of that, in both directions, where MoM's is what the guest uses plus a free
+# share and shrinks only under host pressure. MemoryBalloonPolicy.swift is a
+# line-by-line translation, and scripts/memory-balloon-policy-decisions.py
+# runs this file on MoM's own engine to record the decisions its tests check.
+#
+# Statistics, each guest's in bytes:
+#   Host free_percent  the fraction of the host's memory that is free
+#   guest balloon_cur  what the machine holds: its size less its balloon
+#   guest balloon_min  the least it is asked to hold
+#   guest balloon_max  its size
+#   guest needs        what it needs, as Linux reports it to Hyper-V
+#   guest available    what its guest can still allocate
+#   guest floor        the least its guest keeps available (hv_balloon)
+
+### Constants
+# Hyper-V's memory buffer, as a fraction of what the guest needs
+(defvar memory_buffer 0.20)
+
+# If the percentage of host free memory drops below this value
+# then we will consider the host to be under memory pressure
+(defvar pressure_threshold 0.20)
+
+# If pressure threshold drops below this level, then the pressure
+# is critical and more aggressive ballooning will be employed.
+(defvar pressure_critical 0.05)
+
+# Don't shrink a guest's memory by more than this percent of what it holds
+(defvar max_balloon_change_percent 0.05)
+
+# Only ballooning operations that change the balloon by this percentage
+# of current guest memory should be undertaken to avoid overhead
+(defvar min_balloon_change_percent 0.0025)
+
+### Helper functions
+# Check if the proposed new balloon value is a large-enough
+# change to justify a balloon operation.  This prevents us from
+# introducing overhead through lots of small ballooning operations
+(def change_big_enough (guest new_val)
+{
+    (if (> (abs (- new_val guest.balloon_cur))
+           (* min_balloon_change_percent guest.balloon_cur))
+        1 0)
+})
+
+# The buffer, scaled back according to host pressure as MoM scales a guest's
+# free memory, and made negative to hold the guest under its needs when the
+# pressure is critical
+(def buffer_share ()
+{
+    (if (>= host_free_percent pressure_threshold)
+        memory_buffer
+        (if (> host_free_percent pressure_critical)
+            (* memory_buffer (/ host_free_percent pressure_threshold))
+            (+ -0.05 host_free_percent)))
+})
+
+(def balloon_guest (guest)
+{
+    # A need above the average is taken as it is, so a guest that comes to
+    # need more gets it now rather than as the average catches up
+    (defvar guest_needs (max (guest.StatAvg "needs") (guest.Stat "needs")))
+    (defvar balloon_size (min (max (* guest_needs (+ 1 (buffer_share)))
+                                   guest.balloon_min)
+                              guest.balloon_max))
+    # Shrink by no more than the largest step, and never take the guest's
+    # available memory below its floor, which Linux's Hyper-V balloon refuses
+    # to do itself (hv_balloon.c, balloon_up)
+    (if (< balloon_size guest.balloon_cur)
+        {
+            (defvar spare (- guest.available (min guest.floor guest.available)))
+            (set balloon_size (max balloon_size
+                                   (* guest.balloon_cur
+                                      (- 1 max_balloon_change_percent))
+                                   (- guest.balloon_cur spare)))
+        } 0)
+    # Set the new target for the BalloonController.  Only set it if the
+    # value is a large enough change to be worth it.
+    (if (change_big_enough guest balloon_size)
+        (guest.Control "balloon_target" balloon_size) 0)
+})
+
+### Main script
+(defvar host_free_percent (Host.StatAvg "free_percent"))
+
+(with Guests guest
+    (if (valid guest.balloon_cur (guest.Stat "needs"))
+        (balloon_guest guest)
+        (debug "Memory information is missing, ballooning for" guest "disabled")))

@@ -96,6 +96,19 @@ public protocol VirtualMachineInstance: Sendable {
     /// Release virtiofs shares for a container.
     /// - Parameter id: The container ID whose virtiofs shares should be released
     func releaseVirtioFS(id: String) async throws
+
+    /// Whether the virtual machine has a memory balloon, which is what
+    /// `setTargetMemorySize` moves.
+    var hasMemoryBalloon: Bool { get }
+
+    /// Set how much memory the running virtual machine should hold.
+    ///
+    /// Lowering it hands memory back to the host, which is the only way to
+    /// recover pages the guest has touched and since freed. Raising it returns
+    /// memory to the guest. Throws if the VMM has no memory balloon.
+    /// - Parameter bytes: The size the virtual machine should hold, which must
+    ///   not exceed the size it was created with.
+    func setTargetMemorySize(_ bytes: UInt64) async throws
 }
 
 extension VirtualMachineInstance {
@@ -120,5 +133,26 @@ extension VirtualMachineInstance {
     }
     public func releaseVirtioFS(id: String) async throws {
         // no-op default
+    }
+    public var hasMemoryBalloon: Bool { false }
+    public func setTargetMemorySize(_ bytes: UInt64) async throws {
+        throw ContainerizationError(.unsupported, message: "memory balloon not supported")
+    }
+
+    /// Gather the guest's free memory into contiguous runs, if `policy`
+    /// calls for it now.
+    ///
+    /// The balloon can hand the host only whole host pages, and the guest's
+    /// pages are smaller, so the pages the guest gives up are worth most when
+    /// they sit together. Compacting costs the guest time, so the guest
+    /// decides as Kata's mem-agent does whether it is worth it, and stops if
+    /// its workloads start to stall (see ``MemoryCompactionPolicy``). The
+    /// kernel has to report pressure stall information for that, which a
+    /// machine with a balloon boots with.
+    @discardableResult
+    public func compactGuestMemory(policy: MemoryCompactionPolicy = .init()) async throws -> MemoryCompactionPolicy.Outcome {
+        try await withAgent { agent in
+            try await agent.compactMemory(policy: policy)
+        }
     }
 }

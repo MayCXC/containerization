@@ -507,7 +507,8 @@ struct IntegrationSuite: AsyncParsableCommand {
         return VZVirtualMachineManager(
             kernel: kernel,
             initialFilesystem: initialFilesystem,
-            group: Self.eventLoop
+            group: Self.eventLoop,
+            logger: log
         )
         #elseif os(Linux)
         return try CHVirtualMachineManager(
@@ -570,6 +571,20 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("pod shared swap", testPodSharedSwap),
                 Test("pod container swap limit", testPodContainerSwapLimit),
                 Test("pod IPv6 address", testPodIPv6AddressAdd),
+            ]
+        }
+        return []
+    }
+
+    /// The balloon is a Virtio device this process implements, which
+    /// Virtualization allows from macOS 27.
+    private func macOS27Tests() -> [Test] {
+        if #available(macOS 27.0, *) {
+            return [
+                Test("container memory balloon", testContainerMemoryBalloon),
+                Test("container memory balloon keeps guest data", testContainerMemoryBalloonKeepsGuestData),
+                Test("container memory compaction", testContainerMemoryCompaction),
+                Test("pod memory balloon policy", testPodMemoryBalloonPolicy),
             ]
         }
         return []
@@ -866,7 +881,7 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("container swap", testContainerSwap),
                 Test("container swap under pressure", testContainerSwapUnderPressure),
                 Test("container swap reclaims freed blocks", testContainerSwapReclaimsFreedBlocks),
-            ] + macOS26Tests()
+            ] + macOS26Tests() + macOS27Tests()
         let tests: [Test] = crossPlatformTests + macOSOnlyTests
         #else
         // A virtiofs rootfs rides its own device, which cloud-hypervisor alone
