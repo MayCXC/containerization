@@ -454,6 +454,29 @@ public final class LinuxPod: Sendable {
         "/run/container/\(containerID)/rootfs"
     }
 
+    /// Unmount a container's rootfs, and the layers it is built from when it
+    /// was given a writable layer. Every mount is tried whatever the others
+    /// did, and the first failure is thrown once all have been, so a mount
+    /// left behind by a partial setup still comes down.
+    private static func umountRootfs(of containerID: String, hasWritableLayer: Bool, agent: VirtualMachineAgent) async throws {
+        var paths = [Self.guestRootfsPath(containerID)]
+        if hasWritableLayer {
+            paths.append("/run/container/\(containerID)/upper")
+            paths.append("/run/container/\(containerID)/lower")
+        }
+        var failure: (any Error)?
+        for path in paths {
+            do {
+                try await agent.umount(path: path, flags: 0)
+            } catch {
+                failure = failure ?? error
+            }
+        }
+        if let failure {
+            throw failure
+        }
+    }
+
     static func guestSocketStagingPath(_ socketID: String) -> String {
         "/run/sockets/\(socketID).sock"
     }
@@ -695,7 +718,7 @@ extension LinuxPod {
 
                         try await agent.close()
                     } catch {
-                        try? await agent.umount(path: Self.guestRootfsPath(id), flags: 0)
+                        try? await Self.umountRootfs(of: id, hasWritableLayer: writableAttachment != nil, agent: agent)
                         try? await agent.close()
                         throw error
                     }
@@ -1180,9 +1203,16 @@ extension LinuxPod {
                 return
             }
 
-            // Handle containers that were hotplugged but never started
+            // A container hotplugged but never started holds what its add
+            // mounted: its rootfs, and the layers under it when it was given
+            // a writable layer. A disk detached while a filesystem on it is
+            // still mounted takes the filesystem down with I/O errors and a
+            // journal abort, so the mounts go first and the devices after.
             if container.state == .created {
-                // Release the hotplug device and virtiofs shares
+                let hasWritableLayer = container.writableLayer != nil
+                try? await createdState.vm.withAgent { agent in
+                    try await Self.umountRootfs(of: containerID, hasWritableLayer: hasWritableLayer, agent: agent)
+                }
                 try? await createdState.vm.releaseHotplug(id: containerID)
                 try? await createdState.vm.releaseVirtioFS(id: containerID)
 
@@ -1211,19 +1241,7 @@ extension LinuxPod {
 
                 let hasWritableLayer = container.writableLayer != nil
                 try await createdState.vm.withAgent { agent in
-                    // Unmount the rootfs
-                    try await agent.umount(
-                        path: Self.guestRootfsPath(containerID),
-                        flags: 0
-                    )
-
-                    // If we have a writable layer, we also need to unmount the lower and upper layers.
-                    if hasWritableLayer {
-                        let upperPath = "/run/container/\(containerID)/upper"
-                        let lowerPath = "/run/container/\(containerID)/lower"
-                        try await agent.umount(path: upperPath, flags: 0)
-                        try await agent.umount(path: lowerPath, flags: 0)
-                    }
+                    try await Self.umountRootfs(of: containerID, hasWritableLayer: hasWritableLayer, agent: agent)
                 }
 
                 // Release the hotplug device and virtiofs shares so they can be reused by new containers
