@@ -173,6 +173,58 @@ extension IntegrationSuite {
         }
     }
 
+    /// A member the machine cannot set up as it boots is the only one that
+    /// fails: its sibling comes up and runs, and the member's own start
+    /// answers with the boot's reason. The member's root here is a blank
+    /// disk with no filesystem on it.
+    func testPodBootSetupFailureIsTheMembersOwn() async throws {
+        let id = "test-pod-boot-setup-failure"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+
+        let blankPath = Self.testDir.appending(component: "\(id)-blank.ext4").absolutePath()
+        try? FileManager.default.removeItem(atPath: blankPath)
+        guard FileManager.default.createFile(atPath: blankPath, contents: nil) else {
+            throw IntegrationError.assert(msg: "could not create the blank disk at \(blankPath)")
+        }
+        let blank = try FileHandle(forWritingTo: URL(fileURLWithPath: blankPath))
+        try blank.truncate(atOffset: 64.mib())
+        try blank.close()
+
+        try await pod.addContainer("holder", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "holder")) { config in
+            config.process.arguments = ["/bin/echo", "up"]
+        }
+        try await pod.addContainer("blank", rootfs: .block(format: "ext4", source: blankPath, destination: "/", options: ["rw"])) { config in
+            config.process.arguments = ["/bin/true"]
+        }
+
+        try await pod.create()
+        do {
+            try await pod.startContainer("holder")
+            let status = try await pod.waitContainer("holder")
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "holder status \(status) != 0")
+            }
+
+            do {
+                try await pod.startContainer("blank")
+                throw IntegrationError.assert(msg: "the member with a blank root started")
+            } catch let error as ContainerizationError where error.code == .invalidState {
+                guard error.cause != nil else {
+                    throw IntegrationError.assert(msg: "the refusal carries no reason: \(error)")
+                }
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
     func testPodSharedSwap() async throws {
         let id = "test-pod-shared-swap"
 
