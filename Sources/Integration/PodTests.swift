@@ -92,6 +92,87 @@ extension IntegrationSuite {
         }
     }
 
+    /// A stopped member keeps its place and starts again on the rootfs it
+    /// had, with the streams its new start brings: one member placed with the
+    /// machine's boot storage and one added to the running machine each write
+    /// a marker, stop while a sibling holds the machine up, start again into
+    /// a buffer of the restart's own, and read the marker back.
+    func testPodRestartStoppedContainer() async throws {
+        let id = "test-pod-restart-stopped-container"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+
+        try await pod.addContainer("holder", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "holder")) { config in
+            config.process.arguments = ["/bin/sleep", "600"]
+        }
+        try await pod.addContainer("booted", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "booted")) { config in
+            config.process.arguments = ["/bin/sh", "-c", "echo up; exec /bin/sleep 600"]
+        }
+
+        try await pod.create()
+        var restartOutput: [String: BufferWriter] = [:]
+        do {
+            try await pod.startContainer("holder")
+            try await pod.startContainer("booted")
+
+            try await pod.addContainer("added", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "added")) { config in
+                config.process.arguments = ["/bin/sh", "-c", "echo up; exec /bin/sleep 600"]
+            }
+            try await pod.startContainer("added")
+
+            for member in ["booted", "added"] {
+                let marker = try await pod.execInContainer(member, processID: "mark") { config in
+                    config.arguments = ["/bin/sh", "-c", "echo kept > /marker"]
+                }
+                try await marker.start()
+                let markerStatus = try await marker.wait()
+                try await marker.delete()
+                guard markerStatus.exitCode == 0 else {
+                    throw IntegrationError.assert(msg: "\(member) marker write status \(markerStatus) != 0")
+                }
+
+                try await pod.stopContainer(member)
+                let output = BufferWriter()
+                restartOutput[member] = output
+                try await pod.startContainer(member) { process in
+                    process.stdout = output
+                }
+
+                let buffer = BufferWriter()
+                let read = try await pod.execInContainer(member, processID: "read") { config in
+                    config.arguments = ["/bin/cat", "/marker"]
+                    config.stdout = buffer
+                }
+                try await read.start()
+                let readStatus = try await read.wait()
+                try await read.delete()
+                guard readStatus.exitCode == 0 else {
+                    throw IntegrationError.assert(msg: "\(member) read after restart status \(readStatus) != 0")
+                }
+                guard String(data: buffer.data, encoding: .utf8) == "kept\n" else {
+                    throw IntegrationError.assert(
+                        msg: "\(member) marker after restart should read 'kept', read '\(String(data: buffer.data, encoding: .utf8) ?? "")'")
+                }
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+
+        // The restart's own streams carried the restarted process's output.
+        for (member, output) in restartOutput {
+            guard String(data: output.data, encoding: .utf8) == "up\n" else {
+                throw IntegrationError.assert(
+                    msg: "\(member) restart should have written 'up' to the restart's stream, wrote '\(String(data: output.data, encoding: .utf8) ?? "")'")
+            }
+        }
+    }
+
     func testPodSharedSwap() async throws {
         let id = "test-pod-shared-swap"
 
