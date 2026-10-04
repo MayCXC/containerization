@@ -231,6 +231,29 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
             // it to our time sync routine.
             await self.timeSyncer.start(context: agent)
         }
+
+        // A disk detached from the running machine keeps its name in the
+        // guest until the guest has processed the disconnect, so the provider
+        // asks the guest, through an agent of its own, whether the device
+        // node is still there before it gives the name to another disk.
+        if #available(macOS 15.0, *), let provider = self.hotplugProvider as? VZHotplugProvider {
+            provider.setGuestDeviceProbe { [weak self] path in
+                guard let self, let agent = try? await self.dialAgent() else {
+                    return .unreachable
+                }
+                let answer: VZHotplugProvider.GuestDevice
+                do {
+                    _ = try await agent.stat(root: "/", path: path)
+                    answer = .held
+                } catch let error as ContainerizationError where error.code == .notFound {
+                    answer = .gone
+                } catch {
+                    answer = .unreachable
+                }
+                try? await agent.close()
+                return answer
+            }
+        }
     }
 
     public func stop() async throws {
