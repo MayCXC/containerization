@@ -19,10 +19,21 @@
 /// Conforming types implement the mechanics of hotplugging block devices and
 /// virtiofs shares into a running VM.
 public protocol HotplugProvider: Sendable {
+    /// The machine's attached storage.
+    ///
+    /// A provider holds the machine's whole registry, seeded with what the
+    /// machine booted with, so a device taken while it runs is registered
+    /// alongside the rest and a container reads one registry either way.
+    var storage: MachineAttachments { get }
+
+    /// Mutate the storage registry.
+    func withStorage<T: Sendable>(_ body: (inout sending MachineAttachments) throws -> sending T) rethrows -> T
+
     /// Hotplug a block device into the running VM.
     /// - Parameters:
     ///   - block: The mount configuration for the block device
-    ///   - id: The container ID to associate with this device
+    ///   - id: The owner to associate with this device: a container's ID, or
+    ///     one naming a volume the pod attaches for its containers
     /// - Returns: The attached filesystem with the device path in the guest
     func hotplug(_ block: Mount, id: String) async throws -> AttachedFilesystem
 
@@ -32,11 +43,12 @@ public protocol HotplugProvider: Sendable {
     ///   - rootfs: The rootfs attachment from hotplug
     ///   - writableLayer: The container's writable layer attachment when it
     ///     has one
-    ///   - additionalMounts: Additional mounts to register
-    func registerMounts(id: String, rootfs: AttachedFilesystem, writableLayer: AttachedFilesystem?, additionalMounts: [Mount]) throws
+    ///   - additionalMounts: The container's other mounts, as the container
+    ///     is to mount them
+    func registerMounts(id: String, rootfs: AttachedFilesystem, writableLayer: AttachedFilesystem?, additionalMounts: [AttachedFilesystem]) throws
 
     /// Release a hotplug device.
-    /// - Parameter id: The container ID who should be released
+    /// - Parameter id: The owner whose devices should be released
     func releaseHotplug(id: String) async throws
 
     /// Hotplug virtiofs directories into the running VM.
@@ -45,8 +57,8 @@ public protocol HotplugProvider: Sendable {
     ///   - id: The container ID that owns these mounts
     func hotplugVirtioFS(_ mounts: [Mount], id: String) async throws
 
-    /// Release virtiofs shares for a container.
-    /// - Parameter id: The container ID whose shares should be released
+    /// Release virtiofs shares for an owner.
+    /// - Parameter id: The owner whose shares should be released
     func releaseVirtioFS(id: String) async throws
 
     /// Clean up resources held by the provider.

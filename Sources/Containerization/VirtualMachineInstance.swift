@@ -80,12 +80,15 @@ public protocol VirtualMachineInstance: Sendable {
     /// - Parameter rootfs: The rootfs attachment from hotplug
     /// - Parameter writableLayer: The container's writable layer attachment when it
     ///   has one
-    /// - Parameter additionalMounts: Additional mounts (like /proc, /sys) to register
-    func registerMounts(id: String, rootfs: AttachedFilesystem, writableLayer: AttachedFilesystem?, additionalMounts: [Mount]) throws
+    /// - Parameter additionalMounts: The container's other mounts, as the
+    ///   container is to mount them
+    func registerMounts(id: String, rootfs: AttachedFilesystem, writableLayer: AttachedFilesystem?, additionalMounts: [AttachedFilesystem]) throws
 
     /// Release a hotplug device.
-    /// This should be called when a hotplugged container is stopped or fails to start.
-    /// - Parameter id: The container ID whose hotplug should be released
+    /// This should be called when a hotplugged container is stopped or fails
+    /// to start, or when the last container of a volume attached for a pod's
+    /// containers leaves.
+    /// - Parameter id: The owner whose hotplug should be released
     func releaseHotplug(id: String) async throws
 
     /// Hotplug virtiofs directories into the running VM.
@@ -93,8 +96,8 @@ public protocol VirtualMachineInstance: Sendable {
     /// - Parameter id: The container ID that owns these mounts
     func hotplugVirtioFS(_ mounts: [Mount], id: String) async throws
 
-    /// Release virtiofs shares for a container.
-    /// - Parameter id: The container ID whose virtiofs shares should be released
+    /// Release virtiofs shares for an owner.
+    /// - Parameter id: The owner whose virtiofs shares should be released
     func releaseVirtioFS(id: String) async throws
 }
 
@@ -109,7 +112,7 @@ extension VirtualMachineInstance {
     public func hotplug(_ block: Mount, id: String) async throws -> AttachedFilesystem {
         throw ContainerizationError(.unsupported, message: "hotplug not supported")
     }
-    public func registerMounts(id: String, rootfs: AttachedFilesystem, writableLayer: AttachedFilesystem?, additionalMounts: [Mount]) throws {
+    public func registerMounts(id: String, rootfs: AttachedFilesystem, writableLayer: AttachedFilesystem?, additionalMounts: [AttachedFilesystem]) throws {
         // no-op default
     }
     public func releaseHotplug(id: String) async throws {
