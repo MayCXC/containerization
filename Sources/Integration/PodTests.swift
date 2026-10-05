@@ -850,6 +850,76 @@ extension IntegrationSuite {
         }
     }
 
+    /// The process list of a pod's container, read with an exec of `ps aux`.
+    private func processList(of containerID: String, in pod: LinuxPod, processID: String) async throws -> String {
+        let buffer = BufferWriter()
+        let exec = try await pod.execInContainer(containerID, processID: processID) { config in
+            config.arguments = ["/bin/sh", "-c", "ps aux"]
+            config.stdout = buffer
+        }
+        try await exec.start()
+        let status = try await exec.wait()
+        try await exec.delete()
+        guard status.exitCode == 0 else {
+            throw IntegrationError.assert(msg: "ps in \(containerID) exited with status \(status)")
+        }
+        return String(data: buffer.data, encoding: .utf8) ?? ""
+    }
+
+    /// A container's init that shares the pod's pid namespace takes the rest
+    /// of its container with it: once its exit is answered, nothing the
+    /// container started is left for the containers beside it to see.
+    func testPodSharedPIDNamespaceInitExitTakesItsProcesses() async throws {
+        let id = "test-pod-shared-pid-init-exit-takes-its-processes"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+            config.shareProcessNamespace = true
+        }
+
+        // Killing this init leaves both sleeps it started running.
+        try await pod.addContainer("leaver", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "leaver")) { config in
+            config.process.arguments = ["/bin/sh", "-c", "sleep 301 & sleep 300"]
+        }
+        try await pod.addContainer("watcher", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "watcher")) { config in
+            config.process.arguments = ["/bin/sleep", "302"]
+        }
+
+        do {
+            try await pod.create()
+            try await pod.startContainer("leaver")
+            try await pod.startContainer("watcher")
+
+            var started = false
+            for attempt in 0..<50 {
+                let before = try await processList(of: "watcher", in: pod, processID: "ps-before-\(attempt)")
+                if before.contains("sleep 301") && before.contains("sleep 300") {
+                    started = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            guard started else {
+                throw IntegrationError.assert(msg: "the leaver's sleeps never showed in the shared pid namespace")
+            }
+
+            try await pod.killContainer("leaver", signal: .kill)
+            _ = try await pod.waitContainer("leaver")
+
+            let after = try await processList(of: "watcher", in: pod, processID: "ps-after")
+            guard !after.contains("sleep 301") && !after.contains("sleep 300") else {
+                throw IntegrationError.assert(msg: "the leaver's processes outlived its init's exit: \(after)")
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+
     func testPodReadOnlyRootfs() async throws {
         let id = "test-pod-readonly-rootfs"
 

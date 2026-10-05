@@ -296,6 +296,15 @@ public struct Cgroup2Manager: Sendable {
         )
     }
 
+    /// Whether any process is still in the cgroup or in a cgroup below it.
+    package func populated() throws -> Bool {
+        guard let content = try readFileContent(fileName: "cgroup.events") else {
+            // A cgroup that is gone holds nothing.
+            return false
+        }
+        return parseKeyValuePairs(content)["populated", default: 0] != 0
+    }
+
     package func delete(force: Bool = false) throws {
         self.logger?.info(
             "deleting cgroup manager",
