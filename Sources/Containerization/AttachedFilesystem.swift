@@ -14,6 +14,7 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
+import ContainerizationError
 import ContainerizationExtras
 import ContainerizationOCI
 
@@ -29,13 +30,28 @@ public struct AttachedFilesystem: Sendable {
     public var options: [String]
 
     public init(mount: Mount, allocator: any AddressAllocator<Character>) throws {
+        guard mount.isBlock else {
+            try self.init(mount: mount)
+            return
+        }
+        let char = try allocator.allocate()
+        self.init(type: mount.type, source: "/dev/vd\(char)", destination: mount.destination, options: mount.options)
+    }
+
+    /// The attachment of a mount that takes no device name from its machine:
+    /// a directory share, named by its tag, or a mount that keeps its source.
+    /// A block device is named as its machine attaches it, through
+    /// ``init(mount:allocator:)`` while the machine is configured or the
+    /// machine's hotplug once it runs.
+    public init(mount: Mount) throws {
         switch mount.runtimeOptions {
-        case .virtiofs:
-            let name = try hashFilePath(path: mount.source)
-            self.source = name
         case .virtioblk:
-            let char = try allocator.allocate()
-            self.source = "/dev/vd\(char)"
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "block device \(mount.source) is named by the machine it is attached to"
+            )
+        case .virtiofs:
+            self.source = try hashFilePath(path: mount.source)
         case .shared, .any:
             self.source = mount.source
         }

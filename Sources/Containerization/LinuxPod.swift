@@ -241,6 +241,36 @@ public final class LinuxPod: Sendable {
         }
     }
 
+    /// A block volume the pod's containers mount, which the machine attaches
+    /// once and the guest mounts once, at the path every container that
+    /// mounts the same image is given a bind of. Kata mounts each block
+    /// device at one location within the machine and counts the containers
+    /// that mount it, and the CSI node contract stages a volume once per node
+    /// and publishes it to each workload, the orchestrator counting them; a
+    /// pod's containers share its volumes, which outlive a container's
+    /// restart. So the volume is the pod's: its containers share one
+    /// filesystem, a stop keeps it, and it leaves with the last container
+    /// that mounts it.
+    /// https://github.com/kata-containers/kata-containers/blob/main/src/runtime/virtcontainers/kata_agent.go
+    /// https://github.com/container-storage-interface/spec/blob/master/spec.md
+    /// https://kubernetes.io/docs/concepts/workloads/pods/
+    private struct BlockVolume: Sendable {
+        /// The volume as the machine attaches it, at its guest path: the
+        /// first container's mount of the image, writable where a container
+        /// placed before the machine boots writes to it.
+        var mount: Mount
+        /// The containers that mount it.
+        var users: Set<String>
+        /// Where the guest finds the volume, once the machine has it.
+        var attachment: AttachedFilesystem?
+        /// Whether the guest has the volume mounted at its path.
+        var mounted = false
+        /// Whether the volume was attached while the machine ran, so that it
+        /// is detached when its last container leaves; one the machine booted
+        /// with stays attached until the machine stops.
+        var hotplugged = false
+    }
+
     private let state: AsyncMutex<State>
 
     // Ports to be allocated from for stdio and for
@@ -261,6 +291,9 @@ public final class LinuxPod: Sendable {
         var pauseProcess: LinuxProcess?
         // Whether the unified virtiofs share is mounted at `/run/virtiofs` in the guest
         var unifiedVirtiofsMounted: Bool = false
+        /// The block volumes the containers mount, by the name the pod gives
+        /// each: the tag of its image.
+        var blockVolumes: [String: BlockVolume] = [:]
     }
 
     private enum Phase: Sendable {
@@ -526,6 +559,185 @@ public final class LinuxPod: Sendable {
     private static func guestVolumePath(_ volumeName: String) -> String {
         "/run/volumes/\(volumeName)"
     }
+
+    /// The owner a volume attached while the machine runs is recorded under
+    /// in the machine's hotplug, so that it is given back when its last
+    /// container leaves rather than with the container that brought it.
+    private static func volumeOwner(_ volumeName: String) -> String {
+        "volume-\(volumeName)"
+    }
+
+    /// A container's mounts with each block volume given as a mount of the
+    /// pod's volume of its image, and those volumes as the machine attaches
+    /// them, by name. An image the pod declares a volume of is that volume;
+    /// any other is named by its tag, which no declared volume may take.
+    /// Kata finds a block device a container brings among the sandbox's by
+    /// the device itself, and takes the one it finds.
+    /// https://github.com/kata-containers/kata-containers/blob/main/src/runtime/pkg/device/manager/manager.go
+    private func podVolumes(of mounts: [Mount], for containerID: String) throws -> (mounts: [Mount], volumes: [String: Mount]) {
+        var rewritten: [Mount] = []
+        var volumes: [String: Mount] = [:]
+        for mount in mounts {
+            guard mount.isBlock else {
+                rewritten.append(mount)
+                continue
+            }
+            let tag = try mount.tagHash
+            if let declared = try self.declaredVolume(ofImage: tag) {
+                if declared.readOnly {
+                    try Self.requireReadOnly(mount, of: declared.name, for: containerID)
+                }
+                rewritten.append(.sharedMount(name: declared.name, destination: mount.destination, options: mount.options))
+                continue
+            }
+            guard !self.config.volumes.contains(where: { $0.name == tag }) else {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "pod volume \"\(tag)\" takes the name of the volume of \(mount.source)"
+                )
+            }
+            var volume = volumes[tag] ?? mount
+            volume.destination = Self.guestVolumePath(tag)
+            if !mount.options.contains("ro") {
+                volume.options.removeAll { $0 == "ro" }
+            }
+            volumes[tag] = volume
+            rewritten.append(.sharedMount(name: tag, destination: mount.destination, options: mount.options))
+        }
+        return (rewritten, volumes)
+    }
+
+    /// The volume the pod declares of the image `tag` names, when it declares
+    /// one.
+    private func declaredVolume(ofImage tag: String) throws -> (name: String, readOnly: Bool)? {
+        for volume in self.config.volumes {
+            guard case .diskImage(let path, let readOnly) = volume.source else { continue }
+            if try hashFilePath(path: path.absolutePath()) == tag {
+                return (volume.name, readOnly)
+            }
+        }
+        return nil
+    }
+
+    /// Refuse a container's writable mount of a volume the pod mounts
+    /// read-only: the volume is one filesystem for all its containers, and
+    /// mount(8) refuses a writable mount over a loop device already bound
+    /// read-only to the same file the same way, since a device set up
+    /// read-only cannot be changed.
+    /// https://github.com/util-linux/util-linux/blob/master/libmount/src/hook_loopdev.c
+    private static func requireReadOnly(_ mount: Mount, of volumeName: String, for containerID: String) throws {
+        guard mount.options.contains("ro") else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "container \(containerID) mounts \(mount.source) writable, and the pod's volume \"\(volumeName)\" of it is read-only"
+            )
+        }
+    }
+
+    /// Count a container placed before the machine boots among the users of
+    /// its volumes. Nothing is attached yet, so a volume any of them writes
+    /// to is attached writable, and a container that only reads it is given
+    /// a read-only bind.
+    private static func registerVolumes(_ volumes: [String: Mount], for containerID: String, in blockVolumes: inout [String: BlockVolume]) {
+        for (name, mount) in volumes {
+            var volume = blockVolumes[name] ?? BlockVolume(mount: mount, users: [])
+            if !mount.options.contains("ro") {
+                volume.mount.options.removeAll { $0 == "ro" }
+            }
+            volume.users.insert(containerID)
+            blockVolumes[name] = volume
+        }
+    }
+
+    /// Give a container added to the running machine its volumes: one the
+    /// guest has mounted is counted, one the machine booted with is mounted
+    /// again, and one it lacks is attached through the machine's hotplug and
+    /// mounted at its path, the guest's mount waiting for a device just
+    /// attached as it waits for the root's. A volume already attached keeps
+    /// the mode it was attached with.
+    private static func stageVolumes(
+        _ volumes: [String: Mount],
+        for containerID: String,
+        in blockVolumes: inout [String: BlockVolume],
+        vm: any VirtualMachineInstance,
+        agent: any VirtualMachineAgent
+    ) async throws {
+        for name in volumes.keys.sorted() {
+            guard let mount = volumes[name] else { continue }
+            var volume = blockVolumes[name] ?? BlockVolume(mount: mount, users: [])
+            if let attachment = volume.attachment {
+                if volume.mount.options.contains("ro") {
+                    try Self.requireReadOnly(mount, of: name, for: containerID)
+                }
+                if !volume.mounted {
+                    try await agent.mount(attachment.to)
+                    volume.mounted = true
+                }
+            } else {
+                let owner = Self.volumeOwner(name)
+                let attachment = try await vm.hotplug(volume.mount, id: owner)
+                do {
+                    try await agent.mount(attachment.to)
+                } catch {
+                    try? await vm.releaseHotplug(id: owner)
+                    try? await vm.releaseVirtioFS(id: owner)
+                    throw error
+                }
+                volume.attachment = attachment
+                volume.mounted = true
+                volume.hotplugged = true
+            }
+            volume.users.insert(containerID)
+            blockVolumes[name] = volume
+        }
+    }
+
+    /// Take a container off the users of its volumes. A volume left with
+    /// none is unmounted, and one attached while the machine ran is detached
+    /// after it; one the machine booted with stays attached, unmounted, until
+    /// a container mounts it again or the machine stops. A volume the guest
+    /// cannot unmount stays attached, since a disk detached under a mounted
+    /// filesystem takes the filesystem down with I/O errors and a journal
+    /// abort. Without a running machine nothing is attached, and the count
+    /// is all there is to change.
+    private func releaseVolumes(
+        of containerID: String,
+        in blockVolumes: inout [String: BlockVolume],
+        vm: (any VirtualMachineInstance)?
+    ) async {
+        for name in blockVolumes.keys.sorted() {
+            guard var volume = blockVolumes[name], volume.users.remove(containerID) != nil else { continue }
+            blockVolumes[name] = volume
+            guard volume.users.isEmpty else { continue }
+            guard let vm, vm.state == .running else {
+                if volume.attachment == nil {
+                    blockVolumes[name] = nil
+                }
+                continue
+            }
+            if volume.mounted {
+                do {
+                    try await vm.withAgent { agent in
+                        try await agent.umount(path: Self.guestVolumePath(name), flags: 0)
+                    }
+                    volume.mounted = false
+                } catch {
+                    self.logger?.error(
+                        "the guest could not unmount a volume its last container left, so it stays attached",
+                        metadata: ["volume": "\(name)", "error": "\(error)"])
+                    blockVolumes[name] = volume
+                    continue
+                }
+            }
+            if volume.hotplugged {
+                try? await vm.releaseHotplug(id: Self.volumeOwner(name))
+                try? await vm.releaseVirtioFS(id: Self.volumeOwner(name))
+                blockVolumes[name] = nil
+            } else {
+                blockVolumes[name] = volume
+            }
+        }
+    }
 }
 
 extension LinuxPod {
@@ -604,10 +816,17 @@ extension LinuxPod {
                 logger: self.logger
             )
 
+            // A block volume the container mounts is the pod's, so the
+            // container is given it as a mount of the pod's volume, written
+            // back into the stored config for the same reason.
+            let (mounts, volumes) = try self.podVolumes(of: config.mounts, for: id)
+            config.mounts = mounts
+
             let fileMountContext = try FileMountContext.prepare(mounts: config.mounts)
 
             switch state.phase {
             case .initialized:
+                Self.registerVolumes(volumes, for: id, in: &state.blockVolumes)
                 state.containers[id] = PodContainer(
                     id: id,
                     rootfs: rootfs,
@@ -655,6 +874,7 @@ extension LinuxPod {
                             writableAttachment: writableAttachment,
                             rootfsPath: Self.guestRootfsPath(id)
                         )
+                        try await Self.stageVolumes(volumes, for: id, in: &state.blockVolumes, vm: vm, agent: agent)
 
                         // Shared mounts are handled separately as pod volume
                         // bind mounts; without the filter here, a container
@@ -668,7 +888,7 @@ extension LinuxPod {
                             id: id,
                             rootfs: attachment,
                             writableLayer: writableAttachment,
-                            additionalMounts: nonSharedMounts
+                            additionalMounts: try nonSharedMounts.map { try AttachedFilesystem(mount: $0) }
                         )
 
                         // Mount this container's additional virtiofs shares in the
@@ -776,6 +996,7 @@ extension LinuxPod {
                         fileMountContext: updatedFileMountContext
                     )
                 } catch {
+                    await self.releaseVolumes(of: id, in: &state.blockVolumes, vm: vm)
                     try? await vm.releaseHotplug(id: id)
                     try? await vm.releaseVirtioFS(id: id)
                     throw error
@@ -824,6 +1045,10 @@ extension LinuxPod {
                     )
                 }
             }
+            // The containers' block volumes are the pod's too, named by their
+            // images' tags, which no declared volume takes.
+            let blockVolumes = state.blockVolumes
+            volumeNames.formUnion(blockVolumes.keys)
 
             // Validate that all shared mounts reference valid pod volume names.
             for (id, container) in state.containers {
@@ -840,6 +1065,9 @@ extension LinuxPod {
             }
             for volume in self.config.volumes {
                 machineStorage.volumes[volume.name] = volume.toMount()
+            }
+            for (name, volume) in blockVolumes {
+                machineStorage.volumes[name] = volume.mount
             }
             // The swap area is attached with the machine's own storage so the
             // guest is told the /dev path the VMM allocates it.
@@ -1030,6 +1258,17 @@ extension LinuxPod {
                             ))
                     }
 
+                    // Mount the volumes the containers mount, each once.
+                    for name in blockVolumes.keys.sorted() {
+                        guard let attachment = vm.storage.volumes[name] else {
+                            throw ContainerizationError(
+                                .notFound,
+                                message: "attached filesystem not found for pod volume \"\(name)\""
+                            )
+                        }
+                        try await agent.mount(attachment.to)
+                    }
+
                     // Start up unix socket relays for each container
                     for (_, container) in containers {
                         for socket in container.config.sockets {
@@ -1078,6 +1317,10 @@ extension LinuxPod {
 
                 state.pauseProcess = pauseProcessHolder.withLock { $0 }
                 state.unifiedVirtiofsMounted = hasVirtiofsMount && vm.virtiofsLayout == .unified
+                for name in blockVolumes.keys {
+                    state.blockVolumes[name]?.attachment = vm.storage.volumes[name]
+                    state.blockVolumes[name]?.mounted = true
+                }
 
                 // Apply file mount context updates.
                 let updates = fileMountContextUpdates.withLock { $0 }
@@ -1336,8 +1579,9 @@ extension LinuxPod {
     /// place; the name still answers for it, and placing another container
     /// under it is refused. Removal is the separate act the runtime
     /// specification names for giving the place up, taken once the container
-    /// has stopped. A container that is running keeps its place and this
-    /// call refuses it.
+    /// has stopped, and the container leaves the users of the volumes it
+    /// mounts, the last of them taking a volume down. A container that is
+    /// running keeps its place and this call refuses it.
     /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
     public func removeContainer(_ containerID: String) async throws {
         try await self.state.withLock { state in
@@ -1349,6 +1593,11 @@ extension LinuxPod {
             }
             switch container.state {
             case .registered, .stopped, .errored:
+                var vm: (any VirtualMachineInstance)?
+                if case .created(let createdState) = state.phase {
+                    vm = createdState.vm
+                }
+                await self.releaseVolumes(of: containerID, in: &state.blockVolumes, vm: vm)
                 state.containers[containerID] = nil
             default:
                 throw ContainerizationError(
@@ -1413,7 +1662,27 @@ extension LinuxPod {
                     }
                 }
 
+                // Unmount the volumes the containers mount.
+                let mountedVolumes = state.blockVolumes.filter(\.value.mounted).map(\.key)
+                if createdState.vm.state != .stopped && !mountedVolumes.isEmpty {
+                    try? await createdState.vm.withAgent { agent in
+                        for name in mountedVolumes {
+                            try? await agent.umount(path: Self.guestVolumePath(name), flags: 0)
+                        }
+                    }
+                }
+
                 try await createdState.vm.stop()
+                // The machine's volumes went with it. A pod created again
+                // attaches the ones its containers still mount as it boots.
+                state.blockVolumes = state.blockVolumes.compactMapValues { volume in
+                    guard !volume.users.isEmpty else { return nil }
+                    var volume = volume
+                    volume.attachment = nil
+                    volume.mounted = false
+                    volume.hotplugged = false
+                    return volume
+                }
                 state.phase = .initialized
             } catch {
                 try? await createdState.vm.stop()
