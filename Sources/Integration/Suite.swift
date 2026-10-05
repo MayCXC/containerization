@@ -621,6 +621,15 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("pod container filesystem isolation", testPodContainerFilesystemIsolation),
             Test("pod copy round trip", testPodCopyRoundTrip),
             Test("pod writable layer", testPodWritableLayer),
+            Test("pod hotplug block rootfs", testPodHotplugBlockRootfs),
+            Test("pod hotplug block volume", testPodHotplugBlockVolume),
+            Test("pod hotplug block volume shared", testPodHotplugBlockVolumeShared),
+            Test("pod hotplug block volume read-only", testPodHotplugBlockVolumeReadOnly),
+            Test("pod hotplug block volume counted", testPodHotplugBlockVolumeCounted),
+            Test("pod hotplug writable layer", testPodHotplugWritableLayer),
+            Test("pod hotplug virtiofs share", testPodHotplugVirtiofsShare),
+            Test("pod hotplug virtiofs same share", testPodHotplugVirtiofsSameShare),
+            Test("pod hotplug virtiofs share lifecycle", testPodHotplugVirtiofsShareLifecycle),
             Test("pod container PID namespace isolation", testPodContainerPIDNamespaceIsolation),
             Test("pod container independent resource limits", testPodContainerIndependentResourceLimits),
             Test("pod shared PID namespace", testPodSharedPIDNamespace),
@@ -727,6 +736,12 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("pod shared disk image volume", testPodSharedDiskImageVolume),
                 Test("pod shared tmpfs volume", testPodSharedTmpfsVolume),
 
+                // A joining container's disks ride the machine's share as
+                // image files (cloud-hypervisor gives each a device of its own)
+                Test("pod hotplug image export", testPodHotplugImageExport),
+                Test("pod hotplug volume shared by two", testPodHotplugVolumeSharedByTwo),
+                Test("pod hotplug volume held by another machine", testPodHotplugVolumeHeldByAnotherMachine),
+
                 // cctl --block CLI wiring
                 Test("cctl block NBD mount", testCctlBlockNBDMount),
                 Test("cctl block NBD raw", testCctlBlockNBDRaw),
@@ -747,16 +762,10 @@ struct IntegrationSuite: AsyncParsableCommand {
             ] + macOS26Tests()
         let tests: [Test] = crossPlatformTests + macOSOnlyTests
         #else
-        // Hotplug into a running pod VM is CH-only (VZ has no runtime hotplug),
-        // and no pod test elsewhere exercises addContainer-after-create.
+        // A virtiofs rootfs rides its own device, which cloud-hypervisor alone
+        // adds to a running machine.
         let linuxOnlyTests: [Test] = [
-            Test("pod hotplug block rootfs", testPodHotplugBlockRootfs),
-            Test("pod hotplug block volume", testPodHotplugBlockVolume),
-            Test("pod hotplug block volume shared", testPodHotplugBlockVolumeShared),
-            Test("pod hotplug block volume read-only", testPodHotplugBlockVolumeReadOnly),
-            Test("pod hotplug block volume counted", testPodHotplugBlockVolumeCounted),
-            Test("pod hotplug virtiofs rootfs", testPodHotplugVirtiofsRootfs),
-            Test("pod hotplug writable layer", testPodHotplugWritableLayer),
+            Test("pod hotplug virtiofs rootfs", testPodHotplugVirtiofsRootfs)
         ]
         let tests: [Test] = crossPlatformTests + linuxOnlyTests
         #endif

@@ -1073,12 +1073,14 @@ extension LinuxPod {
             // guest is told the /dev path the VMM allocates it.
             machineStorage.swap = self.config.swapLayer
 
-            // Capture into an immutable `let` so the value is safely usable
-            // from the concurrent `withAgent` closure below. The container
-            // path makes the same decision in LinuxContainer.create — CH
-            // only attaches a virtiofs device when shares are configured,
-            // so mounting an unbacked /run/virtiofs would fail with EINVAL
-            // on the CH backend.
+            // Captured into an immutable `let` so the value is safely usable
+            // from the concurrent `withAgent` closure below. CH attaches a
+            // virtiofs device only when a share is configured, so mounting an
+            // unbacked /run/virtiofs would fail with EINVAL there, while a VZ
+            // machine always carries its one share device and mounts it at
+            // boot whether or not anything is exported yet, so a directory
+            // exported to it later appears under /run/virtiofs as it is
+            // exported.
             let hasVirtiofsMount = machineStorage.ordered.contains { mount in
                 if case .virtiofs = mount.runtimeOptions { return true }
                 return false
@@ -1095,6 +1097,7 @@ extension LinuxPod {
             vmConfig.extensions = self.config.extensions
             let creationConfig = StandardVMConfig(configuration: vmConfig)
             let vm = try await self.vmm.create(config: creationConfig)
+            let mountsShareAtBoot = hasVirtiofsMount || vm.virtiofsLayout == .unified
             let relayManager = UnixSocketRelayManager(vm: vm)
             do {
                 try await vm.start()
@@ -1123,10 +1126,12 @@ extension LinuxPod {
                             ))
                     }
 
-                    // Mount the unified virtiofs share at /run/virtiofs only
-                    // when at least one container has a virtiofs mount. VZ
-                    // tolerates the unbacked mount; CH does not.
-                    if hasVirtiofsMount {
+                    // Mount the machine's share at /run/virtiofs: the unified
+                    // device whenever the machine has one, so that a directory
+                    // exported later appears under it, and a per-tag device
+                    // only where a container has a virtiofs mount, since an
+                    // unbacked one does not mount.
+                    if mountsShareAtBoot {
                         try await agent.mkdir(path: "/run/virtiofs", all: true, perms: 0o755)
                         if vm.virtiofsLayout == .perTag {
                             // CH backend: one virtio-fs device per source-hash
@@ -1316,7 +1321,7 @@ extension LinuxPod {
                 }
 
                 state.pauseProcess = pauseProcessHolder.withLock { $0 }
-                state.unifiedVirtiofsMounted = hasVirtiofsMount && vm.virtiofsLayout == .unified
+                state.unifiedVirtiofsMounted = mountsShareAtBoot && vm.virtiofsLayout == .unified
                 for name in blockVolumes.keys {
                     state.blockVolumes[name]?.attachment = vm.storage.volumes[name]
                     state.blockVolumes[name]?.mounted = true
