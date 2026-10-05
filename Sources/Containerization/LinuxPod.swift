@@ -195,6 +195,7 @@ public final class LinuxPod: Sendable {
     private struct PodContainer: Sendable {
         let id: String
         let rootfs: Mount
+        let writableLayer: Mount?
         let config: ContainerConfiguration
         /// The container's own profile, or the pod's when it set none.
         let seccomp: ResolvedSeccomp
@@ -221,6 +222,9 @@ public final class LinuxPod: Sendable {
     // Ports we request the guest to allocate for unix socket relays from
     // the host.
     private let guestVsockPorts: Atomic<UInt32>
+
+    // Where the blocking reads and writes of a file transfer run.
+    private let copyQueue = DispatchQueue(label: "com.apple.containerization.copy")
 
     private struct State: Sendable {
         var phase: Phase
@@ -381,6 +385,7 @@ public final class LinuxPod: Sendable {
         containerID: String,
         config: ContainerConfiguration,
         rootfs: Mount,
+        writableLayer: Mount? = nil,
         seccomp: ResolvedSeccomp,
         purpose: SpecPurpose
     ) throws -> Spec {
@@ -413,7 +418,7 @@ public final class LinuxPod: Sendable {
 
         // If the rootfs was requested as read-only, set it in the OCI spec.
         // We let the OCI runtime remount as ro, instead of doing it originally.
-        spec.root?.readonly = rootfs.options.contains("ro")
+        spec.root?.readonly = rootfs.options.contains("ro") && writableLayer == nil
 
         // Resource limits.
         spec.linux?.resources?.cpu = LinuxCPU(
@@ -462,6 +467,29 @@ public final class LinuxPod: Sendable {
         "/run/container/\(containerID)/rootfs"
     }
 
+    /// Unmount a container's rootfs, and the layers it is built from when it
+    /// was given a writable layer. Every mount is tried whatever the others
+    /// did, and the first failure is thrown once all have been, so a mount
+    /// left behind by a partial setup still comes down.
+    private static func umountRootfs(of containerID: String, hasWritableLayer: Bool, agent: VirtualMachineAgent) async throws {
+        var paths = [Self.guestRootfsPath(containerID)]
+        if hasWritableLayer {
+            paths.append("/run/container/\(containerID)/upper")
+            paths.append("/run/container/\(containerID)/lower")
+        }
+        var failure: (any Error)?
+        for path in paths {
+            do {
+                try await agent.umount(path: path, flags: 0)
+            } catch {
+                failure = failure ?? error
+            }
+        }
+        if let failure {
+            throw failure
+        }
+    }
+
     static func guestSocketStagingPath(_ socketID: String) -> String {
         "/run/sockets/\(socketID).sock"
     }
@@ -492,9 +520,14 @@ extension LinuxPod {
     /// When called before `create()`, the container is registered for setup during VM creation.
     /// When called after `create()`, the container is hotplugged into the running VM.
     /// If the underlying VMM does not support hotplug, an error is thrown.
+    /// - Parameters:
+    ///   - writableLayer: Optional writable layer mount. When provided, an overlayfs is used with
+    ///     the container's rootfs as the lower layer and this as the upper layer, so all writes
+    ///     go to this layer instead of the rootfs.
     public func addContainer(
         _ id: String,
         rootfs: Mount,
+        writableLayer: Mount? = nil,
         configuration: @Sendable @escaping (inout ContainerConfiguration) throws -> Void
     ) async throws {
         guard id.count <= Self.maxIDLength else {
@@ -502,6 +535,14 @@ extension LinuxPod {
                 .invalidArgument,
                 message: "container id length \(id.count) exceeds maximum of \(Self.maxIDLength) characters"
             )
+        }
+        if let writableLayer {
+            guard writableLayer.isBlock else {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "writableLayer must be a block device"
+                )
+            }
         }
         try await self.state.withLock { state in
             guard state.containers[id] == nil else {
@@ -544,6 +585,7 @@ extension LinuxPod {
                 state.containers[id] = PodContainer(
                     id: id,
                     rootfs: rootfs,
+                    writableLayer: writableLayer,
                     config: config,
                     seccomp: seccomp,
                     state: .registered,
@@ -554,6 +596,9 @@ extension LinuxPod {
             case .created(let createdState):
                 let vm = createdState.vm
 
+                // Strip "ro" as create() does: readonly is expressed through
+                // the OCI spec's root.readonly field and a remount in vmexec
+                // after setup completes, so the device attaches writable.
                 var modifiedRootfs = rootfs
                 modifiedRootfs.options.removeAll(where: { $0 == "ro" })
 
@@ -561,6 +606,13 @@ extension LinuxPod {
 
                 var updatedFileMountContext = fileMountContext
                 do {
+                    // The writable layer is a block device like the rootfs,
+                    // attached alongside it so the overlay has both layers.
+                    var writableAttachment: AttachedFilesystem?
+                    if let writableLayer {
+                        writableAttachment = try await vm.hotplug(writableLayer, id: id)
+                    }
+
                     let virtioFSMounts = fileMountContext.transformedMounts.filter {
                         if case .virtiofs(_) = $0.runtimeOptions { return true }
                         return false
@@ -571,13 +623,17 @@ extension LinuxPod {
 
                     let agent = try await vm.dialAgent()
                     do {
-                        var mount = attachment.to
-                        mount.destination = Self.guestRootfsPath(id)
-                        try await agent.mount(mount)
+                        try await agent.mountRootfs(
+                            containerID: id,
+                            rootfsAttachment: attachment,
+                            writableAttachment: writableAttachment,
+                            rootfsPath: Self.guestRootfsPath(id)
+                        )
 
-                        // Filter out shared mounts — those are handled separately as
-                        // pod volume bind mounts. Without it here, a container added to an
-                        // already-created would add a duplicated mount into the shared VM.
+                        // Shared mounts are handled separately as pod volume
+                        // bind mounts; without the filter here, a container
+                        // added to an already-created pod would add a
+                        // duplicated mount into the shared VM.
                         let nonSharedMounts = fileMountContext.transformedMounts.filter {
                             if case .shared = $0.runtimeOptions { return false }
                             return true
@@ -585,6 +641,7 @@ extension LinuxPod {
                         try vm.registerMounts(
                             id: id,
                             rootfs: attachment,
+                            writableLayer: writableAttachment,
                             additionalMounts: nonSharedMounts
                         )
 
@@ -681,7 +738,7 @@ extension LinuxPod {
 
                         try await agent.close()
                     } catch {
-                        try? await agent.umount(path: Self.guestRootfsPath(id), flags: 0)
+                        try? await Self.umountRootfs(of: id, hasWritableLayer: writableAttachment != nil, agent: agent)
                         try? await agent.close()
                         throw error
                     }
@@ -689,6 +746,7 @@ extension LinuxPod {
                     state.containers[id] = PodContainer(
                         id: id,
                         rootfs: rootfs,
+                        writableLayer: writableLayer,
                         config: config,
                         seccomp: seccomp,
                         state: .created,
@@ -729,6 +787,7 @@ extension LinuxPod {
                 }
                 machineStorage.containers[id] = ContainerMounts(
                     rootfs: modifiedRootfs,
+                    writableLayer: container.writableLayer,
                     mounts: containerMounts
                 )
             }
@@ -784,9 +843,8 @@ extension LinuxPod {
             let creationConfig = StandardVMConfig(configuration: vmConfig)
             let vm = try await self.vmm.create(config: creationConfig)
             let relayManager = UnixSocketRelayManager(vm: vm)
-            try await vm.start()
-
             do {
+                try await vm.start()
                 let containers = state.containers
                 let shareProcessNamespace = self.config.shareProcessNamespace
                 let pauseProcessHolder = Mutex<LinuxProcess?>(nil)
@@ -900,9 +958,12 @@ extension LinuxPod {
                         guard let attached = vm.storage.containers[container.id] else {
                             throw ContainerizationError(.notFound, message: "rootfs mount not found for container \(container.id)")
                         }
-                        var rootfs = attached.rootfs.to
-                        rootfs.destination = Self.guestRootfsPath(container.id)
-                        try await agent.mount(rootfs)
+                        try await agent.mountRootfs(
+                            containerID: container.id,
+                            rootfsAttachment: attached.rootfs,
+                            writableAttachment: attached.writableLayer,
+                            rootfsPath: Self.guestRootfsPath(container.id)
+                        )
                     }
 
                     // Mount file mount holding directories under /run for each container.
@@ -1031,6 +1092,7 @@ extension LinuxPod {
                     containerID: containerID,
                     config: container.config,
                     rootfs: container.rootfs,
+                    writableLayer: container.writableLayer,
                     seccomp: container.seccomp,
                     purpose: .containerInit
                 )
@@ -1170,9 +1232,16 @@ extension LinuxPod {
                 return
             }
 
-            // Handle containers that were hotplugged but never started
+            // A container hotplugged but never started holds what its add
+            // mounted: its rootfs, and the layers under it when it was given
+            // a writable layer. A disk detached while a filesystem on it is
+            // still mounted takes the filesystem down with I/O errors and a
+            // journal abort, so the mounts go first and the devices after.
             if container.state == .created {
-                // Release the hotplug device and virtiofs shares
+                let hasWritableLayer = container.writableLayer != nil
+                try? await createdState.vm.withAgent { agent in
+                    try await Self.umountRootfs(of: containerID, hasWritableLayer: hasWritableLayer, agent: agent)
+                }
                 try? await createdState.vm.releaseHotplug(id: containerID)
                 try? await createdState.vm.releaseVirtioFS(id: containerID)
 
@@ -1199,12 +1268,9 @@ extension LinuxPod {
                 try await process.kill(.kill)
                 try await process.wait(timeoutInSeconds: 3)
 
+                let hasWritableLayer = container.writableLayer != nil
                 try await createdState.vm.withAgent { agent in
-                    // Unmount the rootfs
-                    try await agent.umount(
-                        path: Self.guestRootfsPath(containerID),
-                        flags: 0
-                    )
+                    try await Self.umountRootfs(of: containerID, hasWritableLayer: hasWritableLayer, agent: agent)
                 }
 
                 // Release the hotplug device and virtiofs shares so they can be reused by new containers
@@ -1227,6 +1293,35 @@ extension LinuxPod {
                 state.containers[containerID] = container
 
                 throw error
+            }
+        }
+    }
+
+    /// Take a container out of the pod, so its name is free to place again.
+    ///
+    /// Stopping a container tears down what it was running and keeps its
+    /// place; the name still answers for it, and placing another container
+    /// under it is refused. Removal is the separate act the runtime
+    /// specification names for giving the place up, taken once the container
+    /// has stopped. A container that is running keeps its place and this
+    /// call refuses it.
+    /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+    public func removeContainer(_ containerID: String) async throws {
+        try await self.state.withLock { state in
+            guard let container = state.containers[containerID] else {
+                throw ContainerizationError(
+                    .notFound,
+                    message: "container \(containerID) not found in pod"
+                )
+            }
+            switch container.state {
+            case .registered, .stopped, .errored:
+                state.containers[containerID] = nil
+            default:
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "container \(containerID) must stop before it is removed"
+                )
             }
         }
     }
@@ -1382,6 +1477,7 @@ extension LinuxPod {
                 containerID: containerID,
                 config: container.config,
                 rootfs: container.rootfs,
+                writableLayer: container.writableLayer,
                 seccomp: container.seccomp,
                 purpose: .exec
             )
@@ -1488,6 +1584,82 @@ extension LinuxPod {
                 try await vminitd.filesystemOperation(operation: operation, path: path, containerID: containerID)
             }
         }
+    }
+
+    /// Default chunk size for file transfers (1MiB).
+    public static let defaultCopyChunkSize = GuestFileTransfer.defaultChunkSize
+
+    /// Copy a file or directory from the host into a container in the pod.
+    ///
+    /// Data transfer happens over a dedicated vsock connection. For
+    /// directories, the source is archived as tar+gzip and streamed directly
+    /// through vsock without intermediate temp files.
+    public func copyIn(
+        _ containerID: String,
+        from source: URL,
+        to destination: URL,
+        mode: UInt32 = 0o644,
+        createParents: Bool = true,
+        chunkSize: Int = defaultCopyChunkSize
+    ) async throws {
+        try await self.state.withLock { state in
+            try await self.transfer(containerID, state: state, operation: "copyIn").copyIn(
+                from: source,
+                to: destination,
+                mode: mode,
+                createParents: createParents,
+                chunkSize: chunkSize
+            )
+        }
+    }
+
+    /// Copy a file or directory from a container in the pod to the host.
+    ///
+    /// Data transfer happens over a dedicated vsock connection. For
+    /// directories, the guest archives the source as tar+gzip and streams it
+    /// directly through vsock. The host extracts the archive without
+    /// intermediate temp files.
+    public func copyOut(
+        _ containerID: String,
+        from source: URL,
+        to destination: URL,
+        createParents: Bool = true,
+        chunkSize: Int = defaultCopyChunkSize
+    ) async throws {
+        try await self.state.withLock { state in
+            try await self.transfer(containerID, state: state, operation: "copyOut").copyOut(
+                from: source,
+                to: destination,
+                createParents: createParents,
+                chunkSize: chunkSize
+            )
+        }
+    }
+
+    /// A transfer against one container's filesystem, on a port of its own.
+    private func transfer(_ containerID: String, state: State, operation: String) throws -> GuestFileTransfer {
+        let createdState = try state.phase.createdState(operation)
+
+        guard let container = state.containers[containerID] else {
+            throw ContainerizationError(
+                .notFound,
+                message: "container \(containerID) not found in pod"
+            )
+        }
+
+        guard container.state == .started else {
+            throw ContainerizationError(
+                .invalidState,
+                message: "container \(containerID) must be started to copy files"
+            )
+        }
+
+        return GuestFileTransfer(
+            vm: createdState.vm,
+            guestRoot: Self.guestRootfsPath(containerID),
+            ports: self.hostVsockPorts,
+            queue: self.copyQueue
+        )
     }
 
     /// Close a container's standard input to signal no more input is arriving.
