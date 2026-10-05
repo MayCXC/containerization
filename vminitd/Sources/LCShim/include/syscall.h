@@ -23,6 +23,7 @@
 
 #include <sys/types.h>
 #ifdef __linux__
+#include <sys/sysinfo.h>
 #include <sys/vfs.h>
 #endif
 

@@ -52,6 +52,10 @@ public final class LinuxPod: Sendable {
         /// their own. The `destination` field is ignored, as the area is
         /// enabled rather than mounted.
         public var swapLayer: Mount? = nil
+        /// Size the machine by this policy while the pod runs, so that memory
+        /// its guest does not need goes back to the host. Nil, or a machine
+        /// with no memory balloon, leaves the machine at its full size.
+        public var memoryBalloonPolicy: MemoryBalloonPolicy? = nil
         /// The network interfaces for the pod.
         public var interfaces: [any Interface] = []
         /// Whether nested virtualization should be turned on for the pod.
@@ -326,6 +330,7 @@ public final class LinuxPod: Sendable {
         struct CreatedState: Sendable {
             let vm: any VirtualMachineInstance
             let relayManager: UnixSocketRelayManager
+            let balloon: (controller: MemoryBalloonController, task: Task<Void, Never>)?
         }
 
         func createdState(_ operation: String) throws -> CreatedState {
@@ -1459,7 +1464,24 @@ extension LinuxPod {
                     }
                 }
 
-                state.phase = .created(.init(vm: vm, relayManager: relayManager))
+                var balloon: (controller: MemoryBalloonController, task: Task<Void, Never>)?
+                if let policy = self.config.memoryBalloonPolicy, vm.hasMemoryBalloon {
+                    let controller = MemoryBalloonController(policy: policy, maximum: vmConfig.memoryInBytes, logger: self.logger)
+                    let task = Task {
+                        await controller.run(
+                            memoryInfo: {
+                                try await vm.withAgent { agent in
+                                    try await agent.memoryInfo()
+                                }
+                            },
+                            apply: { target, _ in
+                                try await vm.setTargetMemorySize(target)
+                            }
+                        )
+                    }
+                    balloon = (controller, task)
+                }
+                state.phase = .created(.init(vm: vm, relayManager: relayManager, balloon: balloon))
             } catch {
                 try? await relayManager.stopAll()
                 try? await vm.stop()
@@ -1788,6 +1810,7 @@ extension LinuxPod {
             let createdState = try state.phase.createdState("stop")
 
             do {
+                createdState.balloon?.task.cancel()
                 try await createdState.relayManager.stopAll()
 
                 // Stop all containers
@@ -2032,6 +2055,38 @@ extension LinuxPod {
             try state.phase.createdState("withVirtualMachineInstance").vm
         }
         return try await fn(vm)
+    }
+
+    /// Ask the machine to hold no more than `bytes`. The balloon takes the
+    /// difference from the guest, and hands it back when the target is raised
+    /// again, so nothing changes until the guest has acted on the request.
+    ///
+    /// The pod's containers share the machine's memory, so this bounds all of
+    /// them together rather than any one of them.
+    public func setTargetMemorySize(_ bytes: UInt64) async throws {
+        let vm = try await self.state.withLock { state in
+            try state.phase.createdState("setTargetMemorySize").vm
+        }
+        try await vm.setTargetMemorySize(bytes)
+    }
+
+    /// The guest kernel's account of the machine's memory, which the pod's
+    /// containers share.
+    public func memoryInfo() async throws -> LinuxMemoryInfo {
+        let vm = try await self.state.withLock { state in
+            try state.phase.createdState("memoryInfo").vm
+        }
+        return try await vm.withAgent { agent in
+            try await agent.memoryInfo()
+        }
+    }
+
+    /// What the memory balloon policy has done, or nil when none runs.
+    public func memoryBalloonReport() async throws -> MemoryBalloonController.Report? {
+        let createdState = try await self.state.withLock { state in
+            try state.phase.createdState("memoryBalloonReport")
+        }
+        return await createdState.balloon?.controller.currentReport()
     }
 
     // Perform filesystem operations in a container.

@@ -221,6 +221,101 @@ public nonisolated struct Com_Apple_Containerization_Sandbox_V3_SysctlResponse: 
   public init() {}
 }
 
+/// The configuration of mem-agent's compaction, by its own names:
+/// https://github.com/kata-containers/kata-containers/blob/846c6f80343788a057eedc15fae7f3c91ae2d13a/src/libs/mem-agent/src/compact.rs
+public nonisolated struct Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// The least seconds from one attempt to the next.
+  public var periodSecs: UInt64 = 0
+
+  /// Skip an attempt when memory and IO stalled for more than this percentage
+  /// of the time since the last attempt.
+  public var periodPsiPercentLimit: UInt64 = 0
+
+  /// Stop a compaction when memory and IO stall for more than this percentage
+  /// of a second while it runs.
+  public var compactPsiPercentLimit: UInt64 = 0
+
+  /// Stop a compaction after this many seconds.
+  public var compactSecMax: UInt64 = 0
+
+  /// The order of the free blocks compaction is for.
+  public var compactOrder: UInt32 = 0
+
+  /// How far the guest has to move after one compaction for another to be
+  /// worth it, in pages.
+  public var compactThreshold: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var outcome: Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse.Outcome = .compacted
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public nonisolated enum Outcome: SwiftProtobuf.Enum, Swift.CaseIterable {
+    public typealias RawValue = Int
+
+    /// The guest compacted, until done or stopped by its limits.
+    case compacted // = 0
+
+    /// Less than period_secs had passed since the last attempt.
+    case notDue // = 1
+
+    /// Memory and IO stalled for more than period_psi_percent_limit.
+    case underPressure // = 2
+
+    /// The guest's memory had not moved far enough since the last compaction.
+    case notFragmented // = 3
+    case UNRECOGNIZED(Int)
+
+    public init() {
+      self = .compacted
+    }
+
+    public init?(rawValue: Int) {
+      switch rawValue {
+      case 0: self = .compacted
+      case 1: self = .notDue
+      case 2: self = .underPressure
+      case 3: self = .notFragmented
+      default: self = .UNRECOGNIZED(rawValue)
+      }
+    }
+
+    public var rawValue: Int {
+      switch self {
+      case .compacted: return 0
+      case .notDue: return 1
+      case .underPressure: return 2
+      case .notFragmented: return 3
+      case .UNRECOGNIZED(let i): return i
+      }
+    }
+
+    // The compiler won't synthesize support with the UNRECOGNIZED case.
+    public static let allCases: [Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse.Outcome] = [
+      .compacted,
+      .notDue,
+      .underPressure,
+      .notFragmented,
+    ]
+
+  }
+
+  public init() {}
+}
+
 public nonisolated struct Com_Apple_Containerization_Sandbox_V3_ProxyVsockRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -1807,6 +1902,51 @@ public nonisolated struct Com_Apple_Containerization_Sandbox_V3_FilesystemStats:
   public init() {}
 }
 
+public nonisolated struct Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+/// Fields of the guest's /proc/meminfo, in bytes.
+public nonisolated struct Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// MemTotal.
+  public var totalBytes: UInt64 = 0
+
+  /// MemFree.
+  public var freeBytes: UInt64 = 0
+
+  /// MemAvailable.
+  public var availableBytes: UInt64 = 0
+
+  /// Committed_AS.
+  public var committedBytes: UInt64 = 0
+
+  /// Balloon, absent when the kernel does not print it.
+  public var balloonBytes: UInt64 {
+    get {_balloonBytes ?? 0}
+    set {_balloonBytes = newValue}
+  }
+  /// Returns true if `balloonBytes` has been explicitly set.
+  public var hasBalloonBytes: Bool {self._balloonBytes != nil}
+  /// Clears the value of `balloonBytes`. Subsequent reads from it will return its default value.
+  public mutating func clearBalloonBytes() {self._balloonBytes = nil}
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _balloonBytes: UInt64? = nil
+}
+
 // MARK: - Code below here is support for the SwiftProtobuf runtime.
 
 fileprivate nonisolated let _protobuf_package = "com.apple.containerization.sandbox.v3"
@@ -2039,6 +2179,95 @@ nonisolated extension Com_Apple_Containerization_Sandbox_V3_SysctlResponse: Swif
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
+}
+
+nonisolated extension Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".CompactMemoryRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}period_secs\0\u{3}period_psi_percent_limit\0\u{3}compact_psi_percent_limit\0\u{3}compact_sec_max\0\u{3}compact_order\0\u{3}compact_threshold\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.periodSecs) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.periodPsiPercentLimit) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.compactPsiPercentLimit) }()
+      case 4: try { try decoder.decodeSingularUInt64Field(value: &self.compactSecMax) }()
+      case 5: try { try decoder.decodeSingularUInt32Field(value: &self.compactOrder) }()
+      case 6: try { try decoder.decodeSingularUInt64Field(value: &self.compactThreshold) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.periodSecs != 0 {
+      try visitor.visitSingularUInt64Field(value: self.periodSecs, fieldNumber: 1)
+    }
+    if self.periodPsiPercentLimit != 0 {
+      try visitor.visitSingularUInt64Field(value: self.periodPsiPercentLimit, fieldNumber: 2)
+    }
+    if self.compactPsiPercentLimit != 0 {
+      try visitor.visitSingularUInt64Field(value: self.compactPsiPercentLimit, fieldNumber: 3)
+    }
+    if self.compactSecMax != 0 {
+      try visitor.visitSingularUInt64Field(value: self.compactSecMax, fieldNumber: 4)
+    }
+    if self.compactOrder != 0 {
+      try visitor.visitSingularUInt32Field(value: self.compactOrder, fieldNumber: 5)
+    }
+    if self.compactThreshold != 0 {
+      try visitor.visitSingularUInt64Field(value: self.compactThreshold, fieldNumber: 6)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest, rhs: Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest) -> Bool {
+    if lhs.periodSecs != rhs.periodSecs {return false}
+    if lhs.periodPsiPercentLimit != rhs.periodPsiPercentLimit {return false}
+    if lhs.compactPsiPercentLimit != rhs.compactPsiPercentLimit {return false}
+    if lhs.compactSecMax != rhs.compactSecMax {return false}
+    if lhs.compactOrder != rhs.compactOrder {return false}
+    if lhs.compactThreshold != rhs.compactThreshold {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".CompactMemoryResponse"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}outcome\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularEnumField(value: &self.outcome) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.outcome != .compacted {
+      try visitor.visitSingularEnumField(value: self.outcome, fieldNumber: 1)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse, rhs: Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse) -> Bool {
+    if lhs.outcome != rhs.outcome {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse.Outcome: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0COMPACTED\0\u{1}NOT_DUE\0\u{1}UNDER_PRESSURE\0\u{1}NOT_FRAGMENTED\0")
 }
 
 nonisolated extension Com_Apple_Containerization_Sandbox_V3_ProxyVsockRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
@@ -4833,6 +5062,79 @@ nonisolated extension Com_Apple_Containerization_Sandbox_V3_FilesystemStats: Swi
     if lhs.freeBlocks != rhs.freeBlocks {return false}
     if lhs.inodes != rhs.inodes {return false}
     if lhs.freeInodes != rhs.freeInodes {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".MemoryInfoRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    // Load everything into unknown fields
+    while try decoder.nextFieldNumber() != nil {}
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest, rhs: Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest) -> Bool {
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".MemoryInfoResponse"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}total_bytes\0\u{3}free_bytes\0\u{3}available_bytes\0\u{3}committed_bytes\0\u{3}balloon_bytes\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.totalBytes) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.freeBytes) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.availableBytes) }()
+      case 4: try { try decoder.decodeSingularUInt64Field(value: &self.committedBytes) }()
+      case 5: try { try decoder.decodeSingularUInt64Field(value: &self._balloonBytes) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    if self.totalBytes != 0 {
+      try visitor.visitSingularUInt64Field(value: self.totalBytes, fieldNumber: 1)
+    }
+    if self.freeBytes != 0 {
+      try visitor.visitSingularUInt64Field(value: self.freeBytes, fieldNumber: 2)
+    }
+    if self.availableBytes != 0 {
+      try visitor.visitSingularUInt64Field(value: self.availableBytes, fieldNumber: 3)
+    }
+    if self.committedBytes != 0 {
+      try visitor.visitSingularUInt64Field(value: self.committedBytes, fieldNumber: 4)
+    }
+    try { if let v = self._balloonBytes {
+      try visitor.visitSingularUInt64Field(value: v, fieldNumber: 5)
+    } }()
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse, rhs: Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse) -> Bool {
+    if lhs.totalBytes != rhs.totalBytes {return false}
+    if lhs.freeBytes != rhs.freeBytes {return false}
+    if lhs.availableBytes != rhs.availableBytes {return false}
+    if lhs.committedBytes != rhs.committedBytes {return false}
+    if lhs._balloonBytes != rhs._balloonBytes {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
