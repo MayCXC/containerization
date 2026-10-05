@@ -20,6 +20,8 @@ import FoundationEssentials
 import Foundation
 #endif
 
+import CShim
+
 #if canImport(Musl)
 import Musl
 private let _mount = Musl.mount
@@ -274,8 +276,38 @@ extension Mount {
     /// Mount the mount with the current set of data in the object. Optionally
     /// provide `createWithPerms` to set the permissions for the directory that
     /// it will be mounted at.
+    ///
+    /// A mount whose options carry `loop` names an image file as its source,
+    /// the way mount(8) takes the option: a loop device is attached to the
+    /// file and the device is what is mounted. The device reads and writes
+    /// the file directly, so the filesystem's blocks are cached once, and it
+    /// detaches itself when the filesystem is unmounted.
+    /// https://man7.org/linux/man-pages/man8/mount.8.html
     public func mount(createWithPerms: Int16? = nil) throws {
-        try self.mountToTarget(target: self.target, createWithPerms: createWithPerms)
+        guard self.options.contains("loop") else {
+            try self.mountToTarget(target: self.target, createWithPerms: createWithPerms)
+            return
+        }
+        var onDevice = self
+        onDevice.options.removeAll { $0 == "loop" }
+        let device = try Self.attachLoopDevice(to: self.source, readOnly: self.options.contains("ro"))
+        // The device detaches itself at its last close, so the descriptor
+        // holding it goes only once the mount holds it, or has failed to.
+        defer { close(device.held) }
+        onDevice.source = device.path
+        try onDevice.mountToTarget(target: self.target, createWithPerms: createWithPerms)
+    }
+
+    /// Attach a free loop device to the file at `path` and return the
+    /// device's node, with the descriptor that keeps it attached until the
+    /// device is mounted.
+    private static func attachLoopDevice(to path: String, readOnly: Bool) throws -> (path: String, held: Int32) {
+        var held: Int32 = -1
+        let number = loop_device_attach(path, readOnly ? 1 : 0, &held)
+        guard number >= 0 else {
+            throw Error.errno(-number, "failed to attach a loop device to \(path)")
+        }
+        return ("/dev/loop\(number)", held)
     }
 
     private func mountToTarget(target: String, createWithPerms: Int16?, targetResolved: Bool = false) throws {
