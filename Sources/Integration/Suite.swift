@@ -761,6 +761,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("pod multiple containers", testPodMultipleContainers),
             Test("pod boot setup failure is the member's own", testPodBootSetupFailureIsTheMembersOwn),
             Test("pod boot volume failure is its members'", testPodBootVolumeFailureIsItsMembers),
+            Test("pod removal unmounts an errored member's root", testPodRemovalUnmountsAnErroredMembersRoot),
             Test("pod container output", testPodContainerOutput),
             Test("pod concurrent containers", testPodConcurrentContainers),
             Test("pod exec in container", testPodExecInContainer),

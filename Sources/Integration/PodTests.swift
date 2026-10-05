@@ -297,6 +297,58 @@ extension IntegrationSuite {
         }
     }
 
+    /// A member the machine's boot left errored with its root mounted gives
+    /// the root back when it is removed: the guest unmounts it before the
+    /// devices under it go, so nothing of the member is left mounted. The
+    /// member here mounts a blank disk with no filesystem, which fails it
+    /// after its root is mounted.
+    func testPodRemovalUnmountsAnErroredMembersRoot() async throws {
+        let id = "test-pod-removal-unmounts-errored-root"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+
+        let blankPath = Self.testDir.appending(component: "\(id)-blank.ext4").absolutePath()
+        try? FileManager.default.removeItem(atPath: blankPath)
+        guard FileManager.default.createFile(atPath: blankPath, contents: nil) else {
+            throw IntegrationError.assert(msg: "could not create the blank disk at \(blankPath)")
+        }
+        let blank = try FileHandle(forWritingTo: URL(fileURLWithPath: blankPath))
+        try blank.truncate(atOffset: 64.mib())
+        try blank.close()
+
+        try await pod.addContainer("member", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "member")) { config in
+            config.process.arguments = ["/bin/true"]
+            config.mounts.append(.block(format: "ext4", source: blankPath, destination: "/data"))
+        }
+
+        try await pod.create()
+        do {
+            try await pod.removeContainer("member")
+
+            let root = "/run/container/member/rootfs"
+            let agent = try await Vminitd(connection: pod.dialVsock(port: Vminitd.port), group: Self.eventLoop)
+            var stillMounted = false
+            do {
+                try await agent.umount(path: root, flags: 0)
+                stillMounted = true
+            } catch {
+                // The guest refuses to unmount a path nothing is mounted on.
+            }
+            try await agent.close()
+            guard !stillMounted else {
+                throw IntegrationError.assert(msg: "the removed member's root was still mounted at \(root)")
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
     func testPodSharedSwap() async throws {
         let id = "test-pod-shared-swap"
 

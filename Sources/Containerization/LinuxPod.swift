@@ -238,6 +238,10 @@ public final class LinuxPod: Sendable {
         /// Why the container is errored, when the machine's boot could not
         /// set it up: its start answers with this.
         var failure: (any Error)?
+        /// Whether the guest has the container's root filesystem mounted, so
+        /// that its removal unmounts it before the devices under it are given
+        /// back, as a block volume's attachment records the volume's mount.
+        var rootfsMounted = false
 
         enum ContainerState: Sendable {
             case registered
@@ -982,7 +986,8 @@ extension LinuxPod {
                         seccomp: seccomp,
                         state: .created,
                         process: nil,
-                        fileMountContext: updatedFileMountContext
+                        fileMountContext: updatedFileMountContext,
+                        rootfsMounted: true
                     )
                 } catch {
                     Self.releaseVolumes(of: id, in: &state.blockVolumes)
@@ -1101,6 +1106,7 @@ extension LinuxPod {
                 // answers with it.
                 // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
                 let setupFailures = Mutex<[String: any Error]>([:])
+                let mountedRoots = Mutex<Set<String>>([])
                 let mountedVolumes = Mutex<Set<String>>([])
                 let hasSwapLayer = self.config.swapLayer != nil
 
@@ -1231,6 +1237,7 @@ extension LinuxPod {
                                 writableAttachment: attached.writableLayer,
                                 rootfsPath: Self.guestRootfsPath(container.id)
                             )
+                            mountedRoots.withLock { _ = $0.insert(container.id) }
                         } catch {
                             try? await Self.umountRootfs(of: container.id, hasWritableLayer: container.writableLayer != nil, agent: agent)
                             setupFailures.withLock { $0[container.id] = error }
@@ -1366,7 +1373,9 @@ extension LinuxPod {
                 // Every container the machine set up is created; one it could
                 // not is errored, holding the reason for its start.
                 let failed = setupFailures.withLock { $0 }
+                let roots = mountedRoots.withLock { $0 }
                 for id in state.containers.keys {
+                    state.containers[id]?.rootfsMounted = roots.contains(id)
                     if let failure = failed[id] {
                         self.logger?.error(
                             "the machine could not set a container up as it booted",
@@ -1440,6 +1449,7 @@ extension LinuxPod {
                 // stop path a never-started one takes.
                 if container.state == .stopped {
                     try await Self.remountRootfs(of: containerID, vm: createdState.vm, agent: agent)
+                    container.rootfsMounted = true
                     container.state = .created
                     state.containers[containerID] = container
                 }
@@ -1604,66 +1614,89 @@ extension LinuxPod {
                 )
             }
 
-            do {
-                // Check if the vm is even still running
-                if createdState.vm.state == .stopped {
-                    // The guest is gone with the container's process, so
-                    // deleting it gives back only the host's end of it, and a
-                    // failure says no more than that.
-                    if let process = container.process {
-                        do {
-                            try await process.delete()
-                        } catch {
-                            self.logger?.error("failed to delete the init process of container \(containerID): \(error)")
-                        }
-                    }
-                    container.process = nil
-                    container.state = .stopped
-                    state.containers[containerID] = container
-                    return
-                }
-
-                // A started container has a process to tear down; a created
-                // one holds only what its placement mounted.
+            // Check if the vm is even still running
+            if createdState.vm.state == .stopped {
+                // The guest is gone with the container's process, so
+                // deleting it gives back only the host's end of it, and a
+                // failure says no more than that.
                 if let process = container.process {
-                    try await process.kill(.kill)
-                    try await process.wait(timeoutInSeconds: 3)
+                    do {
+                        try await process.delete()
+                    } catch {
+                        self.logger?.error("failed to delete the init process of container \(containerID): \(error)")
+                    }
                 }
+                container.process = nil
+                container.rootfsMounted = false
+                container.state = .stopped
+                state.containers[containerID] = container
+                return
+            }
 
-                // The container's rootfs comes down, with the layers under it
-                // when it was given a writable layer, while the disks stay
-                // attached: a disk detached under a mounted filesystem takes
-                // the filesystem down with I/O errors and a journal abort, so
-                // removal, which detaches, finds nothing mounted. A created
-                // container's mounts may already be gone, since a placement
-                // that failed unmounts them before the stop that follows. The
-                // volumes it mounts are the pod's, and stay for its restart.
+            // Every step is taken whatever the one before it did, as a
+            // container's own machine is stopped, so that a kill or a wait
+            // that fails still has the container's mounts brought down and its
+            // process deleted. Each failure is logged, and the first is thrown
+            // with the container left errored.
+            // https://github.com/apple/containerization/blob/main/Sources/Containerization/LinuxContainer.swift
+            var firstError: (any Error)?
+
+            // A started container has a process to tear down; a created
+            // one holds only what its placement mounted.
+            if let process = container.process {
+                do {
+                    try await process.kill(.kill)
+                } catch {
+                    self.logger?.error("failed to kill the init of container \(containerID): \(error)")
+                    firstError = firstError ?? error
+                }
+                do {
+                    try await process.wait(timeoutInSeconds: 3)
+                } catch {
+                    self.logger?.error("failed to wait for the init of container \(containerID): \(error)")
+                    firstError = firstError ?? error
+                }
+            }
+
+            // The container's rootfs comes down, with the layers under it
+            // when it was given a writable layer, while the disks stay
+            // attached: a disk detached under a mounted filesystem takes
+            // the filesystem down with I/O errors and a journal abort, so
+            // removal, which detaches, finds nothing mounted. The volumes it
+            // mounts are the pod's, and stay for its restart.
+            if container.rootfsMounted {
                 let hasWritableLayer = container.writableLayer != nil
-                if container.state == .started {
+                do {
                     try await createdState.vm.withAgent { agent in
                         try await Self.umountRootfs(of: containerID, hasWritableLayer: hasWritableLayer, agent: agent)
                     }
-                } else {
-                    try? await createdState.vm.withAgent { agent in
-                        try await Self.umountRootfs(of: containerID, hasWritableLayer: hasWritableLayer, agent: agent)
-                    }
+                    container.rootfsMounted = false
+                } catch {
+                    self.logger?.error("failed to unmount the root filesystem of container \(containerID): \(error)")
+                    firstError = firstError ?? error
                 }
-
-                // Clean up the process resources
-                if let process = container.process {
-                    try await process.delete()
-                }
-
-                container.process = nil
-                container.state = .stopped
-                state.containers[containerID] = container
-            } catch {
-                container.state = .errored
-                container.process = nil
-                state.containers[containerID] = container
-
-                throw error
             }
+
+            // The process is deleted once and let go of either way, as a
+            // container's own machine deletes its init: a process answers a
+            // later deletion with the outcome of its first.
+            if let process = container.process {
+                do {
+                    try await process.delete()
+                } catch {
+                    self.logger?.error("failed to delete the init process of container \(containerID): \(error)")
+                    firstError = firstError ?? error
+                }
+                container.process = nil
+            }
+
+            if let firstError {
+                container.state = .errored
+                state.containers[containerID] = container
+                throw firstError
+            }
+            container.state = .stopped
+            state.containers[containerID] = container
         }
     }
 
@@ -1689,13 +1722,40 @@ extension LinuxPod {
             }
             switch container.state {
             case .registered, .stopped, .errored:
+                var vm: (any VirtualMachineInstance)?
+                if case .created(let createdState) = state.phase {
+                    vm = createdState.vm
+                }
+                // A container whose stop could not finish still holds what
+                // the stop left: its root filesystem is unmounted in the guest
+                // before the devices under it are given back. A filesystem the
+                // guest cannot unmount keeps its devices and the container its
+                // place, the order Kata's runtime keeps when a container goes:
+                // the agent lets go of the container's mounts first, and a
+                // failure there stops the detach of its devices.
+                // https://github.com/kata-containers/kata-containers/blob/main/src/runtime/virtcontainers/container.go
+                if let vm, vm.state == .running {
+                    if container.rootfsMounted {
+                        let hasWritableLayer = container.writableLayer != nil
+                        do {
+                            try await vm.withAgent { agent in
+                                try await Self.umountRootfs(of: containerID, hasWritableLayer: hasWritableLayer, agent: agent)
+                            }
+                        } catch {
+                            self.logger?.error(
+                                "the guest could not unmount the root filesystem of a container being removed, so it keeps its place",
+                                metadata: ["container": "\(containerID)", "error": "\(error)"])
+                            throw error
+                        }
+                    }
+                }
                 Self.releaseVolumes(of: containerID, in: &state.blockVolumes)
                 // A container removed before the machine booted took no
                 // device; one placed in the boot storage holds no hotplug
                 // record, and its release clears the storage entry alone.
-                if case .created(let createdState) = state.phase {
-                    try? await createdState.vm.releaseHotplug(id: containerID)
-                    try? await createdState.vm.releaseVirtioFS(id: containerID)
+                if let vm {
+                    try? await vm.releaseHotplug(id: containerID)
+                    try? await vm.releaseVirtioFS(id: containerID)
                 }
                 state.containers[containerID] = nil
             default:
@@ -1779,6 +1839,11 @@ extension LinuxPod {
                     var volume = volume
                     volume.attachment = nil
                     return volume
+                }
+                // So did the containers' root filesystems, which its boot
+                // mounts again.
+                for id in state.containers.keys {
+                    state.containers[id]?.rootfsMounted = false
                 }
                 state.phase = .initialized
             } catch {
