@@ -1000,6 +1000,7 @@ extension LinuxPod {
             }
 
             let agent = try await createdState.vm.dialAgent()
+            var made: LinuxProcess?
             do {
                 var spec = try self.generateRuntimeSpec(
                     containerID: containerID,
@@ -1115,12 +1116,30 @@ extension LinuxPod {
                     vm: createdState.vm,
                     logger: self.logger
                 )
+                made = process
                 try await process.start()
 
                 container.process = process
                 container.state = .started
                 state.containers[containerID] = container
             } catch {
+                // What the guest made of a start that failed is taken back
+                // out of it, since the guest takes a start of a container it
+                // still holds for an exec in it: Kata stops a container whose
+                // start fails, which removes it from the guest, and logs a
+                // failure of that stop. The guest unmounts the container's
+                // root filesystem as it removes the container, so the
+                // container is left stopped.
+                // https://github.com/kata-containers/kata-containers/blob/main/src/runtime/virtcontainers/container.go
+                if let made {
+                    do {
+                        try await made.delete()
+                        container.state = .stopped
+                        state.containers[containerID] = container
+                    } catch {
+                        self.logger?.warning("failed to delete what a failed start of container \(containerID) left in the guest: \(error)")
+                    }
+                }
                 try? await agent.close()
                 throw error
             }

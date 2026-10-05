@@ -609,6 +609,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("pod shared PID namespace", testPodSharedPIDNamespace),
             Test("pod shared PID namespace init exit takes its processes", testPodSharedPIDNamespaceInitExitTakesItsProcesses),
             Test("pod stop deletes its execs", testPodStopDeletesItsExecs),
+            Test("pod failed start leaves nothing in the guest", testPodFailedStartLeavesNothingInTheGuest),
             Test("pod read-only rootfs", testPodReadOnlyRootfs),
             Test("pod read-only rootfs DNS", testPodReadOnlyRootfsDNSConfigured),
             Test("pod container hosts config", testPodContainerHostsConfig),

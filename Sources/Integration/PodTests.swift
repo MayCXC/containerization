@@ -919,6 +919,54 @@ extension IntegrationSuite {
         }
     }
 
+    /// A container whose start fails leaves nothing of itself in the guest:
+    /// its process names a binary its root does not have, so the guest makes
+    /// the container and fails to run it, and once the start has answered
+    /// the guest holds no such container to delete.
+    func testPodFailedStartLeavesNothingInTheGuest() async throws {
+        let id = "test-pod-failed-start-leaves-nothing"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+        try await pod.addContainer("broken", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "broken")) { config in
+            config.process.arguments = ["foo-bar-baz"]
+        }
+
+        do {
+            try await pod.create()
+            var started = false
+            do {
+                try await pod.startContainer("broken")
+                started = true
+            } catch {
+                // The guest cannot run a binary the root does not have.
+            }
+            guard !started else {
+                throw IntegrationError.assert(msg: "a container whose binary is missing started")
+            }
+
+            let agent = try await Vminitd(connection: pod.dialVsock(port: Vminitd.port), group: Self.eventLoop)
+            var held = false
+            do {
+                try await agent.deleteProcess(id: "broken", containerID: "broken")
+                held = true
+            } catch {
+                // The guest holds no such container.
+            }
+            try await agent.close()
+            guard !held else {
+                throw IntegrationError.assert(msg: "the guest still held the container whose start failed")
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
     /// A pod's stop deletes the processes executed in its containers, as a
     /// container's own machine deletes the ones it vended: a process still
     /// running when the pod stops has been deleted by the time the stop
