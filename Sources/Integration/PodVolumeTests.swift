@@ -931,6 +931,66 @@ extension IntegrationSuite {
         }
     }
 
+    /// A pod's stop keeps what was written to its volumes without a sync: a
+    /// process in a running container writes to a block volume the container
+    /// brings, attached with the caching and synchronization modes
+    /// apple/container gives a named volume, and to a volume the pod
+    /// declares, and the container is still running when the pod stops; both
+    /// writes are in the images afterwards.
+    func testPodStopKeepsUnsyncedWrites() async throws {
+        let id = "test-pod-stop-keeps-unsynced-writes"
+        let bs = try await bootstrap(id)
+
+        let brought = try createEXT4DiskImage(testID: id, name: "brought")
+        let declared = try createEXT4DiskImage(testID: id, name: "declared")
+        let rootfs = try cloneRootfsForContainer(bs.rootfs, testID: id, containerID: "writer")
+
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: VMResources(cpus: 1, memoryInBytes: 512.mib())) { config in
+            config.bootLog = bs.bootLog
+            config.volumes = [
+                .init(name: "declared", source: .diskImage(path: declared), format: "ext4")
+            ]
+        }
+        try await pod.addContainer("writer", rootfs: rootfs) { config in
+            config.process.arguments = ["/bin/sleep", "300"]
+            config.mounts.append(
+                .block(
+                    format: "ext4",
+                    source: brought.absolutePath(),
+                    destination: "/brought",
+                    runtimeOptions: ["vzDiskImageCachingMode=cached", "vzDiskImageSynchronizationMode=fsync"]
+                ))
+            config.mounts.append(.sharedMount(name: "declared", destination: "/declared"))
+        }
+
+        do {
+            try await pod.create()
+            try await pod.startContainer("writer")
+
+            let write = try await pod.execInContainer("writer", processID: "write") { config in
+                config.arguments = ["/bin/sh", "-c", "echo brought > /brought/kept && echo declared > /declared/kept"]
+            }
+            try await write.start()
+            let status = try await write.wait()
+            try await write.delete()
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "the write exited with status \(status)")
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+
+        for (image, expected) in [(brought, "brought"), (declared, "declared")] {
+            let content = try readFileFromDiskImage(image, path: "/kept")
+            guard content == expected else {
+                throw IntegrationError.assert(msg: "the \(expected) volume holds '\(content)' after the pod stopped, not its container's write")
+            }
+        }
+    }
+
     /// `cctl run --block` in filesystem mode: the ext4 on the NBD export is
     /// mounted at dst, and a write from the container lands on the backing file.
     func testCctlBlockNBDMount() async throws {
