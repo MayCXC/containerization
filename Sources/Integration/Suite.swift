@@ -646,6 +646,8 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("pod sysctl multiple containers", testPodSysctlMultipleContainers),
             Test("pod invalid volume reference", testPodInvalidVolumeReference),
             Test("pod duplicate volume name", testPodDuplicateVolumeName),
+            Test("pod block volume shared by containers", testPodBlockVolumeSharedByContainers),
+            Test("pod block volume of declared image", testPodBlockVolumeOfDeclaredImage),
 
             // Mounts / virtiofs shares (cross-platform: VZ on macOS, virtiofsd on Linux/CH).
             Test("container mount", testMounts),
@@ -749,6 +751,10 @@ struct IntegrationSuite: AsyncParsableCommand {
         // and no pod test elsewhere exercises addContainer-after-create.
         let linuxOnlyTests: [Test] = [
             Test("pod hotplug block rootfs", testPodHotplugBlockRootfs),
+            Test("pod hotplug block volume", testPodHotplugBlockVolume),
+            Test("pod hotplug block volume shared", testPodHotplugBlockVolumeShared),
+            Test("pod hotplug block volume read-only", testPodHotplugBlockVolumeReadOnly),
+            Test("pod hotplug block volume counted", testPodHotplugBlockVolumeCounted),
             Test("pod hotplug virtiofs rootfs", testPodHotplugVirtiofsRootfs),
             Test("pod hotplug writable layer", testPodHotplugWritableLayer),
         ]

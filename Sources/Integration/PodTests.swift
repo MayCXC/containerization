@@ -2253,6 +2253,127 @@ extension IntegrationSuite {
         }
     }
 
+    /// An empty ext4 disk image for a test's volume.
+    private func volumeImage(testID: String, name: String = "volume") throws -> URL {
+        let image = Self.testDir.appending(component: "\(testID)-\(name).ext4")
+        try? FileManager.default.removeItem(at: image)
+        let formatter = try EXT4.Formatter(FilePath(image.absolutePath()), minDiskSize: 64.mib())
+        try formatter.close()
+        return image
+    }
+
+    /// The lines a container wrote, trimmed.
+    private func lines(of buffer: BufferWriter) -> [String] {
+        (String(data: buffer.data, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: "\n")
+    }
+
+    /// Run a container of a pod to its exit and fail on a nonzero status.
+    private func runToExit(_ container: String, in pod: LinuxPod) async throws {
+        try await pod.startContainer(container)
+        let status = try await pod.waitContainer(container)
+        guard status.exitCode == 0 else {
+            throw IntegrationError.assert(msg: "\(container) status \(status) != 0")
+        }
+    }
+
+    /// Containers placed before a pod boots that mount one disk image share
+    /// one filesystem: both mounts report the same device, the reader reads
+    /// what the writer wrote, and the reader's read-only mount refuses its
+    /// write while the writer's takes one.
+    func testPodBlockVolumeSharedByContainers() async throws {
+        let id = "test-pod-block-volume-shared"
+        let bs = try await bootstrap(id)
+        let image = try volumeImage(testID: id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+
+        let writer = BufferWriter()
+        try await pod.addContainer("writer", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "writer")) { config in
+            config.process.arguments = ["/bin/sh", "-c", "echo shared > /data/written && stat -c %d /data"]
+            config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/data"))
+            config.process.stdout = writer
+        }
+        let reader = BufferWriter()
+        try await pod.addContainer("reader", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "reader")) { config in
+            config.process.arguments = [
+                "/bin/sh", "-c",
+                "cat /volume/written && stat -c %d /volume && if touch /volume/refused 2>/dev/null; then echo writable; else echo read-only; fi",
+            ]
+            config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/volume", options: ["ro"]))
+            config.process.stdout = reader
+        }
+
+        do {
+            try await pod.create()
+            try await runToExit("writer", in: pod)
+            try await runToExit("reader", in: pod)
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+
+        let device = lines(of: writer)
+        guard device.count == 1, let writerDevice = device.first else {
+            throw IntegrationError.assert(msg: "expected the writer's device, got \(device)")
+        }
+        let read = lines(of: reader)
+        guard read == ["shared", writerDevice, "read-only"] else {
+            throw IntegrationError.assert(msg: "expected [shared, \(writerDevice), read-only] from the reader, got \(read)")
+        }
+        let bytes = try EXT4.EXT4Reader(blockDevice: FilePath(image.absolutePath())).readFile(at: FilePath("/written"))
+        guard String(bytes: bytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) == "shared" else {
+            throw IntegrationError.assert(msg: "expected the writer's write in the image")
+        }
+    }
+
+    /// A container that mounts the disk image of a volume the pod declares
+    /// is given that volume: its mount reports the device the declared
+    /// volume's does and reads what was written through it.
+    func testPodBlockVolumeOfDeclaredImage() async throws {
+        let id = "test-pod-block-volume-declared"
+        let bs = try await bootstrap(id)
+        let image = try volumeImage(testID: id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+            config.volumes = [.init(name: "declared", source: .diskImage(path: image), format: "ext4")]
+        }
+
+        let declared = BufferWriter()
+        try await pod.addContainer("declared", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "declared")) { config in
+            config.process.arguments = ["/bin/sh", "-c", "echo declared > /data/written && stat -c %d /data"]
+            config.mounts.append(.sharedMount(name: "declared", destination: "/data"))
+            config.process.stdout = declared
+        }
+        let block = BufferWriter()
+        try await pod.addContainer("block", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "block")) { config in
+            config.process.arguments = ["/bin/sh", "-c", "cat /data/written && stat -c %d /data"]
+            config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/data"))
+            config.process.stdout = block
+        }
+
+        do {
+            try await pod.create()
+            try await runToExit("declared", in: pod)
+            try await runToExit("block", in: pod)
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+
+        let device = lines(of: declared)
+        let read = lines(of: block)
+        guard device.count == 1, read == ["declared"] + device else {
+            throw IntegrationError.assert(msg: "expected [declared] + \(device) from the block mount, got \(read)")
+        }
+    }
+
     #if os(Linux)
     /// Unpack an image's layers into a host directory to use as a virtiofs
     /// (directory-share) rootfs. Assumes a single-layer image (the alpine
@@ -2382,6 +2503,225 @@ extension IntegrationSuite {
                 throw IntegrationError.assert(
                     msg: "expected 'hello from block rootfs', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
             }
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// Add a container with a block volume to a pod whose machine is already
+    /// running. The container reads what the host put in the volume's image
+    /// and writes into it, and the write is in the image once the pod stops:
+    /// the machine was given the image while it ran, and the guest let the
+    /// volume go before the machine stopped.
+    func testPodHotplugBlockVolume() async throws {
+        let id = "test-pod-hotplug-block-volume"
+        let bs = try await bootstrap(id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+        }
+
+        try await pod.create()
+
+        let seeded = "put in the volume by the host"
+        let volumePath = Self.testDir.appending(component: "\(id)-volume.ext4")
+        try? FileManager.default.removeItem(at: volumePath)
+        let formatter = try EXT4.Formatter(FilePath(volumePath.absolutePath()), minDiskSize: 64.mib())
+        let stream = InputStream(data: Data(seeded.utf8))
+        stream.open()
+        try formatter.create(path: FilePath("/seeded"), mode: 0o100644, buf: stream)
+        stream.close()
+        try formatter.close()
+
+        let written = "written by a container added while running"
+        let buffer = BufferWriter()
+        try await pod.addContainer("hot", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "hot")) { config in
+            config.process.arguments = ["/bin/sh", "-c", "cat /data/seeded && echo '\(written)' > /data/written"]
+            config.mounts.append(.block(format: "ext4", source: volumePath.absolutePath(), destination: "/data"))
+            config.process.stdout = buffer
+        }
+
+        do {
+            try await pod.startContainer("hot")
+            let status = try await pod.waitContainer("hot")
+
+            try await pod.stopContainer("hot")
+            try await pod.stop()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "hot container status \(status) != 0")
+            }
+            guard String(data: buffer.data, encoding: .utf8) == seeded else {
+                throw IntegrationError.assert(
+                    msg: "expected '\(seeded)' from the volume, got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
+            }
+            let reader = try EXT4.EXT4Reader(blockDevice: FilePath(volumePath.absolutePath()))
+            let bytes = try reader.readFile(at: FilePath("/written"))
+            guard String(bytes: bytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) == written else {
+                throw IntegrationError.assert(
+                    msg: "expected '\(written)' in the volume's image, got '\(String(bytes: bytes, encoding: .utf8) ?? "nil")'")
+            }
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// A container added to a running pod that mounts a disk image a booted
+    /// container mounts is given the pod's volume of it: the device the
+    /// booted container's mount reports and the write it made. The volume is
+    /// the pod's, so it stays when the added container is removed, and a
+    /// container added after reads that one's write on the same device.
+    func testPodHotplugBlockVolumeShared() async throws {
+        let id = "test-pod-hotplug-block-volume-shared"
+        let bs = try await bootstrap(id)
+        let image = try volumeImage(testID: id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+
+        let booted = BufferWriter()
+        try await pod.addContainer("booted", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "booted")) { config in
+            config.process.arguments = ["/bin/sh", "-c", "echo booted > /data/booted && stat -c %d /data"]
+            config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/data"))
+            config.process.stdout = booted
+        }
+
+        do {
+            try await pod.create()
+            try await runToExit("booted", in: pod)
+            let device = lines(of: booted)
+            guard device.count == 1 else {
+                throw IntegrationError.assert(msg: "expected the booted container's device, got \(device)")
+            }
+
+            let added = BufferWriter()
+            try await pod.addContainer("added", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "added")) { config in
+                config.process.arguments = ["/bin/sh", "-c", "cat /volume/booted && stat -c %d /volume && echo added > /volume/added"]
+                config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/volume"))
+                config.process.stdout = added
+            }
+            try await runToExit("added", in: pod)
+            guard lines(of: added) == ["booted"] + device else {
+                throw IntegrationError.assert(msg: "expected [booted] + \(device) from the added container, got \(lines(of: added))")
+            }
+            try await pod.stopContainer("added")
+            try await pod.removeContainer("added")
+
+            let later = BufferWriter()
+            try await pod.addContainer("later", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "later")) { config in
+                config.process.arguments = ["/bin/sh", "-c", "cat /data/added && stat -c %d /data"]
+                config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/data"))
+                config.process.stdout = later
+            }
+            try await runToExit("later", in: pod)
+            guard lines(of: later) == ["added"] + device else {
+                throw IntegrationError.assert(msg: "expected [added] + \(device) from the later container, got \(lines(of: later))")
+            }
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// A volume the pod mounts read-only is refused to a container added
+    /// with a writable mount of it, and given to one that reads it.
+    func testPodHotplugBlockVolumeReadOnly() async throws {
+        let id = "test-pod-hotplug-block-volume-read-only"
+        let bs = try await bootstrap(id)
+        let image = try volumeImage(testID: id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+
+        try await pod.addContainer("booted", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "booted")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+            config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/data", options: ["ro"]))
+        }
+
+        do {
+            try await pod.create()
+
+            do {
+                try await pod.addContainer("writer", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "writer")) { config in
+                    config.process.arguments = ["/bin/true"]
+                    config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/data"))
+                }
+                throw IntegrationError.assert(msg: "a writable mount of the pod's read-only volume was not refused")
+            } catch let error as ContainerizationError {
+                guard error.code == .invalidArgument else {
+                    throw IntegrationError.assert(msg: "expected invalidArgument for the writable mount, got \(error)")
+                }
+            }
+
+            let reader = BufferWriter()
+            try await pod.addContainer("reader", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "reader")) { config in
+                config.process.arguments = ["/bin/sh", "-c", "if touch /data/refused 2>/dev/null; then echo writable; else echo read-only; fi"]
+                config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/data", options: ["ro"]))
+                config.process.stdout = reader
+            }
+            try await runToExit("reader", in: pod)
+            guard lines(of: reader) == ["read-only"] else {
+                throw IntegrationError.assert(msg: "expected the reader's volume read-only, got \(lines(of: reader))")
+            }
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// Two containers added to a running pod that mount one disk image share
+    /// the volume the first one's addition attached: it stays when the first
+    /// is removed, and the second reads the first's write on the device the
+    /// first's mount reported.
+    func testPodHotplugBlockVolumeCounted() async throws {
+        let id = "test-pod-hotplug-block-volume-counted"
+        let bs = try await bootstrap(id)
+        let image = try volumeImage(testID: id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+        }
+
+        do {
+            try await pod.create()
+
+            let first = BufferWriter()
+            try await pod.addContainer("first", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "first")) { config in
+                config.process.arguments = ["/bin/sh", "-c", "echo first > /data/first && stat -c %d /data"]
+                config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/data"))
+                config.process.stdout = first
+            }
+            let second = BufferWriter()
+            try await pod.addContainer("second", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "second")) { config in
+                config.process.arguments = ["/bin/sh", "-c", "cat /volume/first && stat -c %d /volume"]
+                config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/volume"))
+                config.process.stdout = second
+            }
+
+            try await runToExit("first", in: pod)
+            try await pod.stopContainer("first")
+            try await pod.removeContainer("first")
+
+            try await runToExit("second", in: pod)
+            let device = lines(of: first)
+            guard device.count == 1, lines(of: second) == ["first"] + device else {
+                throw IntegrationError.assert(msg: "expected [first] + \(device) from the second container, got \(lines(of: second))")
+            }
+            try await pod.stop()
         } catch {
             try? await pod.stop()
             throw error

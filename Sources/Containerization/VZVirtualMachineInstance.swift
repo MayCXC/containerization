@@ -325,7 +325,7 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
         return try await hotplugProvider.hotplug(block, id: id)
     }
 
-    public func registerMounts(id: String, rootfs: AttachedFilesystem, writableLayer: AttachedFilesystem?, additionalMounts: [Mount]) throws {
+    public func registerMounts(id: String, rootfs: AttachedFilesystem, writableLayer: AttachedFilesystem?, additionalMounts: [AttachedFilesystem]) throws {
         guard let hotplugProvider else { return }
         try hotplugProvider.registerMounts(id: id, rootfs: rootfs, writableLayer: writableLayer, additionalMounts: additionalMounts)
     }
