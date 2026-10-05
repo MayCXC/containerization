@@ -1723,8 +1723,10 @@ extension LinuxPod {
             switch container.state {
             case .registered, .stopped, .errored:
                 var vm: (any VirtualMachineInstance)?
+                var relayManager: UnixSocketRelayManager?
                 if case .created(let createdState) = state.phase {
                     vm = createdState.vm
+                    relayManager = createdState.relayManager
                 }
                 // A container whose stop could not finish still holds what
                 // the stop left: its root filesystem is unmounted in the guest
@@ -1735,6 +1737,36 @@ extension LinuxPod {
                 // failure there stops the detach of its devices.
                 // https://github.com/kata-containers/kata-containers/blob/main/src/runtime/virtcontainers/container.go
                 if let vm, vm.state == .running {
+                    // The relays of the container's sockets are its place's,
+                    // set up when it was placed and kept for its restart, so
+                    // they end with the place, before the root they keep busy
+                    // is unmounted, as a container's own machine stops them
+                    // first when the container goes.
+                    // https://github.com/apple/containerization/blob/main/Sources/Containerization/LinuxContainer.swift
+                    for socket in container.config.sockets {
+                        do {
+                            try await relayManager?.stop(socket: socket)
+                        } catch {
+                            self.logger?.error(
+                                "failed to stop the host end of a socket relay of a container being removed",
+                                metadata: ["container": "\(containerID)", "socket": "\(socket.id)", "error": "\(error)"])
+                        }
+                        do {
+                            try await vm.withAgent { agent in
+                                guard let relayAgent = agent as? SocketRelayAgent else {
+                                    throw ContainerizationError(
+                                        .unsupported,
+                                        message: "VirtualMachineAgent does not support relaySocket surface"
+                                    )
+                                }
+                                try await relayAgent.stopSocketRelay(configuration: socket)
+                            }
+                        } catch {
+                            self.logger?.error(
+                                "failed to stop the guest end of a socket relay of a container being removed",
+                                metadata: ["container": "\(containerID)", "socket": "\(socket.id)", "error": "\(error)"])
+                        }
+                    }
                     if container.rootfsMounted {
                         let hasWritableLayer = container.writableLayer != nil
                         do {
