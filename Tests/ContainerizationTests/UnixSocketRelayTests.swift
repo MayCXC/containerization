@@ -162,7 +162,7 @@ private final class RelayVirtualMachine: VirtualMachineInstance {
     let listener = VsockListener(port: 1025) { _ in }
     let dialConnection = Mutex<FileHandle?>(nil)
     var state: VirtualMachineInstanceState { .running }
-    var mounts: [String: [AttachedFilesystem]] { [:] }
+    var storage: MachineAttachments { MachineAttachments() }
 
     func listen(_ port: UInt32) throws -> VsockListener { listener }
     func dialAgent() async throws -> Vminitd {

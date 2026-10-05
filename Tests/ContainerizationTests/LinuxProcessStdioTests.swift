@@ -192,7 +192,7 @@ private final class StubVirtualMachineInstance: VirtualMachineInstance {
     private let listeners = Mutex<[UInt32: VsockListener]>([:])
 
     var state: VirtualMachineInstanceState { .running }
-    var mounts: [String: [AttachedFilesystem]] { [:] }
+    var storage: MachineAttachments { MachineAttachments() }
 
     func listener(forPort port: UInt32) -> VsockListener? {
         listeners.withLock { $0[port] }
