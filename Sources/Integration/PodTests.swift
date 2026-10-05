@@ -2066,6 +2066,49 @@ extension IntegrationSuite {
         }
     }
 
+    /// The pod's kernel parameters reach its containers in every namespace
+    /// that holds them: a parameter of the ipc namespace each container has
+    /// of its own reads back inside the container as the pod set it, as does
+    /// one of the kernel the containers share.
+    func testPodSysctlReachesContainerNamespaces() async throws {
+        let id = "test-pod-sysctl-container-namespaces"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+            config.sysctl = [
+                "kernel.shmmni": "2048",
+                "vm.max_map_count": "262144",
+            ]
+        }
+
+        let buffer = BufferWriter()
+        try await pod.addContainer("container1", rootfs: bs.rootfs) { config in
+            config.process.arguments = ["/bin/sh", "-c", "cat /proc/sys/kernel/shmmni /proc/sys/vm/max_map_count"]
+            config.process.stdout = buffer
+        }
+
+        do {
+            try await pod.create()
+            try await pod.startContainer("container1")
+            let status = try await pod.waitContainer("container1")
+            try await pod.stop()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "process status \(status) != 0")
+            }
+            let lines = (String(data: buffer.data, encoding: .utf8) ?? "").split(separator: "\n").map {
+                $0.trimmingCharacters(in: .whitespaces)
+            }
+            guard lines == ["2048", "262144"] else {
+                throw IntegrationError.assert(msg: "the container read kernel.shmmni and vm.max_map_count as \(lines), not [2048, 262144]")
+            }
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
     func testPodInvalidVolumeReference() async throws {
         let id = "test-pod-invalid-volume-ref"
         let bs = try await bootstrap(id)
