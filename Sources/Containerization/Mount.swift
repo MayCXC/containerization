@@ -303,6 +303,12 @@ extension Mount {
         return .diskImage
     }
 
+    /// Whether the disk is a block device of the host's, which takes the
+    /// options its attachment does rather than a disk image's.
+    var isHostBlockDevice: Bool {
+        storageAttachmentType == .blockDevice
+    }
+
     func configure(config: inout VZVirtualMachineConfiguration) throws {
         switch self.runtimeOptions {
         case .virtioblk(let options):

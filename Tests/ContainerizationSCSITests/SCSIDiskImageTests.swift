@@ -164,5 +164,30 @@ struct SCSIDiskImageTests {
         try file.discard(offset: 4096, length: 4096)
         #expect(Array(try image.contents()[0..<4096]) == [UInt8](repeating: 0xee, count: 4096))
     }
+
+    /// A device of the host's is sized by asking it, as raw_getlength asks
+    /// one, rather than by its file size, which reads as zero. /dev/zero is a
+    /// device that is no disk, so it answers neither request.
+    @Test func aDeviceIsSizedByAskingIt() throws {
+        let file = try SCSIDiskImage(path: "/dev/zero", readOnly: true)
+        #expect(file.isDevice)
+        #expect(throws: SCSIDiskImage.HostError.self) {
+            try file.size()
+        }
+        let image = try TemporaryImage(blocks: 2)
+        let regular = try SCSIDiskImage(path: image.path, readOnly: true)
+        #expect(!regular.isDevice)
+        #expect(try regular.size() == 1024)
+    }
+
+    /// A device keeps its data through a discard, as handle_aiocb_discard
+    /// leaves a host device's on macOS, where a hole punched in it would
+    /// fail: a device node answers F_PUNCHHOLE with ENOTTY.
+    @Test func aDeviceKeepsItsDataThroughADiscard() throws {
+        let file = try SCSIDiskImage(path: "/dev/zero", readOnly: true)
+        #expect(throws: Never.self) {
+            try file.discard(offset: 0, length: 8192)
+        }
+    }
     #endif
 }

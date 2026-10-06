@@ -25,11 +25,13 @@ import Musl
 import Glibc
 #endif
 
-/// A raw disk image file a logical unit reads and writes.
+/// A raw disk image file, or a host block device, a logical unit reads and
+/// writes.
 ///
 /// Its reads, writes, flushes and discards behave as QEMU's file driver
 /// makes them behave on macOS, block/file-posix.c with the block layer's
-/// discard in block/io.c, at d7a65d1793d6:
+/// discard in block/io.c, at d7a65d1793d6; a device behaves as the same
+/// file's host_device driver makes one behave:
 /// https://github.com/qemu/qemu/blob/d7a65d1793d6/block/file-posix.c
 /// https://github.com/qemu/qemu/blob/d7a65d1793d6/block/io.c
 ///
@@ -68,6 +70,10 @@ public final class SCSIDiskImage: @unchecked Sendable {
     public let readOnly: Bool
     public let caching: Caching
     public let synchronization: Synchronization
+    /// Whether the image is a device of the host's rather than a file: a
+    /// block or character special file, the two raw_getlength sizes by
+    /// asking the device.
+    public let isDevice: Bool
     /// The open image, or -1 once it is closed.
     private let openDescriptor: Atomic<Int32>
     private var descriptor: Int32 { openDescriptor.load(ordering: .acquiring) }
@@ -98,10 +104,18 @@ public final class SCSIDiskImage: @unchecked Sendable {
                 message: "disk image \(path) is attached to another machine; a disk is attached to a second machine only while every machine mounts it read-only"
             )
         }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else {
+            let error = errno
+            _ = closeDescriptor(descriptor)
+            throw ContainerizationError(.internalError, message: "failed to stat disk image \(path): \(String(cString: strerror(error)))")
+        }
+        let type = info.st_mode & S_IFMT
         self.path = path
         self.readOnly = readOnly
         self.caching = caching
         self.synchronization = synchronization
+        self.isDevice = type == S_IFBLK || type == S_IFCHR
         self.openDescriptor = Atomic(descriptor)
         self.discardAlignment = Self.fileSystemBlockSize(descriptor)
     }
@@ -128,8 +142,26 @@ public final class SCSIDiskImage: @unchecked Sendable {
         return UInt64(info.f_bsize)
     }
 
-    /// The image's size in bytes.
+    /// The image's size in bytes. A device's file size reads as zero, so a
+    /// device is asked its block count and block size, as raw_getlength
+    /// asks one on macOS, and anywhere else its end is sought.
     func size() throws -> UInt64 {
+        if isDevice {
+            #if canImport(Darwin)
+            var blocks: UInt64 = 0
+            var blockSize: UInt32 = 0
+            guard ioctl(descriptor, Self.getBlockCount, &blocks) == 0, ioctl(descriptor, Self.getBlockSize, &blockSize) == 0 else {
+                throw HostError(code: errno)
+            }
+            return blocks * UInt64(blockSize)
+            #else
+            let end = lseek(descriptor, 0, SEEK_END)
+            guard end >= 0 else {
+                throw HostError(code: errno)
+            }
+            return UInt64(end)
+            #endif
+        }
         var info = stat()
         guard fstat(descriptor, &info) == 0 else {
             throw HostError(code: errno)
@@ -245,6 +277,13 @@ public final class SCSIDiskImage: @unchecked Sendable {
 
     /// Makes what the image has written so far reach what its
     /// synchronization mode says a flush reaches.
+    ///
+    /// A device node answers F_FULLFSYNC with ENOTTY, since that request is a
+    /// file system's of the device under it. A device's flush is fsync(2),
+    /// which writes out what the host buffers for it, and in the full mode
+    /// the device is then asked to flush its own cache, the request
+    /// F_FULLFSYNC makes of a file's device; that second step is ours, as
+    /// QEMU has no flush that reaches permanent storage on macOS.
     func flush() throws {
         let result: Int32
         switch synchronization {
@@ -254,7 +293,14 @@ public final class SCSIDiskImage: @unchecked Sendable {
             result = fsync(descriptor)
         case .full:
             #if canImport(Darwin)
-            result = fcntl(descriptor, F_FULLFSYNC)
+            if isDevice {
+                // dk_synchronize_t, zeroed: offset and length 0 ask for the
+                // whole device, options 0 for its cache to be flushed.
+                var range: (UInt64, UInt64, UInt64) = (0, 0, 0)
+                result = fsync(descriptor) == 0 ? ioctl(descriptor, Self.synchronize, &range) : -1
+            } else {
+                result = fcntl(descriptor, F_FULLFSYNC)
+            }
             #else
             result = fsync(descriptor)
             #endif
@@ -264,6 +310,15 @@ public final class SCSIDiskImage: @unchecked Sendable {
         }
     }
 
+    #if canImport(Darwin)
+    // The requests <sys/disk.h> defines through _IOR and _IOW, which do not
+    // reach Swift: DKIOCGETBLOCKSIZE, DKIOCGETBLOCKCOUNT and DKIOCSYNCHRONIZE,
+    // the last sized for its 24-byte dk_synchronize_t.
+    private static let getBlockSize: UInt = 0x4004_6418
+    private static let getBlockCount: UInt = 0x4008_6419
+    private static let synchronize: UInt = 0x8018_6416
+    #endif
+
     /// Gives back the storage under `length` bytes from `offset`.
     ///
     /// The range goes to the file system in the pieces bdrv_co_pdiscard
@@ -271,8 +326,12 @@ public final class SCSIDiskImage: @unchecked Sendable {
     /// whole blocks, and an unaligned tail. A discard is advisory, so a piece
     /// the file system refuses for its alignment keeps its data, and once
     /// the file system has refused to punch holes at all, no discard tries
-    /// again (has_discard in file-posix.c).
+    /// again (has_discard in file-posix.c). A device keeps its data:
+    /// handle_aiocb_discard has no discard for a host device on macOS.
     func discard(offset: UInt64, length: UInt64) throws {
+        guard !isDevice else {
+            return
+        }
         let alignment = discardAlignment
         var offset = offset
         var remaining = length

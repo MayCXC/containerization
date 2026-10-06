@@ -76,14 +76,30 @@ final class VZVirtioSCSI: NSObject, VZCustomVirtioDeviceConfigurationDelegate, V
 
     /// Attaches the disk image `mount` names as the logical unit at
     /// `target` and `lun`. It takes the options a virtio-blk attachment of
-    /// the same mount takes, and refuses the ones that one refuses.
+    /// the same mount takes, and refuses the ones that one refuses: a block
+    /// device of the host's takes its attachment's synchronization mode,
+    /// which keeps nothing in the host's page cache to turn off.
     func attach(mount: Mount, options: [String], target: UInt8, lun: UInt16) throws {
-        let modes = try VZDiskImageStorageDeviceAttachment.diskImageModes(options: options)
+        let caching: SCSIDiskImage.Caching
+        let synchronization: SCSIDiskImage.Synchronization
+        if mount.isHostBlockDevice {
+            caching = .cached
+            switch try VZDiskBlockDeviceStorageDeviceAttachment.synchronizationMode(options: options) {
+            case .none:
+                synchronization = .none
+            default:
+                synchronization = .full
+            }
+        } else {
+            let modes = try VZDiskImageStorageDeviceAttachment.diskImageModes(options: options)
+            caching = Self.caching(modes.caching)
+            synchronization = Self.synchronization(modes.synchronization)
+        }
         let image = try SCSIDiskImage(
             path: mount.source,
             readOnly: mount.readonly,
-            caching: Self.caching(modes.caching),
-            synchronization: Self.synchronization(modes.synchronization)
+            caching: caching,
+            synchronization: synchronization
         )
         let disk = try SCSIDisk(image: image)
         try deviceQueue.sync {
