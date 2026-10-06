@@ -1184,6 +1184,10 @@ extension LinuxPod {
             do {
                 // Check if the vm is even still running
                 if createdState.vm.state == .stopped {
+                    // The guest is gone with the processes executed in the
+                    // container, so deleting them gives back only the host's
+                    // end of each, and a failure says no more than that.
+                    _ = await self.deleteVendedProcesses(of: &container, id: containerID)
                     container.state = .stopped
                     state.containers[containerID] = container
                     return
@@ -1204,8 +1208,21 @@ extension LinuxPod {
                 try await createdState.vm.releaseHotplug(id: containerID)
                 try await createdState.vm.releaseVirtioFS(id: containerID)
 
+                // The processes executed in the container go before its init,
+                // while the guest still holds the container they ran in: the
+                // guest lets go of a container with its init process.
+                let execFailure = await self.deleteVendedProcesses(of: &container, id: containerID)
+
                 // Clean up the process resources
-                try await process.delete()
+                do {
+                    try await process.delete()
+                } catch {
+                    self.logger?.error("failed to delete the init process of container \(containerID): \(error)")
+                    throw execFailure ?? error
+                }
+                if let execFailure {
+                    throw execFailure
+                }
 
                 container.process = nil
                 container.state = .stopped
@@ -1327,15 +1344,9 @@ extension LinuxPod {
                 guard var container = state.containers[id] else {
                     continue
                 }
-                for process in container.vendedProcesses.values {
-                    do {
-                        try await process._delete()
-                    } catch {
-                        self.logger?.error("failed to delete process \(process.id) of container \(id): \(error)")
-                        firstError = firstError ?? error
-                    }
+                if let failure = await self.deleteVendedProcesses(of: &container, id: id) {
+                    firstError = firstError ?? failure
                 }
-                container.vendedProcesses = [:]
                 if let process = container.process {
                     do {
                         try await process.delete()
@@ -1483,6 +1494,27 @@ extension LinuxPod {
         await self.state.withLock { state in
             _ = state.containers[containerID]?.vendedProcesses.removeValue(forKey: id)
         }
+    }
+
+    /// Delete the processes executed in a container, as a container's own
+    /// machine deletes the ones it vended: each deletion is attempted once,
+    /// a failure is logged, and the container lets go of every one of them
+    /// either way, since a process answers any later deletion with the
+    /// outcome of its first. `_delete` leaves out the process's own callback,
+    /// which takes the lock the caller holds. Returns the first failure.
+    /// https://github.com/apple/containerization/blob/main/Sources/Containerization/LinuxContainer.swift
+    private func deleteVendedProcesses(of container: inout PodContainer, id: String) async -> (any Error)? {
+        var firstError: (any Error)?
+        for process in container.vendedProcesses.values {
+            do {
+                try await process._delete()
+            } catch {
+                self.logger?.error("failed to delete process \(process.id) of container \(id): \(error)")
+                firstError = firstError ?? error
+            }
+        }
+        container.vendedProcesses = [:]
+        return firstError
     }
 
     /// List all container IDs in the pod.

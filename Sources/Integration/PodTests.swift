@@ -1005,6 +1005,46 @@ extension IntegrationSuite {
         }
     }
 
+    /// A container's stop deletes the processes executed in it before its
+    /// init, as a container's own machine deletes the ones it vended: a
+    /// process still running when its container stops has been deleted by
+    /// the time the stop returns, while the guest still held the container
+    /// it ran in.
+    func testPodContainerStopDeletesItsExecs() async throws {
+        let id = "test-pod-container-stop-deletes-its-execs"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+        try await pod.addContainer("container", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "container")) { config in
+            config.process.arguments = ["/bin/sleep", "300"]
+        }
+
+        do {
+            try await pod.create()
+            try await pod.startContainer("container")
+            let exec = try await pod.execInContainer("container", processID: "lingerer") { config in
+                config.arguments = ["/bin/sleep", "301"]
+            }
+            try await exec.start()
+            try await pod.stopContainer("container")
+
+            // The stop's deletion is the process's deletion; one made only
+            // now would ask the guest for a container it let go of with its
+            // init.
+            do {
+                try await exec.delete()
+            } catch {
+                throw IntegrationError.assert(msg: "the exec was not deleted by its container's stop: \(error)")
+            }
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
     func testPodReadOnlyRootfs() async throws {
         let id = "test-pod-readonly-rootfs"
 
