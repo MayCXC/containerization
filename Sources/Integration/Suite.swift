@@ -235,6 +235,18 @@ struct IntegrationSuite: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Only run tests whose names contain this string")
     var filter: String?
 
+    @Option(
+        name: .long,
+        help: "Block device driver for every machine a test leaves on the default: virtio-blk or virtio-scsi",
+        transform: {
+            guard let driver = BlockDeviceDriver(rawValue: $0) else {
+                throw ValidationError("unknown block device driver \($0); expected virtio-blk or virtio-scsi")
+            }
+            return driver
+        }
+    )
+    var blockDeviceDriver: BlockDeviceDriver?
+
     #if os(Linux)
     @Option(name: .long, help: "Path to cloud-hypervisor binary (Linux only). Defaults to PATH lookup.")
     var chBinary: String?
@@ -435,12 +447,15 @@ struct IntegrationSuite: AsyncParsableCommand {
         try? FileManager.default.createDirectory(at: bootlogDirURL, withIntermediateDirectories: true)
         let bootlogURL = bootlogDirURL.appendingPathComponent("\(testID).log")
 
-        let vmm: any VirtualMachineManager = try Self.makeVMM(
+        var vmm: any VirtualMachineManager = try Self.makeVMM(
             kernel: testKernel,
             initialFilesystem: initfsPerTest,
             chBinary: Self.chBinaryOverride(for: self),
             virtiofsdBinary: Self.virtiofsdBinaryOverride(for: self)
         )
+        if let blockDeviceDriver {
+            vmm = BlockDeviceDriverMachines(base: vmm, driver: blockDeviceDriver, overridesConfigured: false)
+        }
 
         return (
             cl,
@@ -539,6 +554,21 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("container IPv6 only gateway outside subnet", testIPv6OnlyGatewayOutsideSubnet),
                 Test("container IPv6 dual stack", testIPv6DualStack),
                 Test("pod IPv6 address", testPodIPv6AddressAdd),
+            ]
+        }
+        return []
+    }
+
+    private func macOS27Tests() -> [Test] {
+        if #available(macOS 27, *) {
+            return [
+                Test("pod scsi volume across stop and start", testPodSCSIVolumeAcrossStopAndStart),
+                Test("pod forty scsi volumes", testPodFortySCSIVolumes),
+                Test("pod hotplug scsi rootfs", testPodHotplugSCSIRootfs),
+                Test("pod scsi volume keeps unsynced writes", testPodSCSIVolumeKeepsUnsyncedWrites),
+                Test("pod scsi speed against virtio-blk", testPodSCSISpeed),
+                Test("container disk on the scsi host", testContainerDiskOnSCSIHost),
+                Test("container disk on the default driver", testContainerDiskOnDefaultDriver),
             ]
         }
         return []
@@ -808,7 +838,7 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("cctl run without entrypoint or cmd fails", testCctlRunWithoutEntrypointOrCmdFails),
                 Test("cctl run entrypoint override keeps image cmd", testCctlRunEntrypointOverrideKeepsImageCmd),
                 Test("cctl run entrypoint override with command", testCctlRunEntrypointOverrideWithCommand),
-            ] + macOS26Tests()
+            ] + macOS26Tests() + macOS27Tests()
         let tests: [Test] = crossPlatformTests + macOSOnlyTests
         #else
         // Hotplug into a running pod VM is CH-only (VZ has no runtime hotplug),

@@ -32,7 +32,7 @@ extension IntegrationSuite {
         return try rootfs.clone(to: clonePath)
     }
 
-    private func createEXT4DiskImage(testID: String, name: String, size: UInt64 = 64.mib()) throws -> URL {
+    func createEXT4DiskImage(testID: String, name: String, size: UInt64 = 64.mib()) throws -> URL {
         let diskURL = Self.testDir.appending(component: "\(testID)-\(name).ext4")
         try? FileManager.default.removeItem(at: diskURL)
         let formatter = try EXT4.Formatter(FilePath(diskURL.absolutePath()), minDiskSize: size)
@@ -64,7 +64,7 @@ extension IntegrationSuite {
         return (server, diskURL)
     }
 
-    private func readFileFromDiskImage(_ diskURL: URL, path: String) throws -> String {
+    func readFileFromDiskImage(_ diskURL: URL, path: String) throws -> String {
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(diskURL.path))
         let bytes = try reader.readFile(at: FilePath(path))
         guard let content = String(bytes: bytes, encoding: .utf8) else {
