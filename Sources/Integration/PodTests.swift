@@ -2410,8 +2410,9 @@ extension IntegrationSuite {
     }
 
     /// Hotplug a container with a virtiofs (directory-share) rootfs into a
-    /// running pod VM, plus an additional virtiofs file-mount. CH-only: VZ has
-    /// no runtime hotplug.
+    /// running pod VM, plus an additional virtiofs file-mount. CH-only: a
+    /// virtiofs rootfs rides its own device, which cloud-hypervisor alone
+    /// adds to a running machine.
     func testPodHotplugVirtiofsRootfs() async throws {
         let id = "test-pod-hotplug-virtiofs-rootfs"
         let bs = try await bootstrap(id)
@@ -2466,15 +2467,18 @@ extension IntegrationSuite {
         }
     }
 
-    /// Hotplug a container with a block rootfs into a running pod VM. Guards
-    /// the existing block hotplug path against the registry-consolidation
-    /// change. CH-only.
+    #endif
+
+    /// Add a container with a block rootfs to a pod whose machine is already
+    /// running. Both backends attach a disk to a running machine, so both are
+    /// held to it.
     func testPodHotplugBlockRootfs() async throws {
         let id = "test-pod-hotplug-block-rootfs"
         let bs = try await bootstrap(id)
 
         let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
             config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
         }
 
         try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
@@ -2483,9 +2487,11 @@ extension IntegrationSuite {
 
         try await pod.create()
 
+        // The container reports the device its root is mounted from, which
+        // says how the disk reached the running machine.
         let buffer = BufferWriter()
         try await pod.addContainer("hot", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "hot")) { config in
-            config.process.arguments = ["/bin/echo", "hello from block rootfs"]
+            config.process.arguments = ["/bin/sh", "-c", "grep ' / ' /proc/mounts | cut -d' ' -f1"]
             config.process.stdout = buffer
         }
 
@@ -2499,9 +2505,17 @@ extension IntegrationSuite {
             guard status.exitCode == 0 else {
                 throw IntegrationError.assert(msg: "hot container status \(status) != 0")
             }
-            guard String(data: buffer.data, encoding: .utf8) == "hello from block rootfs\n" else {
-                throw IntegrationError.assert(
-                    msg: "expected 'hello from block rootfs', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
+            let device = String(data: buffer.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            #if os(macOS)
+            // VZ: a logical unit the machine's virtio-scsi host adds while
+            // the machine runs.
+            let expectedPrefix = "/dev/sd"
+            #else
+            // cloud-hypervisor: a virtio-blk device hot-plugged over PCI.
+            let expectedPrefix = "/dev/vd"
+            #endif
+            guard device.hasPrefix(expectedPrefix) else {
+                throw IntegrationError.assert(msg: "the hot container's root is on '\(device)', expected a \(expectedPrefix)* device")
             }
         } catch {
             try? await pod.stop()
@@ -2520,6 +2534,7 @@ extension IntegrationSuite {
 
         let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
             config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
         }
 
         try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
@@ -2584,6 +2599,7 @@ extension IntegrationSuite {
 
         let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
             config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
         }
 
         let booted = BufferWriter()
@@ -2640,6 +2656,7 @@ extension IntegrationSuite {
 
         let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
             config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
         }
 
         try await pod.addContainer("booted", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "booted")) { config in
@@ -2690,6 +2707,7 @@ extension IntegrationSuite {
 
         let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
             config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
         }
 
         try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
@@ -2727,10 +2745,158 @@ extension IntegrationSuite {
             throw error
         }
     }
+
+    #if os(macOS)
+    /// Two containers joining a running machine that mount one volume are
+    /// given the one the first one's addition attached: one disk of the
+    /// machine's virtio-scsi host, on which what the first writes the second
+    /// reads.
+    func testPodHotplugVolumeSharedByTwo() async throws {
+        let id = "test-pod-hotplug-volume-shared-by-two"
+        let bs = try await bootstrap(id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
+        }
+
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+        }
+
+        try await pod.create()
+
+        let volumePath = Self.testDir.appending(component: "\(id)-volume.ext4")
+        try? FileManager.default.removeItem(at: volumePath)
+        let formatter = try EXT4.Formatter(FilePath(volumePath.absolutePath()), minDiskSize: 64.mib())
+        try formatter.close()
+        let volume = Mount.block(format: "ext4", source: volumePath.absolutePath(), destination: "/data")
+
+        func run(_ containerID: String, _ processID: String, _ arguments: [String]) async throws -> (Int32, String) {
+            let buffer = BufferWriter()
+            let exec = try await pod.execInContainer(containerID, processID: processID) { config in
+                config.arguments = arguments
+                config.stdout = buffer
+            }
+            try await exec.start()
+            let status = try await exec.wait()
+            try await exec.delete()
+            return (status.exitCode, String(data: buffer.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+        }
+
+        do {
+            for name in ["first", "second"] {
+                try await pod.addContainer(name, rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: name)) { config in
+                    config.process.arguments = ["/bin/sleep", "infinity"]
+                    config.mounts.append(volume)
+                }
+                try await pod.startContainer(name)
+            }
+
+            let (wrote, _) = try await run("first", "write", ["/bin/sh", "-c", "echo from-first > /data/written"])
+            let (read, readBack) = try await run("second", "read", ["/bin/cat", "/data/written"])
+            let (_, firstDevice) = try await run("first", "device", ["/bin/sh", "-c", "grep ' /data ' /proc/mounts | cut -d' ' -f1"])
+            let (_, secondDevice) = try await run("second", "device", ["/bin/sh", "-c", "grep ' /data ' /proc/mounts | cut -d' ' -f1"])
+            guard wrote == 0, read == 0, readBack == "from-first" else {
+                throw IntegrationError.assert(msg: "the second container read '\(readBack)' (status \(read)) after the first wrote (status \(wrote))")
+            }
+            guard firstDevice.hasPrefix("/dev/sd"), firstDevice == secondDevice else {
+                throw IntegrationError.assert(msg: "the volume is on '\(firstDevice)' in one container and '\(secondDevice)' in the other")
+            }
+
+            for name in ["first", "second"] {
+                try await pod.killContainer(name, signal: .kill)
+                try await pod.waitContainer(name)
+                try await pod.stopContainer(name)
+                try await pod.removeContainer(name)
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// A container joining a running machine is refused a volume another
+    /// machine holds read-write, whether it would write it or only read it,
+    /// and is given it once that machine has let it go; another machine is
+    /// then refused the volume the pod holds read-write.
+    func testPodHotplugVolumeHeldByAnotherMachine() async throws {
+        let id = "test-pod-hotplug-volume-held"
+        let bs = try await bootstrap(id)
+        let image = try volumeImage(testID: id)
+        let volume = Mount.block(format: "ext4", source: image.absolutePath(), destination: "/data")
+
+        let holder = try LinuxContainer("\(id)-holder", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "holder"), vmm: bs.vmm) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+            config.mounts.append(volume)
+            config.bootLog = bs.bootLog
+        }
+        try await holder.create()
+        try await holder.start()
+
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
+        }
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+        }
+
+        do {
+            try await pod.create()
+
+            for (name, options) in [("writer", [String]()), ("reader", ["ro"])] {
+                do {
+                    try await pod.addContainer(name, rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: name)) { config in
+                        config.process.arguments = ["/bin/true"]
+                        config.mounts.append(.block(format: "ext4", source: image.absolutePath(), destination: "/data", options: options))
+                    }
+                    throw IntegrationError.assert(msg: "the \(name) joined with a volume another machine holds read-write")
+                } catch let error as ContainerizationError {
+                    guard error.code == .invalidState else {
+                        throw IntegrationError.assert(msg: "expected the \(name) refused as invalidState, got \(error)")
+                    }
+                }
+            }
+
+            try await holder.kill(.kill)
+            _ = try await holder.wait()
+            try await holder.stop()
+
+            try await pod.addContainer("writer", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "writer")) { config in
+                config.process.arguments = ["/bin/sh", "-c", "echo joined > /data/joined"]
+                config.mounts.append(volume)
+            }
+            try await runToExit("writer", in: pod)
+
+            let late = try LinuxContainer("\(id)-late", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "late"), vmm: bs.vmm) { config in
+                config.process.arguments = ["/bin/true"]
+                config.mounts.append(volume)
+                config.bootLog = bs.bootLog
+            }
+            var refused = false
+            do {
+                try await late.create()
+                try await late.start()
+            } catch {
+                refused = true
+            }
+            try? await late.stop()
+            guard refused else {
+                throw IntegrationError.assert(msg: "another machine was given the volume the pod holds read-write")
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            try? await holder.stop()
+            throw error
+        }
+    }
     #endif
 
-    /// A container in a pod given a writable layer writes into it, and the
-    /// image it was built from is left as it is for the pod's others.
     /// Add a container with a writable layer to a pod whose machine is
     /// already running: the overlay assembles from the two disks attached
     /// while it runs, and writes land in the layer.
@@ -2740,6 +2906,7 @@ extension IntegrationSuite {
 
         let pod = try LinuxPod(id, vmm: bs.vmm) { config in
             config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
         }
 
         try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
@@ -2792,6 +2959,181 @@ extension IntegrationSuite {
         }
     }
 
+    /// Add a container with a directory-share mount to a pod whose machine is
+    /// already running. Both backends export a directory to a running machine,
+    /// so both are held to it. The added container's root is a disk, which
+    /// the machine takes on the driver that gives it disks while it runs.
+    func testPodHotplugVirtiofsShare() async throws {
+        let id = "test-pod-hotplug-virtiofs-share"
+        let bs = try await bootstrap(id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
+        }
+
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+        }
+
+        try await pod.create()
+
+        let content = "hello from a directory exported while running"
+        let hostDir = FileManager.default.uniqueTemporaryDirectory(create: true)
+        try content.write(to: hostDir.appendingPathComponent("hot.txt"), atomically: true, encoding: .utf8)
+
+        let buffer = BufferWriter()
+        try await pod.addContainer("hot", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "hot")) { config in
+            config.process.arguments = ["/bin/cat", "/shared/hot.txt"]
+            config.mounts.append(.share(source: hostDir.absolutePath(), destination: "/shared"))
+            config.process.stdout = buffer
+        }
+
+        do {
+            try await pod.startContainer("hot")
+            let status = try await pod.waitContainer("hot")
+
+            try await pod.stopContainer("hot")
+            try await pod.stop()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "hot container status \(status) != 0")
+            }
+            guard String(data: buffer.data, encoding: .utf8) == content else {
+                throw IntegrationError.assert(
+                    msg: "expected '\(content)', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
+            }
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// Add a container sharing the host directory a booted container already
+    /// mounts. The machine exports a directory once, so the added container
+    /// takes the export the machine booted with.
+    func testPodHotplugVirtiofsSameShare() async throws {
+        let id = "test-pod-hotplug-virtiofs-same-share"
+        let bs = try await bootstrap(id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
+        }
+
+        let content = "hello from a directory the machine booted with"
+        let hostDir = FileManager.default.uniqueTemporaryDirectory(create: true)
+        try content.write(to: hostDir.appendingPathComponent("seed.txt"), atomically: true, encoding: .utf8)
+
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+            config.mounts.append(.share(source: hostDir.absolutePath(), destination: "/shared"))
+        }
+
+        try await pod.create()
+
+        let buffer = BufferWriter()
+        try await pod.addContainer("hot", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "hot")) { config in
+            config.process.arguments = ["/bin/cat", "/shared/seed.txt"]
+            config.mounts.append(.share(source: hostDir.absolutePath(), destination: "/shared"))
+            config.process.stdout = buffer
+        }
+
+        do {
+            try await pod.startContainer("hot")
+            let status = try await pod.waitContainer("hot")
+
+            try await pod.stopContainer("hot")
+            try await pod.stop()
+
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "hot container status \(status) != 0")
+            }
+            guard String(data: buffer.data, encoding: .utf8) == content else {
+                throw IntegrationError.assert(
+                    msg: "expected '\(content)', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
+            }
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// A booted container keeps its directory share through another
+    /// container's whole hotplug lifecycle: a second container takes the
+    /// same export, stops (releasing its shares), the booted container
+    /// still reads the directory, and a third container takes the export
+    /// again.
+    func testPodHotplugVirtiofsShareLifecycle() async throws {
+        let id = "test-pod-hotplug-virtiofs-share-lifecycle"
+        let bs = try await bootstrap(id)
+
+        let pod = try LinuxPod(id, vmm: bs.vmm) { config in
+            config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
+        }
+
+        let content = "hello from a directory shared across lifecycles"
+        let hostDir = FileManager.default.uniqueTemporaryDirectory(create: true)
+        try content.write(to: hostDir.appendingPathComponent("data.txt"), atomically: true, encoding: .utf8)
+
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+            config.mounts.append(.share(source: hostDir.absolutePath(), destination: "/shared"))
+        }
+
+        try await pod.create()
+        try await pod.startContainer("seed")
+
+        do {
+            for hot in ["hot1", "hot2"] {
+                let buffer = BufferWriter()
+                try await pod.addContainer(hot, rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: hot)) { config in
+                    config.process.arguments = ["/bin/cat", "/shared/data.txt"]
+                    config.mounts.append(.share(source: hostDir.absolutePath(), destination: "/shared"))
+                    config.process.stdout = buffer
+                }
+                try await pod.startContainer(hot)
+                let status = try await pod.waitContainer(hot)
+                try await pod.stopContainer(hot)
+                guard status.exitCode == 0 else {
+                    throw IntegrationError.assert(msg: "\(hot) container status \(status) != 0")
+                }
+                guard String(data: buffer.data, encoding: .utf8) == content else {
+                    throw IntegrationError.assert(
+                        msg: "\(hot): expected '\(content)', got '\(String(data: buffer.data, encoding: .utf8) ?? "nil")'")
+                }
+
+                // The stopped container's shares were released; the booted
+                // container's export stays.
+                let execBuffer = BufferWriter()
+                let exec = try await pod.execInContainer("seed", processID: "check-\(hot)") { config in
+                    config.arguments = ["/bin/cat", "/shared/data.txt"]
+                    config.stdout = execBuffer
+                }
+                try await exec.start()
+                let execStatus = try await exec.wait()
+                try await exec.delete()
+                guard execStatus.exitCode == 0 else {
+                    throw IntegrationError.assert(msg: "seed read after \(hot) stop: status \(execStatus) != 0")
+                }
+                guard String(data: execBuffer.data, encoding: .utf8) == content else {
+                    throw IntegrationError.assert(
+                        msg: "seed after \(hot) stop: expected '\(content)', got '\(String(data: execBuffer.data, encoding: .utf8) ?? "nil")'")
+                }
+            }
+
+            try await pod.killContainer("seed", signal: .kill)
+            try await pod.waitContainer("seed")
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// A container in a pod given a writable layer writes into it, and the
+    /// image it was built from is left as it is for the pod's others.
     func testPodWritableLayer() async throws {
         let id = "test-pod-writable-layer"
 

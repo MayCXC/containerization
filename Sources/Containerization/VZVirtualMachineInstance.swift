@@ -29,9 +29,16 @@ public final class VZVirtualMachineInstance: Sendable {
     public typealias Agent = Vminitd
 
     /// The machine's attached storage.
+    ///
+    /// Where a hotplug provider is installed it holds the registry, so a disk
+    /// taken while the machine runs is registered with the ones it booted
+    /// with. The machine's own copy answers only where there is no provider.
     private let _storage: Mutex<MachineAttachments>
     public var storage: MachineAttachments {
-        _storage.withLock { $0 }
+        if let hotplugProvider {
+            return hotplugProvider.storage
+        }
+        return _storage.withLock { $0 }
     }
 
     /// The underlying Virtualization framework virtual machine.
@@ -42,7 +49,10 @@ public final class VZVirtualMachineInstance: Sendable {
 
     /// Mutate the storage registry.
     public func withStorage<T: Sendable>(_ body: (inout sending MachineAttachments) throws -> sending T) rethrows -> T {
-        try _storage.withLock(body)
+        if let hotplugProvider {
+            return try hotplugProvider.withStorage(body)
+        }
+        return try _storage.withLock(body)
     }
 
     /// Serialize VM operations with the instance lock.
@@ -157,11 +167,17 @@ public final class VZVirtualMachineInstance: Sendable {
             queue: self.queue
         )
 
-        if #available(macOS 27, *), let host = scsi as? VZSCSIHotplugProvider {
-            host.setRegistry { [weak self] id, container in
-                self?.withStorage { $0.containers[id] = container }
-            }
-            self.hotplugProvider = host
+        // A disk or a directory can be given to the machine while it runs: a
+        // disk as a logical unit of its virtio-scsi host, a directory as an
+        // export of its share.
+        if #available(macOS 15.0, *) {
+            self.hotplugProvider = VZHotplugProvider(
+                vm: self.vm,
+                queue: self.queue,
+                initialStorage: mountAttachments,
+                scsi: scsi,
+                logger: logger
+            )
         }
 
         for ext in config.extensions.compactMap({ $0 as? any VZInstanceExtension }) {
@@ -292,6 +308,7 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
             if #available(macOS 27, *), let host = self.scsi as? VZSCSIHotplugProvider {
                 host.detachAll()
             }
+            self.hotplugProvider?.cleanup()
         }
     }
 

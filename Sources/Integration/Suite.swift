@@ -551,6 +551,35 @@ struct IntegrationSuite: AsyncParsableCommand {
         }
     }
 
+    /// The block device driver a pod's machine takes disks on while it runs:
+    /// virtio-blk on cloud-hypervisor, which hot-adds virtio block devices
+    /// and has no virtio-scsi host, and virtio-scsi on Virtualization, which
+    /// adds no virtio block device to a running machine.
+    static var hotplugBlockDeviceDriver: BlockDeviceDriver {
+        #if os(macOS)
+        .virtioSCSI
+        #else
+        .virtioBlock
+        #endif
+    }
+
+    /// Disks given to a pod's running machine: cloud-hypervisor adds each as
+    /// a device of its own, Virtualization as a logical unit of the
+    /// machine's virtio-scsi host, which macOS 27 lets this process implement.
+    private func hotplugDiskTests() -> [Test] {
+        [
+            Test("pod hotplug block rootfs", testPodHotplugBlockRootfs),
+            Test("pod hotplug block volume", testPodHotplugBlockVolume),
+            Test("pod hotplug block volume shared", testPodHotplugBlockVolumeShared),
+            Test("pod hotplug block volume read-only", testPodHotplugBlockVolumeReadOnly),
+            Test("pod hotplug block volume counted", testPodHotplugBlockVolumeCounted),
+            Test("pod hotplug writable layer", testPodHotplugWritableLayer),
+            Test("pod hotplug virtiofs share", testPodHotplugVirtiofsShare),
+            Test("pod hotplug virtiofs same share", testPodHotplugVirtiofsSameShare),
+            Test("pod hotplug virtiofs share lifecycle", testPodHotplugVirtiofsShareLifecycle),
+        ]
+    }
+
     #if os(macOS)
     private func macOS26Tests() -> [Test] {
         if #available(macOS 26.0, *) {
@@ -575,7 +604,9 @@ struct IntegrationSuite: AsyncParsableCommand {
 
     private func macOS27Tests() -> [Test] {
         if #available(macOS 27, *) {
-            return [
+            return hotplugDiskTests() + [
+                Test("pod hotplug volume shared by two", testPodHotplugVolumeSharedByTwo),
+                Test("pod hotplug volume held by another machine", testPodHotplugVolumeHeldByAnotherMachine),
                 Test("pod scsi volume across stop and start", testPodSCSIVolumeAcrossStopAndStart),
                 Test("pod forty scsi volumes", testPodFortySCSIVolumes),
                 Test("pod hotplug scsi rootfs", testPodHotplugSCSIRootfs),
@@ -866,17 +897,12 @@ struct IntegrationSuite: AsyncParsableCommand {
             ] + macOS26Tests() + macOS27Tests()
         let tests: [Test] = crossPlatformTests + macOSOnlyTests
         #else
-        // Hotplug into a running pod VM is CH-only (VZ has no runtime hotplug),
-        // and no pod test elsewhere exercises addContainer-after-create.
-        let linuxOnlyTests: [Test] = [
-            Test("pod hotplug block rootfs", testPodHotplugBlockRootfs),
-            Test("pod hotplug block volume", testPodHotplugBlockVolume),
-            Test("pod hotplug block volume shared", testPodHotplugBlockVolumeShared),
-            Test("pod hotplug block volume read-only", testPodHotplugBlockVolumeReadOnly),
-            Test("pod hotplug block volume counted", testPodHotplugBlockVolumeCounted),
-            Test("pod hotplug virtiofs rootfs", testPodHotplugVirtiofsRootfs),
-            Test("pod hotplug writable layer", testPodHotplugWritableLayer),
-        ]
+        // A virtiofs rootfs rides its own device, which cloud-hypervisor alone
+        // adds to a running machine.
+        let linuxOnlyTests: [Test] =
+            hotplugDiskTests() + [
+                Test("pod hotplug virtiofs rootfs", testPodHotplugVirtiofsRootfs)
+            ]
         let tests: [Test] = crossPlatformTests + linuxOnlyTests
         #endif
 

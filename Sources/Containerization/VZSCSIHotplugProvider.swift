@@ -42,9 +42,19 @@ final class VZSCSIHotplugProvider: HotplugProvider {
         var hotplugged: [String: [SCSIAddress]] = [:]
         /// The addresses with a logical unit attached.
         var attached: Set<SCSIAddress> = []
-        /// Records a container's attachments in the machine's storage, or
-        /// takes them out of it when given nil.
-        var register: (@Sendable (String, ContainerAttachments?) -> Void)?
+    }
+
+    /// The machine's registry as this provider keeps it.
+    private let _storage = Mutex(MachineAttachments())
+
+    var storage: MachineAttachments {
+        _storage.withLock { $0 }
+    }
+
+    func withStorage<T: Sendable>(
+        _ body: (inout sending MachineAttachments) throws -> sending T
+    ) rethrows -> T {
+        try _storage.withLock(body)
     }
 
     private struct BootDisk {
@@ -56,12 +66,6 @@ final class VZSCSIHotplugProvider: HotplugProvider {
     init(device: VZVirtioSCSI) {
         self.device = device
         self.allocator = SCSIAddress.allocator()
-    }
-
-    /// Where `register` records the attachments of a container that joins
-    /// the running machine, and takes them out again when it is released.
-    func setRegistry(_ register: @escaping @Sendable (String, ContainerAttachments?) -> Void) {
-        state.withLock { $0.register = register }
     }
 
     // MARK: - Boot disks
@@ -128,23 +132,23 @@ final class VZSCSIHotplugProvider: HotplugProvider {
     }
 
     func registerMounts(id: String, rootfs: AttachedFilesystem, writableLayer: AttachedFilesystem?, additionalMounts: [AttachedFilesystem]) throws {
-        let register = state.withLock { $0.register }
-        register?(id, ContainerAttachments(rootfs: rootfs, writableLayer: writableLayer, mounts: additionalMounts))
+        let container = ContainerAttachments(rootfs: rootfs, writableLayer: writableLayer, mounts: additionalMounts)
+        _storage.withLock { $0.containers[id] = container }
     }
 
     func releaseHotplug(id: String) async throws {
-        let (addresses, register) = state.withLock { state in
+        let addresses = state.withLock { state in
             let addresses = state.hotplugged.removeValue(forKey: id) ?? []
             for address in addresses {
                 state.attached.remove(address)
             }
-            return (addresses, state.register)
+            return addresses
         }
         for address in addresses {
             device.detach(target: address.target, lun: address.lun)
             try? allocator.release(address)
         }
-        register?(id, nil)
+        _ = _storage.withLock { $0.containers.removeValue(forKey: id) }
     }
 
     func hotplugVirtioFS(_ mounts: [Mount], id: String) async throws {
