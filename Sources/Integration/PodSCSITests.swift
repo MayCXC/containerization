@@ -303,6 +303,68 @@ extension IntegrationSuite {
         }
     }
 
+    /// 4 KiB direct reads from one stream and from eight at once, on a
+    /// volume of equal size on each block device driver, each in a machine
+    /// of that driver, two rounds with the order swapped: eight streams keep
+    /// eight commands in flight, where each transfer of the speed test keeps
+    /// one. Runs only when CONTAINERIZATION_SCSI_SPEED is set, alone on a
+    /// quiet host, since its numbers are the measurement.
+    func testPodSCSIStreams() async throws {
+        guard ProcessInfo.processInfo.environment["CONTAINERIZATION_SCSI_SPEED"] != nil else {
+            throw SkipTest(reason: "set CONTAINERIZATION_SCSI_SPEED to measure")
+        }
+        let id = "test-pod-scsi-streams"
+        let bs = try await bootstrap(id)
+        let size: UInt64 = 1.gib()
+        let disks: [String: URL] = [
+            "blk": try createEXT4DiskImage(testID: id, name: "blk", size: size),
+            "scsi": try createEXT4DiskImage(testID: id, name: "scsi", size: size),
+        ]
+        let machines: [String: any VirtualMachineManager] = [
+            "blk": BlockDeviceDriverMachines.forcing(.virtioBlock, on: bs.vmm),
+            "scsi": BlockDeviceDriverMachines.forcing(.virtioSCSI, on: bs.vmm),
+        ]
+        // Each stream reads its own share of the file. The guest's clock
+        // reads to the hundredth of a second in /proc/uptime, its date to the
+        // second, and a read that fails ends the script, so no time is taken
+        // over a transfer that did not happen.
+        let blocks = 64000
+        var output = ""
+        for round in 1...2 {
+            for name in round == 1 ? ["blk", "scsi"] : ["scsi", "blk"] {
+                var script = """
+                    set -e
+                    dd if=/dev/zero of=/\(name)/k bs=4k count=\(blocks) conv=fsync 2>/dev/null
+                    reads() { per=$((\(blocks) / $2)); pids=""; i=0; while [ $i -lt $2 ]; do dd if=/$1/k of=/dev/null bs=4k skip=$((i * per)) count=$per iflag=direct 2>/dev/null & pids="$pids $!"; i=$((i + 1)); done; for p in $pids; do wait $p; done; }
+                    """
+                for streams in [1, 8] {
+                    script += """
+
+                        s=$(cut -d' ' -f1 /proc/uptime); reads \(name) \(streams); e=$(cut -d' ' -f1 /proc/uptime); echo "round \(round) \(name) \(streams) $s $e"
+                        """
+                }
+                let volumes: [LinuxPod.PodVolume] = disks[name].map { [.init(name: name, source: .diskImage(path: $0), format: "ext4")] } ?? []
+                output +=
+                    try await runPodContainer(
+                        podID: "\(id)-\(name)-\(round)", bootstrap: bs, vmm: machines[name], volumes: volumes,
+                        mounts: [.sharedMount(name: name, destination: "/\(name)")], script: script) + "\n"
+            }
+        }
+
+        var report = "virtio-blk against virtio-scsi, \(blocks) direct 4 KiB reads from one stream and from eight (IOPS):"
+        for line in output.split(separator: "\n") {
+            // "round <n> <volume> <streams> <start> <end>", the times in
+            // seconds since the guest booted.
+            let fields = line.split(separator: " ")
+            guard fields.count == 6, let start = Double(fields[4]), let end = Double(fields[5]), end > start else {
+                throw IntegrationError.assert(msg: "unreadable measurement line '\(line)'")
+            }
+            let rate = String(format: "%.0f IOPS", Double(blocks) / (end - start))
+            report += "\n  \(fields[0]) \(fields[1]) \(fields[2]) \(fields[3]) streams: \(rate)"
+        }
+        print(report)
+    }
+
     // MARK: - Helpers
 
     /// Runs a container with a machine of its own and a disk image mounted at

@@ -569,6 +569,7 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("pod scsi speed against virtio-blk", testPodSCSISpeed),
                 Test("container disk on the scsi host", testContainerDiskOnSCSIHost),
                 Test("container disk on the default driver", testContainerDiskOnDefaultDriver),
+                Test("pod scsi streams against virtio-blk", testPodSCSIStreams),
             ]
         }
         return []
