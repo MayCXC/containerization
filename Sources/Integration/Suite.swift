@@ -577,6 +577,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("pod hotplug virtiofs share", testPodHotplugVirtiofsShare),
             Test("pod hotplug virtiofs same share", testPodHotplugVirtiofsSameShare),
             Test("pod hotplug virtiofs share lifecycle", testPodHotplugVirtiofsShareLifecycle),
+            Test("pod restart stopped container", testPodRestartStoppedContainer),
         ]
     }
 

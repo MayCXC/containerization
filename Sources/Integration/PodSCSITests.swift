@@ -106,7 +106,8 @@ extension IntegrationSuite {
     /// A container joining the running machine gets its root filesystem as a
     /// logical unit added to the virtio-scsi host, beside the first
     /// container's root; the guest sees the disk appear, the container writes
-    /// to it, and once the container is stopped the guest sees the disk go
+    /// to it, the disk stays through the container's stop, which keeps its
+    /// place, and once the container is removed the guest sees the disk go
     /// and the write is in the image.
     func testPodHotplugSCSIRootfs() async throws {
         let id = "test-pod-hotplug-scsi-rootfs"
@@ -148,6 +149,12 @@ extension IntegrationSuite {
             try assertSCSIDiskMount(rootMount, path: "/")
 
             try await pod.stopContainer("hot")
+            let stopped = try await scsiDisks(in: pod, container: "seed")
+            guard stopped == during else {
+                throw IntegrationError.assert(msg: "the stopped container's disk should stay attached as \(during), the guest has \(stopped)")
+            }
+
+            try await pod.removeContainer("hot")
             var after = try await scsiDisks(in: pod, container: "seed")
             for _ in 0..<50 where after != before {
                 try await Task.sleep(for: .milliseconds(100))
@@ -424,10 +431,13 @@ extension IntegrationSuite {
         }
     }
 
-    /// A container joining a running pod on virtio-scsi brings a root and a
-    /// volume as logical units; once it stops its root goes while the
-    /// volume, the pod's, stays, and both writes are in their images once the
-    /// pod stops.
+    /// A container joining a running pod on virtio-scsi gets its root
+    /// filesystem and its volume as logical units added to the host, beside
+    /// the one the machine booted with for the root of the container already
+    /// running. Both stay through the joining container's stop, which keeps
+    /// its place; once it is removed the guest sees its root go and its
+    /// volume stay, the pod's for the machine's life, and once the pod stops
+    /// both writes are in their images.
     func testPodHotplugSCSIRootfsAndVolume() async throws {
         let id = "test-pod-hotplug-scsi-rootfs-volume"
         let bs = try await bootstrap(id)
@@ -477,6 +487,12 @@ extension IntegrationSuite {
             let volumeDisk = String(devices[1].dropFirst("/dev/".count))
 
             try await pod.stopContainer("hot")
+            let stopped = try await scsiDisks(in: pod, container: "seed")
+            guard stopped == during else {
+                throw IntegrationError.assert(msg: "the stopped container's disks should stay attached as \(during), the guest has \(stopped)")
+            }
+
+            try await pod.removeContainer("hot")
             var after = try await scsiDisks(in: pod, container: "seed")
             for _ in 0..<50 where after.contains(rootDisk) {
                 try await Task.sleep(for: .milliseconds(100))

@@ -85,8 +85,8 @@ public protocol VirtualMachineInstance: Sendable {
     func registerMounts(id: String, rootfs: AttachedFilesystem, writableLayer: AttachedFilesystem?, additionalMounts: [AttachedFilesystem]) throws
 
     /// Release a hotplug device.
-    /// This should be called when a hotplugged container is stopped or fails
-    /// to start, or when a volume attached for a pod's containers fails to
+    /// This should be called when a hotplugged container is removed or fails
+    /// to be added, or when a volume attached for a pod's containers fails to
     /// mount; the machine holds the volumes it mounted until it stops.
     /// - Parameter id: The owner whose hotplug should be released
     func releaseHotplug(id: String) async throws
