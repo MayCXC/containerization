@@ -605,23 +605,23 @@ extension IntegrationSuite {
             // leaves out and which the kernel drains an eighth at a time each
             // second (decay_pcp_high in mm/page_alloc.c), so the scattered
             // pages reach the free lists the guest compacts by over tens of
-            // seconds. The attempts start once those lists stop growing.
+            // seconds. A reading that has not grown can come before the drain
+            // has begun as well as after it has ended, so the attempts start
+            // once the lists hold more than the policy's threshold and have
+            // stopped growing for two readings in a row.
+            let threshold = MemoryCompactionPolicy().threshold
             var fragmented = try await fragmentedPages()
+            var steadyReadings = 0
             let deadline = ContinuousClock.now + .seconds(120)
-            while true {
+            while steadyReadings < 2 {
+                guard ContinuousClock.now < deadline else {
+                    throw IntegrationError.assert(
+                        msg: "after two minutes the guest's free lists hold \(fragmented) scattered pages, not settled above the threshold of \(threshold)")
+                }
                 try await Task.sleep(for: .seconds(2))
                 let now = try await fragmentedPages()
-                let settled = now < fragmented + 64
+                steadyReadings = now > threshold && now < fragmented + 64 ? steadyReadings + 1 : 0
                 fragmented = now
-                if settled {
-                    break
-                }
-                guard ContinuousClock.now < deadline else {
-                    throw IntegrationError.assert(msg: "the guest's free lists were still growing after two minutes: \(now) pages")
-                }
-            }
-            guard fragmented > MemoryCompactionPolicy().threshold else {
-                throw IntegrationError.assert(msg: "removing every other page left \(fragmented) scattered free pages")
             }
             let before = try await migrateScanned()
             let first = try await compact(MemoryCompactionPolicy())
