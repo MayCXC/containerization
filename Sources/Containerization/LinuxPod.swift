@@ -235,6 +235,9 @@ public final class LinuxPod: Sendable {
         var state: ContainerState
         var process: LinuxProcess?
         var fileMountContext: FileMountContext
+        /// Why the container is errored, when the machine's boot could not
+        /// set it up: its start answers with this.
+        var failure: (any Error)?
 
         enum ContainerState: Sendable {
             case registered
@@ -1092,6 +1095,13 @@ extension LinuxPod {
                 let shareProcessNamespace = self.config.shareProcessNamespace
                 let pauseProcessHolder = Mutex<LinuxProcess?>(nil)
                 let fileMountContextUpdates = Mutex<[String: FileMountContext]>([:])
+                // A container the machine cannot set up is left errored with
+                // the reason while the rest come up: a container's failure is
+                // its own and never the sandbox's, and the container's start
+                // answers with it.
+                // https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+                let setupFailures = Mutex<[String: any Error]>([:])
+                let mountedVolumes = Mutex<Set<String>>([])
                 let hasSwapLayer = self.config.swapLayer != nil
 
                 try await vm.withAgent { agent in
@@ -1206,29 +1216,41 @@ extension LinuxPod {
                         self.logger?.debug("Pause container started", metadata: ["pid": "\(process.pid)"])
                     }
 
-                    // Mount all container rootfs
+                    // Mount all container rootfs. A rootfs that cannot be
+                    // mounted leaves nothing of itself mounted, so the disks
+                    // under it can be given back without taking a filesystem
+                    // down with them.
                     for (_, container) in containers {
-                        guard let attached = vm.storage.containers[container.id] else {
-                            throw ContainerizationError(.notFound, message: "rootfs mount not found for container \(container.id)")
+                        do {
+                            guard let attached = vm.storage.containers[container.id] else {
+                                throw ContainerizationError(.notFound, message: "rootfs mount not found for container \(container.id)")
+                            }
+                            try await agent.mountRootfs(
+                                containerID: container.id,
+                                rootfsAttachment: attached.rootfs,
+                                writableAttachment: attached.writableLayer,
+                                rootfsPath: Self.guestRootfsPath(container.id)
+                            )
+                        } catch {
+                            try? await Self.umountRootfs(of: container.id, hasWritableLayer: container.writableLayer != nil, agent: agent)
+                            setupFailures.withLock { $0[container.id] = error }
                         }
-                        try await agent.mountRootfs(
-                            containerID: container.id,
-                            rootfsAttachment: attached.rootfs,
-                            writableAttachment: attached.writableLayer,
-                            rootfsPath: Self.guestRootfsPath(container.id)
-                        )
                     }
 
                     // Mount file mount holding directories under /run for each container.
-                    for (id, container) in containers {
+                    for (id, container) in containers where setupFailures.withLock({ $0[id] == nil }) {
                         if container.fileMountContext.hasFileMounts {
                             var ctx = container.fileMountContext
                             let containerMounts = vm.storage.containers[id]?.mounts ?? []
-                            try await ctx.mountHoldingDirectories(
-                                vmMounts: containerMounts,
-                                agent: agent
-                            )
-                            fileMountContextUpdates.withLock { $0[id] = ctx }
+                            do {
+                                try await ctx.mountHoldingDirectories(
+                                    vmMounts: containerMounts,
+                                    agent: agent
+                                )
+                                fileMountContextUpdates.withLock { $0[id] = ctx }
+                            } catch {
+                                setupFailures.withLock { $0[id] = error }
+                            }
                         }
                     }
 
@@ -1252,26 +1274,42 @@ extension LinuxPod {
                         )
                     }
 
-                    // Mount the volumes the containers mount, each once.
+                    // Mount the volumes the containers mount, each once. A
+                    // volume the guest cannot mount is the failure of the
+                    // containers that mount it.
                     for name in blockVolumes.keys.sorted() {
-                        guard let attachment = vm.storage.volumes[name] else {
-                            throw ContainerizationError(
-                                .notFound,
-                                message: "attached filesystem not found for pod volume \"\(name)\""
-                            )
+                        guard let volume = blockVolumes[name] else { continue }
+                        do {
+                            guard let attachment = vm.storage.volumes[name] else {
+                                throw ContainerizationError(
+                                    .notFound,
+                                    message: "attached filesystem not found for pod volume \"\(name)\""
+                                )
+                            }
+                            try await agent.mount(attachment.to, of: attachment)
+                            mountedVolumes.withLock { _ = $0.insert(name) }
+                        } catch {
+                            setupFailures.withLock { failures in
+                                for user in volume.users where failures[user] == nil {
+                                    failures[user] = error
+                                }
+                            }
                         }
-                        try await agent.mount(attachment.to, of: attachment)
                     }
 
                     // Start up unix socket relays for each container
-                    for (_, container) in containers {
-                        for socket in container.config.sockets {
-                            try await self.relayUnixSocket(
-                                socket: socket,
-                                containerID: container.id,
-                                relayManager: relayManager,
-                                agent: agent
-                            )
+                    for (id, container) in containers where setupFailures.withLock({ $0[id] == nil }) {
+                        do {
+                            for socket in container.config.sockets {
+                                try await self.relayUnixSocket(
+                                    socket: socket,
+                                    containerID: container.id,
+                                    relayManager: relayManager,
+                                    agent: agent
+                                )
+                            }
+                        } catch {
+                            setupFailures.withLock { $0[id] = error }
                         }
                     }
 
@@ -1293,25 +1331,29 @@ extension LinuxPod {
 
                     // Setup /etc/resolv.conf and /etc/hosts for each container.
                     // Container-level config takes precedence over pod-level config.
-                    for (_, container) in containers {
-                        if let dns = container.config.dns ?? self.config.dns {
-                            try await agent.configureDNS(
-                                config: dns,
-                                location: Self.guestRootfsPath(container.id)
-                            )
-                        }
-                        if let hosts = container.config.hosts ?? self.config.hosts {
-                            try await agent.configureHosts(
-                                config: hosts,
-                                location: Self.guestRootfsPath(container.id)
-                            )
+                    for (id, container) in containers where setupFailures.withLock({ $0[id] == nil }) {
+                        do {
+                            if let dns = container.config.dns ?? self.config.dns {
+                                try await agent.configureDNS(
+                                    config: dns,
+                                    location: Self.guestRootfsPath(container.id)
+                                )
+                            }
+                            if let hosts = container.config.hosts ?? self.config.hosts {
+                                try await agent.configureHosts(
+                                    config: hosts,
+                                    location: Self.guestRootfsPath(container.id)
+                                )
+                            }
+                        } catch {
+                            setupFailures.withLock { $0[id] = error }
                         }
                     }
                 }
 
                 state.pauseProcess = pauseProcessHolder.withLock { $0 }
                 state.unifiedVirtiofsMounted = mountsShareAtBoot && vm.virtiofsLayout == .unified
-                for name in blockVolumes.keys {
+                for name in mountedVolumes.withLock({ $0 }) {
                     state.blockVolumes[name]?.attachment = vm.storage.volumes[name]
                 }
 
@@ -1321,9 +1363,19 @@ extension LinuxPod {
                     state.containers[id]?.fileMountContext = ctx
                 }
 
-                // Transition all containers to created state
+                // Every container the machine set up is created; one it could
+                // not is errored, holding the reason for its start.
+                let failed = setupFailures.withLock { $0 }
                 for id in state.containers.keys {
-                    state.containers[id]?.state = .created
+                    if let failure = failed[id] {
+                        self.logger?.error(
+                            "the machine could not set a container up as it booted",
+                            metadata: ["container": "\(id)", "error": "\(failure)"])
+                        state.containers[id]?.state = .errored
+                        state.containers[id]?.failure = failure
+                    } else {
+                        state.containers[id]?.state = .created
+                    }
                 }
 
                 state.phase = .created(.init(vm: vm, relayManager: relayManager))
@@ -1355,6 +1407,14 @@ extension LinuxPod {
                 throw ContainerizationError(
                     .notFound,
                     message: "container \(containerID) not found in pod"
+                )
+            }
+
+            if container.state == .errored, let failure = container.failure {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "container \(containerID) could not be set up when the machine booted",
+                    cause: failure
                 )
             }
 
