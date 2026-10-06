@@ -25,10 +25,12 @@ import Logging
 /// logical units that can come and go while the machine runs.
 ///
 /// The guest drives it with the stock Linux `virtio_scsi` driver. The device
-/// is a custom Virtio device: Virtualization hands it the queues, and every
-/// queue is served on the one serial device queue, as the custom device
-/// interface does for all of a device's operations (VZCustomVirtioDevice.h,
-/// VZVirtioQueue.h and VZVirtioQueueElement.h in the macOS 27 SDK).
+/// is a custom Virtio device: Virtualization hands it the queues, and calls
+/// it on the one serial device queue, as the custom device interface does
+/// for all of a device's operations (VZCustomVirtioDevice.h, VZVirtioQueue.h
+/// and VZVirtioQueueElement.h in the macOS 27 SDK). Elements are taken,
+/// written and returned there; the image operations of the commands they
+/// carry run on a pool of threads.
 @available(macOS 27, *)
 final class VZVirtioSCSI: NSObject, VZCustomVirtioDeviceConfigurationDelegate, VZCustomVirtioDeviceDelegate, @unchecked Sendable {
     let configuration: VZCustomVirtioDeviceConfiguration
@@ -43,8 +45,12 @@ final class VZVirtioSCSI: NSObject, VZCustomVirtioDeviceConfigurationDelegate, V
     /// for each.
     init(cpus: Int, logger: Logger?) {
         self.logger = logger
-        self.deviceQueue = DispatchQueue(label: "com.apple.containerization.vzscsi.\(UUID().uuidString)")
-        let controller = VirtioSCSIController(requestQueues: VirtioSCSIController.requestQueueCount(cpus: cpus))
+        let deviceQueue = DispatchQueue(label: "com.apple.containerization.vzscsi.\(UUID().uuidString)")
+        self.deviceQueue = deviceQueue
+        let controller = VirtioSCSIController(
+            requestQueues: VirtioSCSIController.requestQueueCount(cpus: cpus),
+            executor: SCSIOperationPool(completionQueue: deviceQueue)
+        )
         self.controller = controller
 
         let configuration = VZCustomVirtioDeviceConfiguration()
@@ -85,11 +91,11 @@ final class VZVirtioSCSI: NSObject, VZCustomVirtioDeviceConfigurationDelegate, V
         }
     }
 
-    /// Detaches the logical unit at `target` and `lun`, which lets go of its
-    /// image and the image's lock.
+    /// Detaches the logical unit at `target` and `lun`, which closes its
+    /// image and lets go of the image's lock.
     func detach(target: UInt8, lun: UInt16) {
         deviceQueue.sync {
-            _ = controller.detach(target: target, lun: lun)
+            controller.detach(target: target, lun: lun)?.image.close()
         }
     }
 
@@ -183,14 +189,16 @@ final class VZVirtioSCSI: NSObject, VZCustomVirtioDeviceConfigurationDelegate, V
             // takes one.
             controller.eventBuffersAvailable()
         default:
-            while !controller.needsReset, let element = queue.nextElement() {
-                controller.handleRequest(Chain(element))
-            }
+            controller.handleRequests { queue.nextElement().map { Chain($0) } }
         }
     }
 
     func customVirtioDeviceWillReset(_ device: VZCustomVirtioDevice) {
         controller.reset()
+    }
+
+    func customVirtioDeviceWillStop(_ device: VZCustomVirtioDevice) {
+        controller.stop()
     }
 
     /// A queue element as the controller's descriptor chain.
@@ -216,15 +224,8 @@ final class VZVirtioSCSI: NSObject, VZCustomVirtioDeviceConfigurationDelegate, V
             }
         }
 
-        func readRemaining<Result>(_ body: ([UnsafeRawBufferPointer]) throws -> Result) rethrows -> Result {
-            // The element hands the buffers over as data that references
-            // guest memory in place. Data lends its bytes only inside a scope
-            // of its own; an NSData's stay where they are for as long as the
-            // object lives, so every buffer is had at once.
-            let buffers = element.readBuffers().map { $0 as NSData }
-            return try withExtendedLifetime(buffers) {
-                try body(buffers.map { UnsafeRawBufferPointer(start: $0.bytes, count: $0.length) })
-            }
+        func takeReadable() -> any VirtioReadableData {
+            GuestData(pieces: element.readBuffers())
         }
 
         func write(_ bytes: UnsafeRawBufferPointer) -> Bool {
@@ -241,6 +242,21 @@ final class VZVirtioSCSI: NSObject, VZCustomVirtioDeviceConfigurationDelegate, V
 
         func complete() {
             element.returnToQueue()
+        }
+    }
+
+    /// The driver's buffers an element hands over, as data that references
+    /// guest memory in place. Data lends its bytes only inside a scope of its
+    /// own; an NSData's stay where they are for as long as the object lives,
+    /// so every buffer is had at once.
+    private struct GuestData: VirtioReadableData {
+        let pieces: [Data]
+
+        func withBuffers<Result>(_ body: ([UnsafeRawBufferPointer]) throws -> Result) rethrows -> Result {
+            let buffers = pieces.map { $0 as NSData }
+            return try withExtendedLifetime(buffers) {
+                try body(buffers.map { UnsafeRawBufferPointer(start: $0.bytes, count: $0.length) })
+            }
         }
     }
 

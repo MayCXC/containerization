@@ -33,11 +33,16 @@ final class BusFixture {
         return disk
     }
 
+    /// Runs `cdb` through the bus. An image operation runs before it returns.
     func run(_ cdb: [UInt8], target: UInt8 = 0, lun: UInt16 = 0, dataOut: [UInt8] = []) throws -> (completion: SCSICompletion, data: [UInt8]) {
         let request = try #require(bus.prepare(cdb, at: SCSIBus.Address(target: target, lun: lun)))
         let dataIn = SCSIDataBuffer(capacity: 4096)
-        let completion = dataOut.withUnsafeBytes { bytes in
-            bus.execute(request, dataOut: SCSIDataOut(buffers: [bytes]), dataIn: dataIn)
+        let completion: SCSICompletion
+        switch bus.execute(request, dataOut: SCSIDataOut(bytes: dataOut), dataIn: dataIn) {
+        case .completed(let done):
+            completion = done
+        case .waiting(let operation):
+            completion = bus.finish(request, try #require(operation.run()), dataIn: dataIn)
         }
         return (completion, Array(dataIn.content))
     }

@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 import ContainerizationError
+import Synchronization
 
 /// A descriptor chain a virtio device took from one of its queues: bytes the
 /// driver wrote for the device to read, then buffers for the device to write.
@@ -25,13 +26,19 @@ public protocol VirtioDescriptorChain: AnyObject {
     var writableByteCount: Int { get }
     /// Consumes exactly `buffer.count` readable bytes into `buffer`.
     func read(into buffer: UnsafeMutableRawBufferPointer) -> Bool
-    /// Consumes the remaining readable bytes, handing them to `body` where
-    /// they lie.
-    func readRemaining<Result>(_ body: ([UnsafeRawBufferPointer]) throws -> Result) rethrows -> Result
+    /// Consumes the remaining readable bytes and hands them over where they
+    /// lie, readable from any thread until the chain completes.
+    func takeReadable() -> any VirtioReadableData
     /// Writes `bytes` into the next writable bytes.
     func write(_ bytes: UnsafeRawBufferPointer) -> Bool
     /// Returns the chain to the driver, with what the device wrote.
     func complete()
+}
+
+/// Bytes a driver wrote for the device, left where they lie in its buffers.
+public protocol VirtioReadableData: Sendable {
+    /// Calls `body` with the buffers, in order.
+    func withBuffers<Result>(_ body: ([UnsafeRawBufferPointer]) throws -> Result) rethrows -> Result
 }
 
 /// The buffers a virtio-scsi driver keeps on the event queue for the device
@@ -50,8 +57,16 @@ public protocol VirtioEventQueue: AnyObject {
 /// QEMU's virtio-scsi device, hw/scsi/virtio-scsi.c at d7a65d1793d6:
 /// https://github.com/qemu/qemu/blob/d7a65d1793d6/hw/scsi/virtio-scsi.c
 ///
-/// It is not thread-safe: the device drives it from one serial queue.
-public final class VirtioSCSIController {
+/// Commands run as QEMU's do. The adapter takes every request a queue holds
+/// and prepares each, then submits them all (virtio_scsi_handle_cmd_vq): a
+/// command that completes without the image is answered as it is submitted,
+/// and one that waits on the image completes when its operation has, in
+/// whatever order the operations finish.
+///
+/// The adapter is driven from one serial queue, and its state is touched
+/// only there. Its executor runs the operations elsewhere and completes them
+/// back on that queue.
+public final class VirtioSCSIController: @unchecked Sendable {
     public static let deviceID: UInt16 = 8
     /// The control and event queues, ahead of the request queues
     /// (VIRTIO_SCSI_VQ_NUM_FIXED).
@@ -104,7 +119,9 @@ public final class VirtioSCSIController {
     enum Response: UInt8 {
         case ok = 0
         case overrun = 1
+        case aborted = 2
         case badTarget = 3
+        case reset = 4
         case failure = 9
         case functionSucceeded = 10
         case functionRejected = 11
@@ -166,7 +183,13 @@ public final class VirtioSCSIController {
     public private(set) var needsReset = false
 
     private let bus = SCSIBus()
-    private let dataIn = SCSIDataBuffer()
+    private let executor: any SCSIOperationExecutor
+    /// The commands whose operations were submitted and that are not yet
+    /// answered, by the order they were submitted in.
+    private var inFlight: [UInt64: InFlight] = [:]
+    private var submitted: UInt64 = 0
+    /// Data-in buffers commands have given back, for the next ones.
+    private var spareBuffers: [SCSIDataBuffer] = []
     /// The event queue, from the moment the driver is ready (DRIVER_OK).
     private var events: (any VirtioEventQueue)?
     private var hotplugNegotiated = false
@@ -174,9 +197,67 @@ public final class VirtioSCSIController {
     /// went out.
     private var eventsDropped = false
 
-    /// An adapter with `requestQueues` request queues.
-    public init(requestQueues: Int = 1) {
+    /// An adapter with `requestQueues` request queues, whose image
+    /// operations `executor` runs.
+    public init(requestQueues: Int = 1, executor: any SCSIOperationExecutor) {
         self.requestQueueCount = min(max(requestQueues, 1), Self.maximumQueues - Int(Self.fixedQueueCount))
+        self.executor = executor
+    }
+
+    /// A command waiting on its image operation, from the moment the
+    /// operation is submitted until the command is answered. The operation
+    /// writes `result` on its own thread before the command's completion is
+    /// queued, and reads `canceled`; everything else is touched only on the
+    /// adapter's queue.
+    private final class InFlight: @unchecked Sendable {
+        let chain: any VirtioDescriptorChain
+        /// The driver's tag for the command, which task management names it by.
+        let tag: UInt64
+        let request: SCSIBus.Request
+        let dataIn: SCSIDataBuffer
+        let operation: SCSIOperation
+        /// Set when a task management function, an unplug or a reset cancels
+        /// the command. The operation reads it between its requests to the
+        /// image, and issues no more once it is set.
+        let canceled = Atomic(false)
+        /// How the operation completed, or nil when the cancel stopped it:
+        /// set by the operation, read once it has run.
+        var result: SCSICompletion?
+        /// What a canceled command is answered with: ABORTED, or RESET when a
+        /// reset canceled it (virtio_scsi_request_cancelled).
+        var cancellation: Response?
+        /// The task management functions waiting for the command to be
+        /// answered.
+        var waiting: [PendingFunction] = []
+        var answered = false
+        var position: UInt64 = 0
+
+        var disk: SCSIDisk { request.device.disk }
+
+        init(chain: any VirtioDescriptorChain, tag: UInt64, request: SCSIBus.Request, dataIn: SCSIDataBuffer, operation: SCSIOperation) {
+            self.chain = chain
+            self.tag = tag
+            self.request = request
+            self.dataIn = dataIn
+            self.operation = operation
+        }
+
+        func cancel(_ response: Response) {
+            cancellation = response
+            canceled.store(true, ordering: .releasing)
+        }
+    }
+
+    /// A task management function waiting for the commands it canceled to
+    /// be answered, and answered after the last of them (the remaining count
+    /// of virtio_scsi_tmf_dec_remaining).
+    private final class PendingFunction {
+        let chain: any VirtioDescriptorChain
+        var remaining = 0
+
+        init(chain: any VirtioDescriptorChain) {
+            self.chain = chain
+        }
     }
 
     // MARK: - Device life cycle
@@ -194,13 +275,41 @@ public final class VirtioSCSIController {
     }
 
     /// The device resets: every logical unit with it, and what the driver
-    /// negotiated (virtio_scsi_reset).
+    /// negotiated (virtio_scsi_reset). Each unit's reset cancels its commands
+    /// and waits for their operations, and the queues go with the device's
+    /// reset, so none of the commands is answered.
     public func reset() {
+        let commands = Array(inFlight.values)
+        for command in commands {
+            command.cancel(.reset)
+        }
+        drop(commands)
         bus.reset()
         events = nil
         hotplugNegotiated = false
         eventsDropped = false
         needsReset = false
+    }
+
+    /// The machine stops: the commands in flight run to their end, and none
+    /// is answered, as the queues stop with the machine (QEMU drains the
+    /// block layer as a machine stops, bdrv_drain_all).
+    public func stop() {
+        drop(Array(inFlight.values))
+    }
+
+    /// Waits for the operations of `commands`, then lets go of the commands
+    /// without answering them.
+    private func drop(_ commands: [InFlight]) {
+        guard !commands.isEmpty else {
+            return
+        }
+        executor.waitForRunningOperations()
+        for command in commands {
+            command.answered = true
+            inFlight[command.position] = nil
+            giveBack(command.dataIn)
+        }
     }
 
     private func deviceError(_ reason: String) {
@@ -227,12 +336,28 @@ public final class VirtioSCSIController {
         }
     }
 
-    /// Detaches the logical unit at `target` and `lun`, and returns it.
+    /// Detaches the logical unit at `target` and `lun`, and returns it. No
+    /// operation reaches the unit's image once it returns.
+    ///
+    /// The unit's commands are purged as it goes (scsi_qdev_unrealize):
+    /// those not already canceled are aborted, and each is answered once its
+    /// operation has run, before the driver hears the unit is gone
+    /// (virtio_scsi_hotunplug).
     @discardableResult
     public func detach(target: UInt8, lun: UInt16) -> SCSIDisk? {
         let address = SCSIBus.Address(target: target, lun: lun)
         guard let disk = bus.detach(at: address) else {
             return nil
+        }
+        let commands = self.commands(of: disk)
+        for command in commands where command.cancellation == nil {
+            command.cancel(.aborted)
+        }
+        if !commands.isEmpty {
+            executor.waitForRunningOperations()
+            for command in commands where !command.answered {
+                answer(command)
+            }
         }
         if hotplugNegotiated {
             pushEvent(Self.transportReset, reason: Self.removed, address: address)
@@ -243,19 +368,61 @@ public final class VirtioSCSIController {
 
     // MARK: - Request queue
 
-    /// Serves one request from a request queue and returns its chain.
-    public func handleRequest(_ chain: any VirtioDescriptorChain) {
+    /// A request whose command is routed to its unit and ready to run, with
+    /// the data the driver sent and a buffer for what the command returns.
+    private struct Prepared {
+        let chain: any VirtioDescriptorChain
+        /// The driver's tag for the command, which task management names it by.
+        let tag: UInt64
+        let request: SCSIBus.Request
+        let dataOut: SCSIDataOut
+        let dataIn: SCSIDataBuffer
+    }
+
+    /// Serves the requests a request queue holds, taking each from `next`
+    /// until it returns nil (virtio_scsi_handle_cmd_vq). Every request is
+    /// prepared, then the commands of all of them are submitted.
+    public func handleRequests(from next: () -> (any VirtioDescriptorChain)?) {
+        var prepared: [Prepared] = []
+        while !needsReset, let chain = next() {
+            if let command = prepare(chain) {
+                prepared.append(command)
+            }
+        }
+        // A request that broke the transport leaves the commands prepared
+        // with it unrun and unanswered, as QEMU detaches them
+        // (virtqueue_detach_element).
         guard !needsReset else {
+            for command in prepared {
+                giveBack(command.dataIn)
+            }
             return
         }
+        for command in prepared {
+            submit(command)
+        }
+    }
+
+    /// Serves one request from a request queue.
+    public func handleRequest(_ chain: any VirtioDescriptorChain) {
+        var pending: (any VirtioDescriptorChain)? = chain
+        handleRequests {
+            defer { pending = nil }
+            return pending
+        }
+    }
+
+    /// Prepares a request (virtio_scsi_handle_cmd_req_prepare): answers one
+    /// the transport refuses, and routes the command of any other.
+    private func prepare(_ chain: any VirtioDescriptorChain) -> Prepared? {
         guard chain.readableByteCount >= Self.requestHeaderLength, chain.writableByteCount >= Self.responseHeaderLength else {
             deviceError("wrong size for virtio-scsi headers")
-            return
+            return nil
         }
         var header = [UInt8](repeating: 0, count: Self.requestHeaderLength)
         guard header.withUnsafeMutableBytes({ chain.read(into: $0) }) else {
             deviceError("wrong size for virtio-scsi headers")
-            return
+            return nil
         }
         let dataOutLength = chain.readableByteCount
         let dataInCapacity = chain.writableByteCount - Self.responseHeaderLength
@@ -263,28 +430,108 @@ public final class VirtioSCSIController {
         // way only.
         guard dataOutLength == 0 || dataInCapacity == 0 else {
             respond(on: chain, .failure)
-            return
+            return nil
         }
         let direction: SCSICommand.Direction = dataOutLength > 0 ? .toDevice : dataInCapacity > 0 ? .fromDevice : .none
         guard let address = Self.address(Array(header[0..<8])), let request = bus.prepare(Array(header[19...]), at: address) else {
             respond(on: chain, .badTarget)
-            return
+            return nil
         }
         // The command must move its data the way the driver's buffers go, and
         // fit them.
         if request.direction != .none && (request.direction != direction || request.transferLength > dataOutLength + dataInCapacity) {
             respond(on: chain, .overrun)
+            return nil
+        }
+        return Prepared(
+            chain: chain,
+            tag: header.littleEndian64(at: 8),
+            request: request,
+            dataOut: SCSIDataOut(chain.takeReadable()),
+            dataIn: takeBuffer()
+        )
+    }
+
+    /// Runs a prepared command (virtio_scsi_handle_cmd_req_submit): answers
+    /// it when it completes without the image, and otherwise submits the
+    /// operation it waits on and answers it once that has run.
+    private func submit(_ prepared: Prepared) {
+        let operation: SCSIOperation
+        switch bus.execute(prepared.request, dataOut: prepared.dataOut, dataIn: prepared.dataIn) {
+        case .completed(let completion):
+            respond(on: prepared.chain, to: prepared.request, completion, dataIn: prepared.dataIn)
+            giveBack(prepared.dataIn)
             return
+        case .waiting(let waiting):
+            operation = waiting
         }
-        let completion = chain.readRemaining { buffers in
-            bus.execute(request, dataOut: SCSIDataOut(buffers: buffers), dataIn: dataIn)
+        let command = InFlight(chain: prepared.chain, tag: prepared.tag, request: prepared.request, dataIn: prepared.dataIn, operation: operation)
+        submitted += 1
+        command.position = submitted
+        inFlight[submitted] = command
+        executor.submit(
+            {
+                command.result = command.operation.run(until: { command.canceled.load(ordering: .acquiring) })
+            },
+            completion: { [weak self] in
+                guard let self, !command.answered else {
+                    return
+                }
+                self.answer(command)
+            })
+    }
+
+    /// Answers a command whose operation has run: with how it completed, or
+    /// with its cancellation (virtio_scsi_command_complete and
+    /// virtio_scsi_request_cancelled). The task management functions waiting
+    /// for it hear it was answered.
+    private func answer(_ command: InFlight) {
+        command.answered = true
+        inFlight[command.position] = nil
+        if let cancellation = command.cancellation {
+            respond(on: command.chain, cancellation)
+        } else {
+            let completion = bus.finish(command.request, command.result ?? .checkCondition(.ioProcessTerminated), dataIn: command.dataIn)
+            respond(on: command.chain, to: command.request, completion, dataIn: command.dataIn)
         }
-        let transferred = request.direction == .toDevice ? request.transferLength : dataIn.count
+        giveBack(command.dataIn)
+        for function in command.waiting {
+            function.remaining -= 1
+            if function.remaining == 0 {
+                writeControl(function.chain, [Response.ok.rawValue])
+            }
+        }
+    }
+
+    /// Writes a command's response: its status, with its data when it
+    /// succeeded and its sense when it did not.
+    private func respond(on chain: any VirtioDescriptorChain, to request: SCSIBus.Request, _ completion: SCSICompletion, dataIn: SCSIDataBuffer) {
         if completion.status == .good {
             // The residual counts from the command's own transfer length.
+            let transferred = request.direction == .toDevice ? request.transferLength : dataIn.count
             respond(on: chain, .ok, status: .good, residual: UInt32(clamping: request.transferLength - transferred), data: dataIn.content)
         } else {
             respond(on: chain, .ok, status: completion.status, sense: completion.sense?.data(descriptorFormat: false) ?? [])
+        }
+    }
+
+    /// The commands in flight to `disk`, in the order they were submitted.
+    private func commands(of disk: SCSIDisk) -> [InFlight] {
+        inFlight.keys.sorted().compactMap { inFlight[$0] }.filter { $0.disk === disk }
+    }
+
+    /// A data-in buffer for a command, one a command gave back when there is
+    /// one.
+    private func takeBuffer() -> SCSIDataBuffer {
+        spareBuffers.popLast() ?? SCSIDataBuffer(capacity: 64 * 1024)
+    }
+
+    /// Takes back a command's data-in buffer, keeping as many as the most
+    /// operations that run at once.
+    private func giveBack(_ buffer: SCSIDataBuffer) {
+        buffer.clear()
+        if spareBuffers.count < SCSIOperationPool.maximumWorkers {
+            spareBuffers.append(buffer)
         }
     }
 
@@ -346,8 +593,7 @@ public final class VirtioSCSIController {
             guard let request = readControl(chain, length: 20, responseLength: 1) else {
                 return
             }
-            let response = manageTask(subtype: request.littleEndian32(at: 0), lun: Array(request[4..<12]))
-            writeControl(chain, [response.rawValue])
+            manageTask(subtype: request.littleEndian32(at: 0), lun: Array(request[4..<12]), tag: request.littleEndian64(at: 12), answering: chain)
         case .asynchronousNotificationQuery, .asynchronousNotificationSubscribe:
             // struct virtio_scsi_ctrl_an: the LUN and the events asked for.
             // No asynchronous events are supported.
@@ -385,30 +631,86 @@ public final class VirtioSCSIController {
         chain.complete()
     }
 
-    /// A task management function (virtio_scsi_do_tmf). The device runs each
-    /// command to completion before it takes the next request, so no command
-    /// is ever in flight to abort, query or clear: those find nothing and
-    /// report the function complete.
-    private func manageTask(subtype: UInt32, lun: [UInt8]) -> Response {
+    /// A task management function (virtio_scsi_do_tmf), answered on `chain`.
+    ///
+    /// An abort cancels the commands it names that are in flight and not
+    /// already canceled, and is answered once they are. A reset cancels every
+    /// command its units have in flight, which the reset answers RESET, and
+    /// is answered once all of them are, as QEMU's reset drains the unit's
+    /// I/O (scsi_device_purge_requests). A query finds the commands in flight
+    /// that are not canceled.
+    private func manageTask(subtype: UInt32, lun: [UInt8], tag: UInt64, answering chain: any VirtioDescriptorChain) {
         let address = Self.address(lun)
         let device = address.flatMap { bus.device(at: $0) }
-        switch TaskManagementFunction(rawValue: subtype) {
+        let function = TaskManagementFunction(rawValue: subtype)
+        switch function {
         case .abortTask, .abortTaskSet, .clearTaskSet, .queryTask, .queryTaskSet, .logicalUnitReset:
             guard let address, let device else {
-                return .badTarget
+                writeControl(chain, [Response.badTarget.rawValue])
+                return
             }
             guard device.address == address else {
-                return .incorrectLUN
+                writeControl(chain, [Response.incorrectLUN.rawValue])
+                return
             }
-            if subtype == TaskManagementFunction.logicalUnitReset.rawValue {
-                device.disk.reset()
+            let live = commands(of: device.disk).filter { $0.cancellation == nil }
+            switch function {
+            case .abortTask:
+                abort(live.filter { $0.tag == tag }, answering: chain)
+            case .abortTaskSet, .clearTaskSet:
+                abort(live, answering: chain)
+            case .queryTask:
+                // FUNCTION SUCCEEDED when the command is in the task set.
+                writeControl(chain, [(live.contains { $0.tag == tag } ? Response.functionSucceeded : Response.ok).rawValue])
+            case .queryTaskSet:
+                writeControl(chain, [(live.isEmpty ? Response.ok : Response.functionSucceeded).rawValue])
+            default:
+                resetUnits([device.disk], answering: chain)
             }
-            return .ok
         case .iTNexusReset:
-            bus.reset(target: lun[1])
-            return .ok
+            resetUnits(bus.units.filter { $0.key.target == lun[1] }.map(\.value), answering: chain)
         case .clearACA, nil:
-            return .functionRejected
+            writeControl(chain, [Response.functionRejected.rawValue])
+        }
+    }
+
+    /// Cancels `commands`, which are answered ABORTED once their operations
+    /// have run, and answers the function on `chain` after the last of them
+    /// (virtio_scsi_tmf_cancel_req).
+    private func abort(_ commands: [InFlight], answering chain: any VirtioDescriptorChain) {
+        for command in commands {
+            command.cancel(.aborted)
+        }
+        answer(chain, after: commands)
+    }
+
+    /// Resets `disks`, which report the reset to their next command, and
+    /// cancels everything they have in flight, which is answered RESET; the
+    /// function on `chain` is answered once all of it is (scsi_disk_reset).
+    private func resetUnits(_ disks: [SCSIDisk], answering chain: any VirtioDescriptorChain) {
+        let commands = inFlight.keys.sorted().compactMap { inFlight[$0] }.filter { command in
+            disks.contains { $0 === command.disk }
+        }
+        for command in commands {
+            command.cancel(.reset)
+        }
+        for disk in disks {
+            disk.reset()
+        }
+        answer(chain, after: commands)
+    }
+
+    /// Answers a task management function FUNCTION COMPLETE once `commands`
+    /// are answered, or at once when there are none.
+    private func answer(_ chain: any VirtioDescriptorChain, after commands: [InFlight]) {
+        guard !commands.isEmpty else {
+            writeControl(chain, [Response.ok.rawValue])
+            return
+        }
+        let function = PendingFunction(chain: chain)
+        function.remaining = commands.count
+        for command in commands {
+            command.waiting.append(function)
         }
     }
 

@@ -319,12 +319,14 @@ struct SCSIDiskTests {
         let command = try #require(SCSICommand([0x2a, 0, 0, 0, 0, 2, 0, 0, 2, 0], blockSize: 512))
         let first = [UInt8](repeating: 1, count: 100)
         let second = [UInt8](repeating: 2, count: 924)
-        let completion = first.withUnsafeBytes { first in
-            second.withUnsafeBytes { second in
-                fixture.disk.execute(command, dataOut: SCSIDataOut(buffers: [first, second]), dataIn: SCSIDataBuffer())
-            }
+        let outcome = fixture.disk.execute(command, dataOut: SCSIDataOut(HeldBytes(pieces: [first, second])), dataIn: SCSIDataBuffer())
+        guard case .waiting(let operation) = outcome else {
+            Issue.record("a write waits on its operation")
+            return
         }
-        #expect(completion == .good)
+        // Nothing reaches the image until the operation runs.
+        #expect(try fixture.image.block(2) == [UInt8](repeating: 2, count: 512))
+        #expect(operation.run() == .good)
         #expect(try fixture.image.block(2) + fixture.image.block(3) == first + second)
     }
 
@@ -435,6 +437,100 @@ struct SCSIDiskTests {
         // The half block keeps its data.
         #expect(try fixture.image.block(24) == [UInt8](repeating: 24, count: 512))
         #expect(try fixture.image.block(7) == [UInt8](repeating: 7, count: 512))
+    }
+
+    // MARK: Canceled commands
+
+    /// A canceled command's operation runs the request it issued to its
+    /// end and issues no other: the read after a forced read's flush is not
+    /// issued, and a plain read, one request, runs.
+    @Test func aCanceledReadIssuesNoReadAfterItsFlush() throws {
+        let fixture = try DiskFixture(blocks: 16)
+        let dataIn = SCSIDataBuffer(capacity: 4096)
+        let stale = [UInt8](repeating: 0xee, count: 512)
+        dataIn.fill(stale, length: 512)
+        let forced = try #require(SCSICommand([0x28, 0x08, 0, 0, 0, 3, 0, 0, 1, 0], blockSize: 512))
+        guard case .waiting(let operation) = fixture.disk.execute(forced, dataOut: SCSIDataOut(), dataIn: dataIn) else {
+            Issue.record("a read waits on its operation")
+            return
+        }
+        var asked = 0
+        #expect(
+            operation.run(until: {
+                asked += 1
+                return true
+            }) == nil)
+        #expect(asked == 1)
+        #expect(Array(dataIn.content) == stale)
+
+        let plain = try #require(SCSICommand([0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0], blockSize: 512))
+        guard case .waiting(let read) = fixture.disk.execute(plain, dataOut: SCSIDataOut(), dataIn: dataIn) else {
+            Issue.record("a read waits on its operation")
+            return
+        }
+        #expect(read.run(until: { true }) == .good)
+        #expect(Array(dataIn.content) == [UInt8](repeating: 3, count: 512))
+    }
+
+    @Test func aCanceledUnmapIssuesNoFurtherRange() throws {
+        let fixture = try DiskFixture(blocks: 64)
+        // Blocks 8 to 23, then 32 to 47: 8 KiB each, aligned to the file
+        // system's blocks.
+        var parameters: [UInt8] = [0, 38, 0, 32, 0, 0, 0, 0]
+        parameters += [0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0]
+        parameters += [0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 16, 0, 0, 0, 0]
+        let command = try #require(SCSICommand([0x42, 0, 0, 0, 0, 0, 0, 0, UInt8(parameters.count), 0], blockSize: 512))
+        guard case .waiting(let operation) = fixture.disk.execute(command, dataOut: SCSIDataOut(bytes: parameters), dataIn: SCSIDataBuffer()) else {
+            Issue.record("an unmap waits on its operation")
+            return
+        }
+        var asked = 0
+        #expect(
+            operation.run(until: {
+                asked += 1
+                return true
+            }) == nil)
+        #expect(asked == 1)
+        #if os(macOS)
+        #expect(try fixture.image.block(8) == [UInt8](repeating: 0, count: 512))
+        #endif
+        #expect(try fixture.image.block(32) == [UInt8](repeating: 32, count: 512))
+    }
+
+    /// A pattern goes to the image a run per request, and a canceled WRITE
+    /// SAME stops between runs; zeros go in one request, which runs.
+    @Test func aCanceledWriteSameStopsBetweenRuns() throws {
+        let run = SCSIDiskImage.patternRunLength / 512
+        let blocks = 2 * run
+        let fixture = try DiskFixture(blocks: blocks)
+        var cdb: [UInt8] = [0x93, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        cdb.appendBigEndian(UInt32(blocks))
+        cdb += [0, 0]
+        let block = [UInt8](repeating: 0x5a, count: 512)
+        let pattern = try #require(SCSICommand(cdb, blockSize: 512))
+        guard case .waiting(let operation) = fixture.disk.execute(pattern, dataOut: SCSIDataOut(bytes: block), dataIn: SCSIDataBuffer()) else {
+            Issue.record("a WRITE SAME waits on its operation")
+            return
+        }
+        var asked = 0
+        #expect(
+            operation.run(until: {
+                asked += 1
+                return true
+            }) == nil)
+        #expect(asked == 1)
+        #expect(try fixture.image.block(run - 1) == block)
+        #expect(try fixture.image.block(run) == [UInt8](repeating: UInt8(truncatingIfNeeded: run), count: 512))
+
+        // NDOB: zeros.
+        cdb[1] = 0x01
+        let zeros = try #require(SCSICommand(cdb, blockSize: 512))
+        guard case .waiting(let zeroing) = fixture.disk.execute(zeros, dataOut: SCSIDataOut(), dataIn: SCSIDataBuffer()) else {
+            Issue.record("a WRITE SAME waits on its operation")
+            return
+        }
+        #expect(zeroing.run(until: { true }) == .good)
+        #expect(try fixture.image.block(blocks - 1) == [UInt8](repeating: 0, count: 512))
     }
 
     @Test func unmapRefusals() throws {

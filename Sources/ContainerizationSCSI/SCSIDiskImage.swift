@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 import ContainerizationError
+import Synchronization
 
 #if canImport(Darwin)
 import Darwin
@@ -31,7 +32,11 @@ import Glibc
 /// discard in block/io.c, at d7a65d1793d6:
 /// https://github.com/qemu/qemu/blob/d7a65d1793d6/block/file-posix.c
 /// https://github.com/qemu/qemu/blob/d7a65d1793d6/block/io.c
-public final class SCSIDiskImage {
+///
+/// Operations on the image run on several threads at once, as the file
+/// driver's do on QEMU's thread pool: each is a positioned call on the one
+/// descriptor, and the image's only mutable state is atomic.
+public final class SCSIDiskImage: @unchecked Sendable {
     /// Whether the host's page cache holds the image's data (QEMU's
     /// cache.direct).
     public enum Caching: Sendable {
@@ -63,7 +68,9 @@ public final class SCSIDiskImage {
     public let readOnly: Bool
     public let caching: Caching
     public let synchronization: Synchronization
-    private let descriptor: Int32
+    /// The open image, or -1 once it is closed.
+    private let openDescriptor: Atomic<Int32>
+    private var descriptor: Int32 { openDescriptor.load(ordering: .acquiring) }
     /// The granularity a hole can be punched at: the file system's block
     /// size, as file-posix.c takes it for pdiscard_alignment on macOS.
     private let discardAlignment: UInt64
@@ -82,7 +89,7 @@ public final class SCSIDiskImage {
         }
         guard flock(descriptor, (readOnly ? LOCK_SH : LOCK_EX) | LOCK_NB) == 0 else {
             let error = errno
-            close(descriptor)
+            _ = closeDescriptor(descriptor)
             guard error == EWOULDBLOCK else {
                 throw ContainerizationError(.internalError, message: "failed to lock disk image \(path): \(String(cString: strerror(error)))")
             }
@@ -95,12 +102,22 @@ public final class SCSIDiskImage {
         self.readOnly = readOnly
         self.caching = caching
         self.synchronization = synchronization
-        self.descriptor = descriptor
+        self.openDescriptor = Atomic(descriptor)
         self.discardAlignment = Self.fileSystemBlockSize(descriptor)
     }
 
     deinit {
-        close(descriptor)
+        close()
+    }
+
+    /// Closes the image, which lets go of its lock. Called once no
+    /// operation can reach the image any more; one that did would fail as on
+    /// a closed file.
+    public func close() {
+        let descriptor = openDescriptor.exchange(-1, ordering: .acquiringAndReleasing)
+        if descriptor >= 0 {
+            _ = closeDescriptor(descriptor)
+        }
     }
 
     private static func fileSystemBlockSize(_ descriptor: Int32) -> UInt64 {
@@ -199,10 +216,12 @@ public final class SCSIDiskImage {
     /// in hw/scsi/scsi-disk.c).
     static let patternRunLength = 512 * 1024
 
-    /// Writes `pattern` again and again over `length` bytes from `offset`.
-    func write(repeating pattern: [UInt8], length: UInt64, at offset: UInt64) throws {
+    /// Writes `pattern` again and again over `length` bytes from `offset`,
+    /// a run at a time. Between two runs it calls `betweenRuns`, and stops
+    /// when that returns false. Returns whether it wrote the whole range.
+    func write(repeating pattern: [UInt8], length: UInt64, at offset: UInt64, betweenRuns: () throws -> Bool) throws -> Bool {
         guard !pattern.isEmpty else {
-            return
+            return true
         }
         let runLength = Int(min(length, UInt64(Self.patternRunLength)))
         var run = [UInt8]()
@@ -212,12 +231,16 @@ public final class SCSIDiskImage {
         }
         var done: UInt64 = 0
         while done < length {
+            guard try done == 0 || betweenRuns() else {
+                return false
+            }
             let count = Int(min(length - done, UInt64(run.count)))
             try run.withUnsafeBytes { bytes in
                 try write([UnsafeRawBufferPointer(rebasing: bytes.prefix(count))], count: count, at: offset + done)
             }
             done += UInt64(count)
         }
+        return true
     }
 
     /// Makes what the image has written so far reach what its
@@ -270,13 +293,13 @@ public final class SCSIDiskImage {
     }
 
     /// Whether the file system punches holes, until it first refuses to.
-    private var punchesHoles = true
+    private let punchesHoles = Atomic(true)
 
     /// Punches a hole as handle_aiocb_discard does on macOS: F_PUNCHHOLE,
     /// with ENODEV taken for ENOTSUP. Elsewhere the image keeps its data.
     private func punchHole(offset: UInt64, length: UInt64) throws {
         #if canImport(Darwin)
-        guard punchesHoles else {
+        guard punchesHoles.load(ordering: .relaxed) else {
             return
         }
         var hole = fpunchhole_t(fp_flags: 0, reserved: 0, fp_offset: off_t(offset), fp_length: off_t(length))
@@ -286,7 +309,7 @@ public final class SCSIDiskImage {
         let error = errno
         switch error {
         case ENOTSUP, ENODEV:
-            punchesHoles = false
+            punchesHoles.store(false, ordering: .relaxed)
         case EINVAL where offset % discardAlignment != 0 || length % discardAlignment != 0:
             break
         default:
@@ -294,4 +317,15 @@ public final class SCSIDiskImage {
         }
         #endif
     }
+}
+
+/// The C library's close, which the image's own `close()` hides inside it.
+private func closeDescriptor(_ descriptor: Int32) -> Int32 {
+    #if canImport(Darwin)
+    Darwin.close(descriptor)
+    #elseif canImport(Musl)
+    Musl.close(descriptor)
+    #elseif canImport(Glibc)
+    Glibc.close(descriptor)
+    #endif
 }

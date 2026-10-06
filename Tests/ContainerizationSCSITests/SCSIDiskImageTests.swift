@@ -119,7 +119,14 @@ struct SCSIDiskImageTests {
         let file = try SCSIDiskImage(path: image.path, readOnly: false)
         // Past one run of the pattern.
         let pattern = (0..<512).map { UInt8(truncatingIfNeeded: $0 * 7) }
-        try file.write(repeating: pattern, length: 1536 * 512, at: 512)
+        var between = 0
+        let finished = try file.write(repeating: pattern, length: 1536 * 512, at: 512) {
+            between += 1
+            return true
+        }
+        #expect(finished)
+        // Two runs, and a call between them.
+        #expect(between == 1)
         let contents = try image.contents()
         #expect(Array(contents[0..<512]) == [UInt8](repeating: 0, count: 512))
         for block in [1, 1024, 1025, 1536] {

@@ -141,9 +141,17 @@ public final class SCSIDisk {
         raiseUnitAttention(.reset)
     }
 
+    /// Where a command left off once the disk took it.
+    enum Outcome {
+        /// The command completed; what it returns is in its data-in buffer.
+        case completed(SCSICompletion)
+        /// The command completes once `operation` has run on the image.
+        case waiting(SCSIOperation)
+    }
+
     /// Runs `command`, reading what it sends from `dataOut` and leaving what
-    /// it returns in `dataIn`.
-    func execute(_ command: SCSICommand, dataOut: SCSIDataOut, dataIn: SCSIDataBuffer) -> SCSICompletion {
+    /// it returns in `dataIn`, or hands back the image operation it waits on.
+    func execute(_ command: SCSICommand, dataOut: SCSIDataOut, dataIn: SCSIDataBuffer) -> Outcome {
         switch command.opcode {
         case SCSIOpcode.read6, SCSIOpcode.read10, SCSIOpcode.read12, SCSIOpcode.read16:
             return read(command, into: dataIn)
@@ -151,7 +159,29 @@ public final class SCSIDisk {
             SCSIOpcode.writeAndVerify12, SCSIOpcode.writeAndVerify16:
             return write(command, from: dataOut)
         default:
-            return emulate(command, dataOut: dataOut, dataIn: dataIn)
+            break
+        }
+        // Emulated commands (scsi_disk_emulate_command).
+        guard command.transferLength <= Self.maximumEmulatedTransfer else {
+            return .completed(.checkCondition(.invalidFieldInCDB))
+        }
+        switch command.opcode {
+        case SCSIOpcode.synchronizeCache10:
+            return .waiting(SCSIOperation(image: image, kind: .flush))
+        case SCSIOpcode.modeSelect6, SCSIOpcode.modeSelect10:
+            guard command.transferLength > 0 else {
+                return .completed(.good)
+            }
+            return modeSelect(command.cdb, parameters: dataOut.bytes(command.transferLength))
+        case SCSIOpcode.unmap:
+            guard command.transferLength > 0 else {
+                return .completed(.good)
+            }
+            return unmap(command.cdb, parameters: dataOut.bytes(command.transferLength))
+        case SCSIOpcode.writeSame10, SCSIOpcode.writeSame16:
+            return writeSame(command, block: dataOut.bytes(command.transferLength))
+        default:
+            return .completed(emulate(command, dataIn: dataIn))
         }
     }
 
@@ -170,81 +200,67 @@ public final class SCSIDisk {
         }
     }
 
-    /// Whether `blocks` blocks from `lba` lie within the disk; zero blocks
-    /// just past its end do (check_lba_range).
-    private func addresses(_ lba: UInt64, blocks: UInt64) -> Bool {
+    /// Whether `blocks` blocks from `lba` lie within a disk whose last block
+    /// is `lastBlock`; zero blocks just past its end do (check_lba_range).
+    static func addresses(_ lba: UInt64, blocks: UInt64, lastBlock: UInt64) -> Bool {
         let (end, overflow) = lba.addingReportingOverflow(blocks)
         return !overflow && end <= lastBlock + 1
     }
 
-    private func read(_ command: SCSICommand, into dataIn: SCSIDataBuffer) -> SCSICompletion {
+    private func addresses(_ lba: UInt64, blocks: UInt64) -> Bool {
+        Self.addresses(lba, blocks: blocks, lastBlock: lastBlock)
+    }
+
+    private func read(_ command: SCSICommand, into dataIn: SCSIDataBuffer) -> Outcome {
         // RDPROTECT: protection information is not supported.
         guard command.cdb[1] & 0xe0 == 0 else {
-            return .checkCondition(.invalidFieldInCDB)
+            return .completed(.checkCondition(.invalidFieldInCDB))
         }
         let blocks = UInt64(command.transferLength / Self.blockSize)
         guard addresses(command.lba, blocks: blocks) else {
-            return .checkCondition(.lbaOutOfRange)
+            return .completed(.checkCondition(.lbaOutOfRange))
         }
         guard blocks > 0 else {
-            return .good
+            return .completed(.good)
         }
-        return perform {
-            if Self.forcesUnitAccess(command.cdb) {
-                try image.flush()
-            }
-            try image.read(into: dataIn.prepare(command.transferLength), at: command.lba * UInt64(Self.blockSize))
-        } failed: {
-            dataIn.clear()
-        }
+        return .waiting(
+            SCSIOperation(
+                image: image,
+                kind: .read(offset: command.lba * UInt64(Self.blockSize), flushFirst: Self.forcesUnitAccess(command.cdb)),
+                destination: dataIn.prepare(command.transferLength)
+            ))
     }
 
-    private func write(_ command: SCSICommand, from dataOut: SCSIDataOut) -> SCSICompletion {
+    private func write(_ command: SCSICommand, from dataOut: SCSIDataOut) -> Outcome {
         guard !image.readOnly else {
-            return .checkCondition(.writeProtected)
+            return .completed(.checkCondition(.writeProtected))
         }
         // WRPROTECT: protection information is not supported.
         guard command.cdb[1] & 0xe0 == 0 else {
-            return .checkCondition(.invalidFieldInCDB)
+            return .completed(.checkCondition(.invalidFieldInCDB))
         }
         let blocks = UInt64(command.transferLength / Self.blockSize)
         guard addresses(command.lba, blocks: blocks) else {
-            return .checkCondition(.lbaOutOfRange)
+            return .completed(.checkCondition(.lbaOutOfRange))
         }
         guard blocks > 0 else {
-            return .good
+            return .completed(.good)
         }
-        return perform {
-            try image.write(dataOut.buffers, count: command.transferLength, at: command.lba * UInt64(Self.blockSize))
-            // The block layer writes through when the cache is off, and
-            // completes a forced unit access with a flush (bdrv_co_do_pwritev).
-            if Self.forcesUnitAccess(command.cdb) || !writeCacheEnabled {
-                try image.flush()
-            }
-        }
-    }
-
-    /// Runs `body`, reporting a failed host call the way QEMU reports it to
-    /// the guest (scsi_handle_rw_error with the report error action).
-    private func perform(_ body: () throws -> Void, failed: () -> Void = {}) -> SCSICompletion {
-        do {
-            try body()
-            return .good
-        } catch let error as SCSIDiskImage.HostError {
-            failed()
-            return .hostError(error.code)
-        } catch {
-            failed()
-            return .checkCondition(.ioProcessTerminated)
-        }
+        // The block layer writes through when the cache is off, and completes
+        // a forced unit access with a flush (bdrv_co_do_pwritev).
+        let flushAfter = Self.forcesUnitAccess(command.cdb) || !writeCacheEnabled
+        return .waiting(
+            SCSIOperation(
+                image: image,
+                kind: .write(offset: command.lba * UInt64(Self.blockSize), length: command.transferLength, flushAfter: flushAfter),
+                source: dataOut
+            ))
     }
 
     // MARK: - Emulated commands (scsi_disk_emulate_command)
 
-    private func emulate(_ command: SCSICommand, dataOut: SCSIDataOut, dataIn: SCSIDataBuffer) -> SCSICompletion {
-        guard command.transferLength <= Self.maximumEmulatedTransfer else {
-            return .checkCondition(.invalidFieldInCDB)
-        }
+    /// The emulated commands that complete without the image.
+    private func emulate(_ command: SCSICommand, dataIn: SCSIDataBuffer) -> SCSICompletion {
         let cdb = command.cdb
         switch command.opcode {
         case SCSIOpcode.testUnitReady, SCSIOpcode.startStopUnit, SCSIOpcode.preventAllowMediumRemoval:
@@ -273,26 +289,12 @@ public final class SCSIDisk {
             // Sense a command left behind is the bus's to report; here there
             // is none.
             return respond(SCSISense.noSense.data(descriptorFormat: cdb[1] & 0x01 != 0), to: command, in: dataIn)
-        case SCSIOpcode.synchronizeCache10:
-            return perform { try image.flush() }
         case SCSIOpcode.seek10:
             return command.lba > lastBlock ? .checkCondition(.lbaOutOfRange) : .good
         case SCSIOpcode.verify10, SCSIOpcode.verify12, SCSIOpcode.verify16:
             // BYTCHK: comparing the medium against sent data is not
             // supported; without it there is nothing to verify.
             return cdb[1] & 0x06 != 0 ? .checkCondition(.invalidFieldInCDB) : .good
-        case SCSIOpcode.modeSelect6, SCSIOpcode.modeSelect10:
-            guard command.transferLength > 0 else {
-                return .good
-            }
-            return modeSelect(cdb, parameters: dataOut.bytes(command.transferLength))
-        case SCSIOpcode.unmap:
-            guard command.transferLength > 0 else {
-                return .good
-            }
-            return unmap(cdb, parameters: dataOut.bytes(command.transferLength))
-        case SCSIOpcode.writeSame10, SCSIOpcode.writeSame16:
-            return writeSame(command, block: dataOut.bytes(command.transferLength))
         case SCSIOpcode.formatUnit:
             // The medium is formatted already; a parameter list header
             // changes nothing.
@@ -508,33 +510,33 @@ public final class SCSIDisk {
 
     /// MODE SELECT (scsi_disk_emulate_mode_select): every page is checked
     /// before any changes, so a bad list changes nothing.
-    private func modeSelect(_ cdb: [UInt8], parameters: [UInt8]) -> SCSICompletion {
+    private func modeSelect(_ cdb: [UInt8], parameters: [UInt8]) -> Outcome {
         // Only PF=1 and SP=0: page format, nothing saved.
         guard cdb[1] & 0x11 == 0x10 else {
-            return .checkCondition(.invalidFieldInCDB)
+            return .completed(.checkCondition(.invalidFieldInCDB))
         }
         let sixByte = cdb[0] == SCSIOpcode.modeSelect6
         let headerLength = sixByte ? 4 : 8
         guard parameters.count >= headerLength else {
-            return .checkCondition(.parameterListLengthError)
+            return .completed(.checkCondition(.parameterListLengthError))
         }
         let descriptorsLength = sixByte ? Int(parameters[3]) : Int(parameters.bigEndian16(at: 6))
         guard parameters.count - headerLength >= descriptorsLength else {
-            return .checkCondition(.parameterListLengthError)
+            return .completed(.checkCondition(.parameterListLengthError))
         }
         guard descriptorsLength == 0 || descriptorsLength == 8 else {
-            return .checkCondition(.invalidFieldInParameterList)
+            return .completed(.checkCondition(.invalidFieldInParameterList))
         }
         let pages = Array(parameters[(headerLength + descriptorsLength)...])
         if let sense = selectModePages(pages, apply: false) {
-            return .checkCondition(sense)
+            return .completed(.checkCondition(sense))
         }
         _ = selectModePages(pages, apply: true)
         guard writeCacheEnabled else {
             // Turning the cache off makes what it held reach the medium.
-            return perform { try image.flush() }
+            return .waiting(SCSIOperation(image: image, kind: .flush))
         }
-        return .good
+        return .completed(.good)
     }
 
     private func selectModePages(_ pages: [UInt8], apply: Bool) -> SCSISense? {
@@ -624,35 +626,28 @@ public final class SCSIDisk {
 
     /// UNMAP (scsi_disk_emulate_unmap): each block descriptor in turn, until
     /// one falls outside the disk.
-    private func unmap(_ cdb: [UInt8], parameters: [UInt8]) -> SCSICompletion {
+    private func unmap(_ cdb: [UInt8], parameters: [UInt8]) -> Outcome {
         // ANCHOR is not supported.
         guard cdb[1] & 0x01 == 0 else {
-            return .checkCondition(.invalidFieldInCDB)
+            return .completed(.checkCondition(.invalidFieldInCDB))
         }
         guard parameters.count >= 8, parameters.count >= Int(parameters.bigEndian16(at: 0)) + 2 else {
-            return .checkCondition(.parameterListLengthError)
+            return .completed(.checkCondition(.parameterListLengthError))
         }
         let descriptorsLength = Int(parameters.bigEndian16(at: 2))
         guard parameters.count >= descriptorsLength + 8, descriptorsLength & 15 == 0 else {
-            return .checkCondition(.parameterListLengthError)
+            return .completed(.checkCondition(.parameterListLengthError))
         }
         guard !image.readOnly else {
-            return .checkCondition(.writeProtected)
+            return .completed(.checkCondition(.writeProtected))
         }
-        for offset in stride(from: 8, to: 8 + descriptorsLength, by: 16) {
-            let lba = parameters.bigEndian64(at: offset)
-            let blocks = UInt64(parameters.bigEndian32(at: offset + 8))
-            guard addresses(lba, blocks: blocks) else {
-                return .checkCondition(.lbaOutOfRange)
-            }
-            let completion = perform {
-                try image.discard(offset: lba * UInt64(Self.blockSize), length: blocks * UInt64(Self.blockSize))
-            }
-            guard completion == .good else {
-                return completion
-            }
+        let ranges = stride(from: 8, to: 8 + descriptorsLength, by: 16).map { offset in
+            (lba: parameters.bigEndian64(at: offset), blocks: UInt64(parameters.bigEndian32(at: offset + 8)))
         }
-        return .good
+        guard !ranges.isEmpty else {
+            return .completed(.good)
+        }
+        return .waiting(SCSIOperation(image: image, kind: .unmap(ranges: ranges, lastBlock: lastBlock)))
     }
 
     /// WRITE SAME (scsi_disk_emulate_write_same): one block written over a
@@ -663,32 +658,28 @@ public final class SCSIDisk {
     /// but its emulation completes a command that transfers no data before
     /// the routine runs, so there NDOB writes nothing. Here it writes the
     /// zeros SBC asks for.
-    private func writeSame(_ command: SCSICommand, block: [UInt8]) -> SCSICompletion {
+    private func writeSame(_ command: SCSICommand, block: [UInt8]) -> Outcome {
         let cdb = command.cdb
         let blocks = UInt64(cdb[0] == SCSIOpcode.writeSame10 ? UInt32(cdb.bigEndian16(at: 7)) : cdb.bigEndian32(at: 10))
         // Zero blocks, which would mean to the end of the medium, ANCHOR,
         // PBDATA and LBDATA are not supported.
         guard blocks != 0, cdb[1] & 0x16 == 0 else {
-            return .checkCondition(.invalidFieldInCDB)
+            return .completed(.checkCondition(.invalidFieldInCDB))
         }
         guard !image.readOnly else {
-            return .checkCondition(.writeProtected)
+            return .completed(.checkCondition(.writeProtected))
         }
         guard addresses(command.lba, blocks: blocks) else {
-            return .checkCondition(.lbaOutOfRange)
+            return .completed(.checkCondition(.lbaOutOfRange))
         }
+        let offset = command.lba * UInt64(Self.blockSize)
+        let length = blocks * UInt64(Self.blockSize)
         // NDOB sends no block: the range is written with zeros.
-        let pattern = block.isEmpty ? [UInt8](repeating: 0, count: Self.blockSize) : block
-        return perform {
-            try image.write(
-                repeating: pattern,
-                length: blocks * UInt64(Self.blockSize),
-                at: command.lba * UInt64(Self.blockSize)
-            )
-            if !writeCacheEnabled {
-                try image.flush()
-            }
+        guard block.contains(where: { $0 != 0 }) else {
+            return .waiting(SCSIOperation(image: image, kind: .writeZeros(offset: offset, length: length, flushAfter: !writeCacheEnabled)))
         }
+        return .waiting(
+            SCSIOperation(image: image, kind: .writeSame(pattern: block, offset: offset, length: length, flushAfter: !writeCacheEnabled)))
     }
 }
 

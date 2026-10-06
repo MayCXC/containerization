@@ -148,21 +148,15 @@ final class SCSIBus {
         return Request(route: answeredByBus ? .target(command) : .device(command), command: command, address: address, device: device)
     }
 
-    /// Runs a routed command.
-    ///
-    /// The sense of a command that fails goes back with its response, and
-    /// the device keeps it for REQUEST SENSE until a command succeeds
-    /// (scsi_req_complete). A unit attention condition is reported once:
-    /// the response carries it, so the device keeps nothing of it
-    /// (scsi_req_get_sense).
-    func execute(_ request: Request, dataOut: SCSIDataOut, dataIn: SCSIDataBuffer) -> SCSICompletion {
+    /// Runs a routed command, or hands back the image operation it waits
+    /// on; `finish` completes it once the operation has run.
+    func execute(_ request: Request, dataOut: SCSIDataOut, dataIn: SCSIDataBuffer) -> SCSIDisk.Outcome {
         dataIn.clear()
-        let disk = request.device.disk
         let completion: SCSICompletion
         switch request.route {
         case .unitAttention(let sense):
-            disk.deferredSense = nil
-            return .checkCondition(sense)
+            request.device.disk.deferredSense = nil
+            return .completed(.checkCondition(sense))
         case .invalidOperationCode:
             completion = .checkCondition(.invalidOperationCode)
         case .invalidField:
@@ -170,8 +164,25 @@ final class SCSIBus {
         case .target(let command):
             completion = answer(command, of: request, dataIn: dataIn)
         case .device(let command):
-            completion = disk.execute(command, dataOut: dataOut, dataIn: dataIn)
+            switch request.device.disk.execute(command, dataOut: dataOut, dataIn: dataIn) {
+            case .completed(let done):
+                completion = done
+            case .waiting(let operation):
+                return .waiting(operation)
+            }
         }
+        return .completed(finish(request, completion, dataIn: dataIn))
+    }
+
+    /// Completes a command with `completion`.
+    ///
+    /// The sense of a command that fails goes back with its response, and
+    /// the device keeps it for REQUEST SENSE until a command succeeds,
+    /// whichever command completes last setting it (scsi_req_complete). A
+    /// unit attention condition is reported once: the response carries it,
+    /// so the device keeps nothing of it (scsi_req_get_sense).
+    func finish(_ request: Request, _ completion: SCSICompletion, dataIn: SCSIDataBuffer) -> SCSICompletion {
+        let disk = request.device.disk
         if completion.status == .good {
             disk.deferredSense = nil
         } else {

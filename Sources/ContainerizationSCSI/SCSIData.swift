@@ -14,23 +14,67 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
-/// The data a command sends to the device, left in the initiator's buffers.
-struct SCSIDataOut {
-    let buffers: [UnsafeRawBufferPointer]
+/// The data a command sends to the device, left in the initiator's buffers,
+/// where an image operation can read it from any thread.
+struct SCSIDataOut: Sendable {
+    let source: any VirtioReadableData
+
+    /// Data held in byte arrays, as the transport hands no buffers over.
+    init(bytes: [UInt8] = []) {
+        source = HeldBytes(pieces: bytes.isEmpty ? [] : [bytes])
+    }
+
+    init(_ source: any VirtioReadableData) {
+        self.source = source
+    }
 
     /// The first `length` bytes, copied out.
     func bytes(_ length: Int) -> [UInt8] {
-        var bytes = [UInt8]()
-        bytes.reserveCapacity(length)
-        for buffer in buffers where bytes.count < length {
-            bytes.append(contentsOf: buffer.prefix(length - bytes.count))
+        source.withBuffers { buffers in
+            var bytes = [UInt8]()
+            bytes.reserveCapacity(length)
+            for buffer in buffers where bytes.count < length {
+                bytes.append(contentsOf: buffer.prefix(length - bytes.count))
+            }
+            return bytes
         }
-        return bytes
+    }
+
+    func withBuffers<Result>(_ body: ([UnsafeRawBufferPointer]) throws -> Result) rethrows -> Result {
+        try source.withBuffers(body)
+    }
+}
+
+/// Data a driver wrote, held in one byte array and handed over as the
+/// pieces it came in.
+struct HeldBytes: VirtioReadableData {
+    private let bytes: [UInt8]
+    private let lengths: [Int]
+
+    init(pieces: [[UInt8]]) {
+        bytes = pieces.flatMap { $0 }
+        lengths = pieces.map(\.count)
+    }
+
+    func withBuffers<Result>(_ body: ([UnsafeRawBufferPointer]) throws -> Result) rethrows -> Result {
+        try bytes.withUnsafeBytes { all in
+            var buffers: [UnsafeRawBufferPointer] = []
+            buffers.reserveCapacity(lengths.count)
+            var offset = 0
+            for length in lengths {
+                buffers.append(UnsafeRawBufferPointer(rebasing: all[offset..<(offset + length)]))
+                offset += length
+            }
+            return try body(buffers)
+        }
     }
 }
 
 /// The data a command returns to the initiator, held until the command
 /// completes: a virtio-scsi response carries its status ahead of its data.
+///
+/// A read's operation fills the bytes `prepare` handed out on another
+/// thread; nothing else touches the buffer until the operation has run.
 final class SCSIDataBuffer {
     private var storage: UnsafeMutableRawBufferPointer
     private(set) var count = 0

@@ -88,14 +88,88 @@ struct DiskFixture {
     }
 
     /// Runs `cdb` on the disk itself, past the bus: no unit attention, no
-    /// deferred sense.
+    /// deferred sense. An image operation runs before it returns.
     func run(_ cdb: [UInt8], dataOut: [UInt8] = []) throws -> (completion: SCSICompletion, data: [UInt8]) {
         let command = try #require(SCSICommand(cdb, blockSize: 512))
         let dataIn = SCSIDataBuffer(capacity: 4096)
-        let completion = dataOut.withUnsafeBytes { bytes in
-            disk.execute(command, dataOut: SCSIDataOut(buffers: [bytes]), dataIn: dataIn)
+        let completion: SCSICompletion
+        switch disk.execute(command, dataOut: SCSIDataOut(bytes: dataOut), dataIn: dataIn) {
+        case .completed(let done):
+            completion = done
+        case .waiting(let operation):
+            completion = try #require(operation.run())
+            if completion != .good {
+                dataIn.clear()
+            }
         }
         return (completion, Array(dataIn.content))
+    }
+}
+
+/// Runs each operation, then its completion, as it is submitted.
+final class InlineExecutor: SCSIOperationExecutor {
+    func submit(_ operation: @escaping @Sendable () -> Void, completion: @escaping @Sendable () -> Void) {
+        operation()
+        completion()
+    }
+
+    func waitForRunningOperations() {}
+}
+
+/// Holds the operations submitted to it until a test runs them, in any
+/// order, and delivers their completions when the test says.
+final class ManualExecutor: SCSIOperationExecutor, @unchecked Sendable {
+    private struct Submission {
+        let operation: @Sendable () -> Void
+        let completion: @Sendable () -> Void
+        var ran = false
+        var completed = false
+    }
+
+    private var submissions: [Submission] = []
+
+    /// The operations submitted so far.
+    var submitted: Int { submissions.count }
+    /// The operations submitted and not yet run.
+    var pending: Int { submissions.filter { !$0.ran }.count }
+
+    func submit(_ operation: @escaping @Sendable () -> Void, completion: @escaping @Sendable () -> Void) {
+        submissions.append(Submission(operation: operation, completion: completion))
+    }
+
+    /// Runs the operation of the `index`th submission, if it has not run.
+    func run(_ index: Int) {
+        guard !submissions[index].ran else {
+            return
+        }
+        submissions[index].ran = true
+        submissions[index].operation()
+    }
+
+    /// Delivers the completion of the `index`th submission, which runs its
+    /// operation first if it has not.
+    func complete(_ index: Int) {
+        run(index)
+        guard !submissions[index].completed else {
+            return
+        }
+        submissions[index].completed = true
+        submissions[index].completion()
+    }
+
+    /// Delivers every completion not yet delivered, in submission order.
+    func completeAll() {
+        for index in submissions.indices {
+            complete(index)
+        }
+    }
+
+    /// Every operation submitted runs, as the pool's threads finish what
+    /// they started; their completions wait.
+    func waitForRunningOperations() {
+        for index in submissions.indices {
+            run(index)
+        }
     }
 }
 
@@ -138,20 +212,10 @@ final class MemoryChain: VirtioDescriptorChain {
         return true
     }
 
-    /// The remaining pieces, held in one array and handed over as the
-    /// buffers they were.
-    func readRemaining<Result>(_ body: ([UnsafeRawBufferPointer]) throws -> Result) rethrows -> Result {
+    func takeReadable() -> any VirtioReadableData {
         let pieces = readable
         readable = []
-        return try pieces.flatMap { $0 }.withUnsafeBytes { all in
-            var buffers: [UnsafeRawBufferPointer] = []
-            var offset = 0
-            for piece in pieces {
-                buffers.append(UnsafeRawBufferPointer(rebasing: all[offset..<(offset + piece.count)]))
-                offset += piece.count
-            }
-            return try body(buffers)
-        }
+        return HeldBytes(pieces: pieces)
     }
 
     func write(_ bytes: UnsafeRawBufferPointer) -> Bool {
@@ -162,8 +226,12 @@ final class MemoryChain: VirtioDescriptorChain {
         return true
     }
 
+    /// Called each time the chain completes.
+    var onComplete: (() -> Void)?
+
     func complete() {
         completions += 1
+        onComplete?()
     }
 }
 
@@ -192,10 +260,10 @@ let testUnitReady: [UInt8] = [0x00, 0, 0, 0, 0, 0]
 
 /// A virtio-scsi command request: the LUN address, a tag, task attribute,
 /// priority and CRN, then the CDB padded to the configured 32 bytes.
-func commandRequest(target: UInt8 = 0, lun: UInt16 = 0, cdb: [UInt8]) -> [UInt8] {
+func commandRequest(target: UInt8 = 0, lun: UInt16 = 0, tag: UInt64 = 0, cdb: [UInt8]) -> [UInt8] {
     var request: [UInt8] = [1, target]
     request += SCSIBus.encode(lun: lun) + [0, 0, 0, 0]
-    request += [UInt8](repeating: 0, count: 8)
+    request.appendLittleEndian(tag)
     request += [0, 0, 0]
     request += cdb + [UInt8](repeating: 0, count: 32 - cdb.count)
     return request

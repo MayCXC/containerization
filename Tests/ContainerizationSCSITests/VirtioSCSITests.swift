@@ -20,12 +20,15 @@ import Testing
 @testable import ContainerizationSCSI
 
 /// A host adapter with disks attached, and the requests a driver sends it.
+/// Its operations run as they are submitted unless the fixture is given an
+/// executor that holds them.
 final class ControllerFixture {
-    let controller = VirtioSCSIController()
+    let controller: VirtioSCSIController
     private(set) var deviceErrors: [String] = []
     private var images: [TemporaryImage] = []
 
-    init() {
+    init(executor: any SCSIOperationExecutor = InlineExecutor(), requestQueues: Int = 1) {
+        controller = VirtioSCSIController(requestQueues: requestQueues, executor: executor)
         controller.onDeviceError = { [weak self] reason in
             self?.deviceErrors.append(reason)
         }
@@ -50,10 +53,21 @@ final class ControllerFixture {
     /// Sends a command request with the data the driver writes and room for
     /// `dataIn` bytes the device returns, and returns its chain.
     @discardableResult
-    func send(target: UInt8 = 0, lun: UInt16 = 0, cdb: [UInt8], dataOut: [[UInt8]] = [], dataIn: Int = 0) -> MemoryChain {
-        let chain = MemoryChain(readable: [commandRequest(target: target, lun: lun, cdb: cdb)] + dataOut, writable: 108 + dataIn)
+    func send(target: UInt8 = 0, lun: UInt16 = 0, tag: UInt64 = 0, cdb: [UInt8], dataOut: [[UInt8]] = [], dataIn: Int = 0) -> MemoryChain {
+        let chain = request(target: target, lun: lun, tag: tag, cdb: cdb, dataOut: dataOut, dataIn: dataIn)
         controller.handleRequest(chain)
         return chain
+    }
+
+    /// A command request's chain, not yet sent.
+    func request(target: UInt8 = 0, lun: UInt16 = 0, tag: UInt64 = 0, cdb: [UInt8], dataOut: [[UInt8]] = [], dataIn: Int = 0) -> MemoryChain {
+        MemoryChain(readable: [commandRequest(target: target, lun: lun, tag: tag, cdb: cdb)] + dataOut, writable: 108 + dataIn)
+    }
+
+    /// Sends `chains` as a request queue holds them, all taken in one pass.
+    func send(_ chains: [MemoryChain]) {
+        var remaining = chains[...]
+        controller.handleRequests { remaining.popFirst() }
     }
 
     func response(target: UInt8 = 0, lun: UInt16 = 0, cdb: [UInt8], dataOut: [[UInt8]] = [], dataIn: Int = 0) throws -> CommandResponse {
@@ -68,12 +82,12 @@ final class ControllerFixture {
 }
 
 /// struct virtio_scsi_ctrl_tmf: the type, the function, the LUN and a tag.
-private func taskManagement(_ function: UInt32, target: UInt8 = 0, lun: UInt16 = 0, addressing: UInt8 = 1) -> [UInt8] {
+func taskManagement(_ function: UInt32, target: UInt8 = 0, lun: UInt16 = 0, addressing: UInt8 = 1, tag: UInt64 = 0x1234) -> [UInt8] {
     var request = [UInt8]()
     request.appendLittleEndian(UInt32(0))
     request.appendLittleEndian(function)
     request += [addressing, target] + SCSIBus.encode(lun: lun) + [0, 0, 0, 0]
-    request.appendLittleEndian(UInt64(0x1234))
+    request.appendLittleEndian(tag)
     return request
 }
 
@@ -100,6 +114,26 @@ private let eventsMissed: UInt32 = 0x8000_0000
 private let rescan: UInt32 = 1
 private let removed: UInt32 = 2
 
+/// READ (10) and WRITE (10) of one block.
+private func read10(_ lba: UInt8) -> [UInt8] {
+    [0x28, 0, 0, 0, 0, lba, 0, 0, 1, 0]
+}
+
+private func write10(_ lba: UInt8) -> [UInt8] {
+    [0x2a, 0, 0, 0, 0, lba, 0, 0, 1, 0]
+}
+
+/// The order chains complete in, by name.
+private final class CompletionOrder {
+    private(set) var names: [String] = []
+
+    func watch(_ chain: MemoryChain, as name: String) {
+        chain.onComplete = { [weak self] in
+            self?.names.append(name)
+        }
+    }
+}
+
 /// The transport, held against QEMU's virtio-scsi device (hw/scsi/virtio-scsi.c
 /// at d7a65d1793d6) and the virtio specification's section 5.6.
 struct VirtioSCSITests {
@@ -108,7 +142,7 @@ struct VirtioSCSITests {
         // seg_max sized by the queue (256 - 2), max_sectors 0xFFFF,
         // cmd_per_lun 128, a 16-byte event, 96 bytes of sense, a 32-byte CDB,
         // channel 0, target 255 and LUN 16383.
-        let controller = VirtioSCSIController(requestQueues: 4)
+        let controller = VirtioSCSIController(requestQueues: 4, executor: InlineExecutor())
         #expect(
             controller.configurationSpace == [
                 4, 0, 0, 0, 254, 0, 0, 0, 0xff, 0xff, 0, 0, 128, 0, 0, 0, 16, 0, 0, 0, 96, 0, 0, 0, 32, 0, 0, 0, 0, 0, 255, 0, 0xff, 0x3f, 0, 0,
@@ -127,7 +161,7 @@ struct VirtioSCSITests {
         #expect(VirtioSCSIController.requestQueueCount(cpus: 1) == 1)
         #expect(VirtioSCSIController.requestQueueCount(cpus: 8) == 8)
         #expect(VirtioSCSIController.requestQueueCount(cpus: 4096) == 1022)
-        #expect(VirtioSCSIController(requestQueues: 8).configurationSpace.littleEndian32(at: 0) == 8)
+        #expect(VirtioSCSIController(requestQueues: 8, executor: InlineExecutor()).configurationSpace.littleEndian32(at: 0) == 8)
     }
 
     // MARK: Request queue
@@ -287,7 +321,7 @@ struct VirtioSCSITests {
         #expect(try fixture.response(cdb: testUnitReady).sense == SCSISense.reset.fixed)
     }
 
-    @Test func tasksToAbortOrQueryAreNeverInFlight() throws {
+    @Test func withNothingInFlightAbortsAndQueriesFindNothing() throws {
         let fixture = ControllerFixture()
         try fixture.attachReady()
         // ABORT TASK, ABORT TASK SET, CLEAR TASK SET, QUERY TASK and QUERY
@@ -328,6 +362,286 @@ struct VirtioSCSITests {
         // CLEAR ACA, and a function with no meaning.
         #expect(fixture.control(taskManagement(2), responseLength: 1).written == [11])
         #expect(fixture.control(taskManagement(99), responseLength: 1).written == [11])
+    }
+
+    // MARK: Commands in flight
+
+    @Test func commandsCompleteAsTheirOperationsFinish() throws {
+        let executor = ManualExecutor()
+        let fixture = ControllerFixture(executor: executor)
+        try fixture.attachReady()
+        let first = fixture.request(tag: 1, cdb: read10(1), dataIn: 512)
+        let second = fixture.request(tag: 2, cdb: read10(2), dataIn: 512)
+        let order = CompletionOrder()
+        order.watch(first, as: "first")
+        order.watch(second, as: "second")
+        fixture.send([first, second])
+        // Both are in flight at once.
+        #expect(executor.submitted == 2)
+        #expect(order.names.isEmpty)
+        executor.complete(1)
+        #expect(order.names == ["second"])
+        #expect(try CommandResponse(second.written).data == [UInt8](repeating: 2, count: 512))
+        executor.complete(0)
+        #expect(order.names == ["second", "first"])
+        #expect(try CommandResponse(first.written).data == [UInt8](repeating: 1, count: 512))
+    }
+
+    /// A write's data goes to the image from a pool thread, however many
+    /// buffers the driver sent it in.
+    @Test func aWriteOfManyBuffersRunsOnAPoolThread() throws {
+        let queue = DispatchQueue(label: "com.apple.containerization.scsi.test")
+        let pool = SCSIOperationPool(completionQueue: queue)
+        let fixture = ControllerFixture(executor: pool)
+        let image = try queue.sync { try fixture.attachReady(blocks: 1024) }
+        // 1000 blocks in 4000 buffers.
+        let buffers = (0..<4000).map { [UInt8](repeating: UInt8(truncatingIfNeeded: $0 / 4 + 1), count: 128) }
+        let write = queue.sync { fixture.send(cdb: [0x2a, 0, 0, 0, 0, 0, 0, 0x03, 0xe8, 0], dataOut: buffers) }
+        pool.waitForRunningOperations()
+        queue.sync {}
+        #expect(try CommandResponse(write.written).status == 0)
+        #expect(try image.block(0) == [UInt8](repeating: 1, count: 512))
+        #expect(try image.block(999) == [UInt8](repeating: 232, count: 512))
+    }
+
+    /// Every request is prepared before any command runs, and a command that
+    /// completes without the image is answered as it is submitted.
+    @Test func aBatchIsPreparedThenSubmitted() throws {
+        let executor = ManualExecutor()
+        let fixture = ControllerFixture(executor: executor)
+        try fixture.attachReady()
+        let read = fixture.request(cdb: read10(1), dataIn: 512)
+        let inquiry = fixture.request(cdb: [0x12, 0, 0, 0, 96, 0], dataIn: 96)
+        fixture.send([read, inquiry])
+        #expect(executor.submitted == 1)
+        #expect(read.completions == 0)
+        #expect(try CommandResponse(inquiry.written).data.count == 96)
+        executor.completeAll()
+        #expect(try CommandResponse(read.written).status == 0)
+    }
+
+    /// A request that breaks the transport leaves every command prepared
+    /// with it unrun and unanswered; those the transport refused in their
+    /// preparation are answered.
+    @Test func aRequestThatBreaksTheTransportLeavesItsBatchUnanswered() throws {
+        let executor = ManualExecutor()
+        let fixture = ControllerFixture(executor: executor)
+        try fixture.attachReady()
+        let read = fixture.request(cdb: read10(1), dataIn: 512)
+        let inquiry = fixture.request(cdb: [0x12, 0, 0, 0, 96, 0], dataIn: 96)
+        let badTarget = fixture.request(target: 5, cdb: testUnitReady)
+        let broken = MemoryChain(Array(commandRequest(cdb: testUnitReady)[..<50]), writable: 108)
+        fixture.send([read, inquiry, badTarget, broken])
+        #expect(fixture.controller.needsReset)
+        #expect(executor.submitted == 0)
+        #expect(read.completions == 0)
+        #expect(inquiry.completions == 0)
+        #expect(broken.completions == 0)
+        #expect(try CommandResponse(badTarget.written).response == 3)
+    }
+
+    /// ABORT TASK cancels the command, whose request to the image runs to
+    /// its end; the command is answered ABORTED, then the function.
+    @Test func abortTaskAnswersTheCommandThenItself() throws {
+        let executor = ManualExecutor()
+        let fixture = ControllerFixture(executor: executor)
+        let image = try fixture.attachReady()
+        let block = [UInt8](repeating: 0xab, count: 512)
+        let write = fixture.send(tag: 7, cdb: write10(4), dataOut: [block])
+        let other = fixture.send(tag: 8, cdb: read10(5), dataIn: 512)
+        let abort = MemoryChain(taskManagement(0, tag: 7), writable: 1)
+        let order = CompletionOrder()
+        order.watch(write, as: "write")
+        order.watch(abort, as: "abort")
+        fixture.controller.handleControl(abort)
+        #expect(abort.completions == 0)
+        // A canceled command is out of the task set.
+        #expect(fixture.control(taskManagement(6, tag: 7), responseLength: 1).written == [0])
+        #expect(fixture.control(taskManagement(6, tag: 8), responseLength: 1).written == [10])
+        // A tag with no command in flight is answered at once.
+        #expect(fixture.control(taskManagement(0, tag: 9), responseLength: 1).written == [0])
+        executor.complete(0)
+        #expect(order.names == ["write", "abort"])
+        #expect(try CommandResponse(write.written).response == 2)
+        #expect(abort.written == [0])
+        #expect(try image.block(4) == block)
+        #expect(other.completions == 0)
+        executor.complete(1)
+        #expect(try CommandResponse(other.written).response == 0)
+    }
+
+    /// ABORT TASK SET and CLEAR TASK SET cancel every command of the unit,
+    /// those whose operation has run but not completed among them, and
+    /// leave other units' commands alone.
+    @Test func abortTaskSetCancelsTheUnitsCommands() throws {
+        for function: UInt32 in [1, 3] {
+            let executor = ManualExecutor()
+            let fixture = ControllerFixture(executor: executor)
+            try fixture.attachReady(lun: 0)
+            try fixture.attachReady(lun: 1)
+            let ran = fixture.send(lun: 0, tag: 1, cdb: read10(1), dataIn: 512)
+            let waiting = fixture.send(lun: 0, tag: 2, cdb: read10(2), dataIn: 512)
+            let elsewhere = fixture.send(lun: 1, tag: 3, cdb: read10(3), dataIn: 512)
+            executor.run(0)
+            let abort = fixture.control(taskManagement(function, lun: 0), responseLength: 1)
+            #expect(abort.completions == 0)
+            #expect(fixture.control(taskManagement(7, lun: 0), responseLength: 1).written == [0])
+            #expect(fixture.control(taskManagement(7, lun: 1), responseLength: 1).written == [10])
+            executor.complete(1)
+            #expect(abort.completions == 0)
+            executor.complete(0)
+            #expect(abort.written == [0])
+            #expect(try CommandResponse(ran.written).response == 2)
+            #expect(try CommandResponse(waiting.written).response == 2)
+            #expect(elsewhere.completions == 0)
+            executor.complete(2)
+            #expect(try CommandResponse(elsewhere.written).response == 0)
+        }
+    }
+
+    @Test func queriesFindTheCommandsInFlight() throws {
+        let executor = ManualExecutor()
+        let fixture = ControllerFixture(executor: executor)
+        try fixture.attachReady()
+        fixture.send(tag: 5, cdb: read10(1), dataIn: 512)
+        #expect(fixture.control(taskManagement(6, tag: 5), responseLength: 1).written == [10])
+        #expect(fixture.control(taskManagement(6, tag: 6), responseLength: 1).written == [0])
+        #expect(fixture.control(taskManagement(7), responseLength: 1).written == [10])
+        executor.completeAll()
+        #expect(fixture.control(taskManagement(6, tag: 5), responseLength: 1).written == [0])
+        #expect(fixture.control(taskManagement(7), responseLength: 1).written == [0])
+    }
+
+    /// A LOGICAL UNIT RESET answers the unit's commands RESET once their
+    /// operations have run, then itself, and the unit reports the reset.
+    @Test func aLogicalUnitResetAnswersItsCommandsThenItself() throws {
+        let executor = ManualExecutor()
+        let fixture = ControllerFixture(executor: executor)
+        try fixture.attachReady(lun: 0)
+        try fixture.attachReady(lun: 1)
+        let command = fixture.send(lun: 0, tag: 1, cdb: read10(1), dataIn: 512)
+        let elsewhere = fixture.send(lun: 1, tag: 2, cdb: read10(2), dataIn: 512)
+        let reset = MemoryChain(taskManagement(5, lun: 0), writable: 1)
+        let order = CompletionOrder()
+        order.watch(command, as: "command")
+        order.watch(reset, as: "reset")
+        fixture.controller.handleControl(reset)
+        #expect(reset.completions == 0)
+        executor.complete(0)
+        #expect(order.names == ["command", "reset"])
+        #expect(try CommandResponse(command.written).response == 4)
+        #expect(reset.written == [0])
+        #expect(try fixture.response(lun: 0, cdb: testUnitReady).sense == SCSISense.reset.fixed)
+        executor.complete(1)
+        #expect(try CommandResponse(elsewhere.written).response == 0)
+        #expect(try fixture.response(lun: 1, cdb: testUnitReady).status == 0)
+    }
+
+    /// A command an abort canceled, still running when a reset comes, is
+    /// answered RESET, then both functions in turn.
+    @Test func aResetAnswersRESETForACommandAnAbortCanceled() throws {
+        let executor = ManualExecutor()
+        let fixture = ControllerFixture(executor: executor)
+        try fixture.attachReady()
+        let command = fixture.send(tag: 1, cdb: read10(1), dataIn: 512)
+        let abort = MemoryChain(taskManagement(0, tag: 1), writable: 1)
+        let reset = MemoryChain(taskManagement(5), writable: 1)
+        let order = CompletionOrder()
+        order.watch(command, as: "command")
+        order.watch(abort, as: "abort")
+        order.watch(reset, as: "reset")
+        fixture.controller.handleControl(abort)
+        fixture.controller.handleControl(reset)
+        #expect(order.names.isEmpty)
+        executor.complete(0)
+        #expect(order.names == ["command", "abort", "reset"])
+        #expect(try CommandResponse(command.written).response == 4)
+    }
+
+    @Test func anITNexusResetWaitsForEveryUnitOfTheTarget() throws {
+        let executor = ManualExecutor()
+        let fixture = ControllerFixture(executor: executor)
+        try fixture.attachReady(lun: 0)
+        try fixture.attachReady(lun: 1)
+        try fixture.attachReady(target: 1, lun: 0)
+        let first = fixture.send(lun: 0, tag: 1, cdb: read10(1), dataIn: 512)
+        let second = fixture.send(lun: 1, tag: 2, cdb: read10(2), dataIn: 512)
+        let elsewhere = fixture.send(target: 1, tag: 3, cdb: read10(3), dataIn: 512)
+        let reset = fixture.control(taskManagement(4), responseLength: 1)
+        executor.complete(1)
+        #expect(reset.completions == 0)
+        executor.complete(0)
+        #expect(reset.written == [0])
+        #expect(try CommandResponse(first.written).response == 4)
+        #expect(try CommandResponse(second.written).response == 4)
+        #expect(elsewhere.completions == 0)
+        executor.complete(2)
+        #expect(try CommandResponse(elsewhere.written).response == 0)
+    }
+
+    /// A device reset cancels what is in flight, waits for its requests to
+    /// the image, and answers nothing: the queues go with the reset. An
+    /// UNMAP canceled before it started runs its first range and no other.
+    @Test func aDeviceResetWaitsForItsCommandsAndAnswersNone() throws {
+        let executor = ManualExecutor()
+        let fixture = ControllerFixture(executor: executor)
+        let image = try fixture.attachReady(blocks: 64)
+        var parameters: [UInt8] = [0, 38, 0, 32, 0, 0, 0, 0]
+        parameters += [0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0]
+        parameters += [0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 16, 0, 0, 0, 0]
+        let unmap = fixture.send(tag: 1, cdb: [0x42, 0, 0, 0, 0, 0, 0, 0, UInt8(parameters.count), 0], dataOut: [parameters])
+        let abort = fixture.control(taskManagement(0, tag: 1), responseLength: 1)
+        fixture.controller.reset()
+        #expect(executor.pending == 0)
+        #if os(macOS)
+        #expect(try image.block(8) == [UInt8](repeating: 0, count: 512))
+        #endif
+        #expect(try image.block(32) == [UInt8](repeating: 32, count: 512))
+        executor.completeAll()
+        #expect(unmap.completions == 0)
+        #expect(abort.completions == 0)
+        #expect(try fixture.response(cdb: testUnitReady).sense == SCSISense.reset.fixed)
+    }
+
+    /// When the machine stops, what is in flight runs to its end and
+    /// nothing is answered.
+    @Test func stoppingRunsWhatIsInFlightAndAnswersNothing() throws {
+        let executor = ManualExecutor()
+        let fixture = ControllerFixture(executor: executor)
+        let image = try fixture.attachReady()
+        let block = [UInt8](repeating: 0xcd, count: 512)
+        let write = fixture.send(tag: 1, cdb: write10(3), dataOut: [block])
+        fixture.controller.stop()
+        #expect(executor.pending == 0)
+        #expect(try image.block(3) == block)
+        executor.completeAll()
+        #expect(write.completions == 0)
+    }
+
+    /// Detaching a unit answers its commands ABORTED once their requests to
+    /// the image have run, before the driver hears the unit is gone.
+    @Test func detachAnswersTheUnitsCommandsBeforeTheEvent() throws {
+        let executor = ManualExecutor()
+        let fixture = ControllerFixture(executor: executor)
+        try fixture.attachReady(lun: 0)
+        try fixture.attachReady(lun: 3)
+        let queue = MemoryEventQueue()
+        queue.post(4)
+        fixture.controller.driverReady(negotiatedFeatures: VirtioSCSIController.hotplugFeature, eventQueue: queue)
+        let command = fixture.send(lun: 3, tag: 1, cdb: read10(1), dataIn: 512)
+        let elsewhere = fixture.send(lun: 0, tag: 2, cdb: read10(2), dataIn: 512)
+        let order = CompletionOrder()
+        order.watch(command, as: "command")
+        let notice = try #require(queue.buffers.first)
+        order.watch(notice, as: "removed")
+        #expect(fixture.controller.detach(target: 0, lun: 3) != nil)
+        #expect(order.names == ["command", "removed"])
+        #expect(try CommandResponse(command.written).response == 2)
+        #expect(notice.written == event(transportReset, lun: [1, 0, 0, 3, 0, 0, 0, 0], reason: removed))
+        #expect(elsewhere.completions == 0)
+        executor.completeAll()
+        #expect(command.completions == 1)
+        #expect(try CommandResponse(elsewhere.written).response == 0)
     }
 
     @Test func asynchronousNotificationsReportNone() throws {
