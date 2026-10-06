@@ -303,6 +303,13 @@ extension Mount {
         return .diskImage
     }
 
+    /// Whether the disk is a network block device, which reaches the guest
+    /// through Virtualization's own attachment alone, where an image or a
+    /// device of the host's is a disk this process can open itself.
+    var isNetworkBlockDevice: Bool {
+        storageAttachmentType == .networkBlockDevice
+    }
+
     /// Whether the disk is a block device of the host's, which takes the
     /// options its attachment does rather than a disk image's.
     var isHostBlockDevice: Bool {

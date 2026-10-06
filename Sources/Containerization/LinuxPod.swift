@@ -46,6 +46,9 @@ public final class LinuxPod: Sendable {
         public var interfaces: [any Interface] = []
         /// Whether nested virtualization should be turned on for the pod.
         public var virtualization: Bool = false
+        /// The device the pod's machine attaches its containers' block
+        /// devices on.
+        public var blockDeviceDriver: BlockDeviceDriver = .virtioBlock
         /// Optional file path to store serial boot logs.
         public var bootLog: BootLog?
         /// Whether containers in the pod should share a PID namespace.
@@ -132,7 +135,8 @@ public final class LinuxPod: Sendable {
         public enum Source: Sendable {
             /// A network block device (NBD) volume.
             case nbd(url: URL, timeout: TimeInterval? = nil, readOnly: Bool = false)
-            /// A disk-image file on the host, attached as a virtio-block device.
+            /// A disk-image file on the host, attached on the pod's block
+            /// device driver.
             case diskImage(path: URL, readOnly: Bool = false)
             /// An in-memory (tmpfs) volume mounted inside the guest.
             case tmpfs(sizeBytes: UInt64? = nil)
@@ -557,7 +561,7 @@ extension LinuxPod {
                     do {
                         var mount = attachment.to
                         mount.destination = Self.guestRootfsPath(id)
-                        try await agent.mount(mount)
+                        try await agent.mount(mount, of: attachment)
 
                         // Filter out shared mounts — those are handled separately as
                         // pod volume bind mounts. Without it here, a container added to an
@@ -754,7 +758,8 @@ extension LinuxPod {
                 interfaces: self.config.interfaces,
                 mountsByID: mountsByID,
                 bootLog: self.config.bootLog,
-                nestedVirtualization: self.config.virtualization
+                nestedVirtualization: self.config.virtualization,
+                blockDeviceDriver: self.config.blockDeviceDriver
             )
             vmConfig.extensions = self.config.extensions
             let creationConfig = StandardVMConfig(configuration: vmConfig)
@@ -871,7 +876,8 @@ extension LinuxPod {
                         }
                         var rootfs = rootfsAttachment.to
                         rootfs.destination = Self.guestRootfsPath(container.id)
-                        try await agent.mount(rootfs)
+                        try await agent.mount(rootfs, of: rootfsAttachment)
+                        try await agent.mountContainerDisks(Array(attachments.dropFirst()))
                     }
 
                     // Mount file mount holding directories under /run for each container.
@@ -904,7 +910,9 @@ extension LinuxPod {
                                 source: attachment.source,
                                 destination: guestPath,
                                 options: attachment.options
-                            ))
+                            ),
+                            of: attachment
+                        )
                     }
 
                     // Start up unix socket relays for each container
@@ -1007,7 +1015,8 @@ extension LinuxPod {
                 )
                 // We don't need the rootfs, nor do OCI runtimes want it included.
                 // Also filter out file mount holding directories - we mount those separately under /run.
-                // Transform virtiofs mounts to bind mounts from /run/virtiofs/{tag}
+                // Transform virtiofs mounts to bind mounts from /run/virtiofs/{tag}, and a disk
+                // on the virtio-scsi host to a bind mount from where the guest mounted it.
                 let containerMounts = createdState.vm.mounts[containerID] ?? []
                 let holdingTags = container.fileMountContext.holdingDirectoryTags
                 var mounts: [ContainerizationOCI.Mount] =
@@ -1022,6 +1031,9 @@ extension LinuxPod {
                                 destination: attached.destination,
                                 options: ["bind"] + attached.options
                             )
+                        }
+                        if let path = attached.guestDiskPath {
+                            return attached.diskBind(at: path)
                         }
                         return attached.to
                     }
@@ -1170,7 +1182,9 @@ extension LinuxPod {
                 try await process.kill(.kill)
                 try await process.wait(timeoutInSeconds: 3)
 
+                let ownMounts = Array((createdState.vm.mounts[containerID] ?? []).dropFirst())
                 try await createdState.vm.withAgent { agent in
+                    try await agent.unmountContainerDisks(ownMounts)
                     // Unmount the rootfs
                     try await agent.umount(
                         path: Self.guestRootfsPath(containerID),
@@ -1228,7 +1242,9 @@ extension LinuxPod {
                             try? await process.kill(.kill)
                             _ = try? await process.wait(timeoutInSeconds: 3)
 
+                            let ownMounts = Array((createdState.vm.mounts[containerID] ?? []).dropFirst())
                             try? await createdState.vm.withAgent { agent in
+                                try? await agent.unmountContainerDisks(ownMounts)
                                 try await agent.umount(
                                     path: Self.guestRootfsPath(containerID),
                                     flags: 0
