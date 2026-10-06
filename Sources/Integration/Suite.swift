@@ -607,6 +607,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             return hotplugDiskTests() + [
                 Test("pod hotplug volume shared by two", testPodHotplugVolumeSharedByTwo),
                 Test("pod hotplug volume held by another machine", testPodHotplugVolumeHeldByAnotherMachine),
+                Test("pod hotplug volume held for the pod's life", testPodHotplugVolumeHeldForPodLife),
                 Test("pod scsi volume across stop and start", testPodSCSIVolumeAcrossStopAndStart),
                 Test("pod forty scsi volumes", testPodFortySCSIVolumes),
                 Test("pod hotplug scsi rootfs", testPodHotplugSCSIRootfs),

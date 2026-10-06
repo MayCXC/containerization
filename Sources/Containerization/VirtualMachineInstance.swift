@@ -86,8 +86,8 @@ public protocol VirtualMachineInstance: Sendable {
 
     /// Release a hotplug device.
     /// This should be called when a hotplugged container is stopped or fails
-    /// to start, or when the last container of a volume attached for a pod's
-    /// containers leaves.
+    /// to start, or when a volume attached for a pod's containers fails to
+    /// mount; the machine holds the volumes it mounted until it stops.
     /// - Parameter id: The owner whose hotplug should be released
     func releaseHotplug(id: String) async throws
 

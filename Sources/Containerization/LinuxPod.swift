@@ -250,14 +250,14 @@ public final class LinuxPod: Sendable {
     /// mounts the same image is given a bind of. Kata mounts each block
     /// device at one location within the machine and counts the containers
     /// that mount it, and the CSI node contract stages a volume once per node
-    /// and publishes it to each workload, the orchestrator counting them; a
-    /// pod's containers share its volumes, which outlive a container's
-    /// restart. So the volume is the pod's: its containers share one
-    /// filesystem, a stop keeps it, and it leaves with the last container
-    /// that mounts it.
+    /// and publishes it to each workload, the orchestrator counting them. A
+    /// pod's volumes have the pod's lifetime: they outlive a container's
+    /// restart and its removal, and the kubelet tears them down with the pod.
+    /// So the volume is the pod's: its containers share one filesystem, and
+    /// the machine holds it, attached and mounted, until the machine stops.
     /// https://github.com/kata-containers/kata-containers/blob/main/src/runtime/virtcontainers/kata_agent.go
     /// https://github.com/container-storage-interface/spec/blob/master/spec.md
-    /// https://kubernetes.io/docs/concepts/workloads/pods/
+    /// https://kubernetes.io/docs/concepts/storage/volumes/
     private struct BlockVolume: Sendable {
         /// The volume as the machine attaches it, at its guest path: the
         /// first container's mount of the image, writable where a container
@@ -265,14 +265,9 @@ public final class LinuxPod: Sendable {
         var mount: Mount
         /// The containers that mount it.
         var users: Set<String>
-        /// Where the guest finds the volume, once the machine has it.
+        /// Where the guest finds the volume, once the machine has attached it
+        /// and the guest has mounted it at its path.
         var attachment: AttachedFilesystem?
-        /// Whether the guest has the volume mounted at its path.
-        var mounted = false
-        /// Whether the volume was attached while the machine ran, so that it
-        /// is detached when its last container leaves; one the machine booted
-        /// with stays attached until the machine stops.
-        var hotplugged = false
     }
 
     private let state: AsyncMutex<State>
@@ -565,8 +560,8 @@ public final class LinuxPod: Sendable {
     }
 
     /// The owner a volume attached while the machine runs is recorded under
-    /// in the machine's hotplug, so that it is given back when its last
-    /// container leaves rather than with the container that brought it.
+    /// in the machine's hotplug: the pod's, so that releasing the container
+    /// that brought it leaves it attached for the machine's life.
     private static func volumeOwner(_ volumeName: String) -> String {
         "volume-\(volumeName)"
     }
@@ -654,11 +649,10 @@ public final class LinuxPod: Sendable {
     }
 
     /// Give a container added to the running machine its volumes: one the
-    /// guest has mounted is counted, one the machine booted with is mounted
-    /// again, and one it lacks is attached through the machine's hotplug and
-    /// mounted at its path, the guest's mount waiting for a device just
-    /// attached as it waits for the root's. A volume already attached keeps
-    /// the mode it was attached with.
+    /// machine has is counted, and one it lacks is attached through the
+    /// machine's hotplug and mounted at its path, the guest's mount waiting
+    /// for a device just attached as it waits for the root's. A volume
+    /// already attached keeps the mode it was attached with.
     private static func stageVolumes(
         _ volumes: [String: Mount],
         for containerID: String,
@@ -669,13 +663,9 @@ public final class LinuxPod: Sendable {
         for name in volumes.keys.sorted() {
             guard let mount = volumes[name] else { continue }
             var volume = blockVolumes[name] ?? BlockVolume(mount: mount, users: [])
-            if let attachment = volume.attachment {
+            if volume.attachment != nil {
                 if volume.mount.options.contains("ro") {
                     try Self.requireReadOnly(mount, of: name, for: containerID)
-                }
-                if !volume.mounted {
-                    try await agent.mount(attachment.to, of: attachment)
-                    volume.mounted = true
                 }
             } else {
                 let owner = Self.volumeOwner(name)
@@ -688,54 +678,21 @@ public final class LinuxPod: Sendable {
                     throw error
                 }
                 volume.attachment = attachment
-                volume.mounted = true
-                volume.hotplugged = true
             }
             volume.users.insert(containerID)
             blockVolumes[name] = volume
         }
     }
 
-    /// Take a container off the users of its volumes. A volume left with
-    /// none is unmounted, and one attached while the machine ran is detached
-    /// after it; one the machine booted with stays attached, unmounted, until
-    /// a container mounts it again or the machine stops. A volume the guest
-    /// cannot unmount stays attached, since a disk detached under a mounted
-    /// filesystem takes the filesystem down with I/O errors and a journal
-    /// abort. Without a running machine nothing is attached, and the count
-    /// is all there is to change.
-    private func releaseVolumes(
-        of containerID: String,
-        in blockVolumes: inout [String: BlockVolume],
-        vm: (any VirtualMachineInstance)?
-    ) async {
+    /// Take a container off the users of its volumes. The machine keeps a
+    /// volume attached and mounted for its life whether or not a container
+    /// still mounts it, as a pod keeps its volumes until it is torn down; one
+    /// the machine never attached, since it has not booted, is forgotten with
+    /// its last container.
+    private static func releaseVolumes(of containerID: String, in blockVolumes: inout [String: BlockVolume]) {
         for name in blockVolumes.keys.sorted() {
             guard var volume = blockVolumes[name], volume.users.remove(containerID) != nil else { continue }
-            blockVolumes[name] = volume
-            guard volume.users.isEmpty else { continue }
-            guard let vm, vm.state == .running else {
-                if volume.attachment == nil {
-                    blockVolumes[name] = nil
-                }
-                continue
-            }
-            if volume.mounted {
-                do {
-                    try await vm.withAgent { agent in
-                        try await agent.umount(path: Self.guestVolumePath(name), flags: 0)
-                    }
-                    volume.mounted = false
-                } catch {
-                    self.logger?.error(
-                        "the guest could not unmount a volume its last container left, so it stays attached",
-                        metadata: ["volume": "\(name)", "error": "\(error)"])
-                    blockVolumes[name] = volume
-                    continue
-                }
-            }
-            if volume.hotplugged {
-                try? await vm.releaseHotplug(id: Self.volumeOwner(name))
-                try? await vm.releaseVirtioFS(id: Self.volumeOwner(name))
+            if volume.users.isEmpty && volume.attachment == nil {
                 blockVolumes[name] = nil
             } else {
                 blockVolumes[name] = volume
@@ -1000,7 +957,7 @@ extension LinuxPod {
                         fileMountContext: updatedFileMountContext
                     )
                 } catch {
-                    await self.releaseVolumes(of: id, in: &state.blockVolumes, vm: vm)
+                    Self.releaseVolumes(of: id, in: &state.blockVolumes)
                     try? await vm.releaseHotplug(id: id)
                     try? await vm.releaseVirtioFS(id: id)
                     throw error
@@ -1331,7 +1288,6 @@ extension LinuxPod {
                 state.unifiedVirtiofsMounted = mountsShareAtBoot && vm.virtiofsLayout == .unified
                 for name in blockVolumes.keys {
                     state.blockVolumes[name]?.attachment = vm.storage.volumes[name]
-                    state.blockVolumes[name]?.mounted = true
                 }
 
                 // Apply file mount context updates.
@@ -1592,7 +1548,7 @@ extension LinuxPod {
     /// under it is refused. Removal is the separate act the runtime
     /// specification names for giving the place up, taken once the container
     /// has stopped, and the container leaves the users of the volumes it
-    /// mounts, the last of them taking a volume down. A container that is
+    /// mounts, which the machine keeps until it stops. A container that is
     /// running keeps its place and this call refuses it.
     /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
     public func removeContainer(_ containerID: String) async throws {
@@ -1605,11 +1561,7 @@ extension LinuxPod {
             }
             switch container.state {
             case .registered, .stopped, .errored:
-                var vm: (any VirtualMachineInstance)?
-                if case .created(let createdState) = state.phase {
-                    vm = createdState.vm
-                }
-                await self.releaseVolumes(of: containerID, in: &state.blockVolumes, vm: vm)
+                Self.releaseVolumes(of: containerID, in: &state.blockVolumes)
                 state.containers[containerID] = nil
             default:
                 throw ContainerizationError(
@@ -1675,7 +1627,7 @@ extension LinuxPod {
                 }
 
                 // Unmount the volumes the containers mount.
-                let mountedVolumes = state.blockVolumes.filter(\.value.mounted).map(\.key)
+                let mountedVolumes = state.blockVolumes.filter { $0.value.attachment != nil }.map(\.key)
                 if createdState.vm.state != .stopped && !mountedVolumes.isEmpty {
                     try? await createdState.vm.withAgent { agent in
                         for name in mountedVolumes {
@@ -1691,8 +1643,6 @@ extension LinuxPod {
                     guard !volume.users.isEmpty else { return nil }
                     var volume = volume
                     volume.attachment = nil
-                    volume.mounted = false
-                    volume.hotplugged = false
                     return volume
                 }
                 state.phase = .initialized

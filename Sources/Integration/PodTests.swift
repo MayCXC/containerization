@@ -2895,6 +2895,75 @@ extension IntegrationSuite {
             throw error
         }
     }
+
+    /// A volume a container joining the running machine brings is the pod's
+    /// for the machine's life: once the container is removed another machine
+    /// is still refused it, and once the pod stops another machine is given
+    /// it, with what the container wrote and never synced.
+    func testPodHotplugVolumeHeldForPodLife() async throws {
+        let id = "test-pod-hotplug-volume-pod-life"
+        let bs = try await bootstrap(id)
+        let image = try volumeImage(testID: id)
+        let volume = Mount.block(format: "ext4", source: image.absolutePath(), destination: "/data")
+
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+            config.blockDeviceDriver = Self.hotplugBlockDeviceDriver
+        }
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+        }
+
+        func machine(_ name: String, _ arguments: [String], stdout: BufferWriter? = nil) throws -> LinuxContainer {
+            try LinuxContainer("\(id)-\(name)", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: name), vmm: bs.vmm) { config in
+                config.process.arguments = arguments
+                config.mounts.append(volume)
+                config.bootLog = bs.bootLog
+                if let stdout {
+                    config.process.stdout = stdout
+                }
+            }
+        }
+
+        do {
+            try await pod.create()
+            try await pod.addContainer("writer", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "writer")) { config in
+                config.process.arguments = ["/bin/sh", "-c", "echo kept > /data/kept"]
+                config.mounts.append(volume)
+            }
+            try await runToExit("writer", in: pod)
+            try await pod.stopContainer("writer")
+            try await pod.removeContainer("writer")
+
+            let early = try machine("early", ["/bin/true"])
+            var refused = false
+            do {
+                try await early.create()
+                try await early.start()
+            } catch {
+                refused = true
+            }
+            try? await early.stop()
+            guard refused else {
+                throw IntegrationError.assert(msg: "another machine was given the volume while the pod's machine runs")
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+
+        let readBack = BufferWriter()
+        let reader = try machine("reader", ["/bin/cat", "/data/kept"], stdout: readBack)
+        try await reader.create()
+        try await reader.start()
+        let status = try await reader.wait()
+        try await reader.stop()
+        guard status.exitCode == 0, lines(of: readBack) == ["kept"] else {
+            throw IntegrationError.assert(msg: "after the pod stopped another machine read \(lines(of: readBack)) (exit \(status.exitCode)), expected [kept]")
+        }
+    }
     #endif
 
     /// Add a container with a writable layer to a pod whose machine is
