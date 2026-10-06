@@ -31,6 +31,7 @@ private final class Record: Sendable {
         var completed = 0
         var completedFirst = 0
         var met = 0
+        var notes: [String] = []
     }
 
     private let state = Mutex(State())
@@ -60,11 +61,16 @@ private final class Record: Sendable {
         state.withLock { $0.met += 1 }
     }
 
+    func note(_ name: String) {
+        state.withLock { $0.notes.append(name) }
+    }
+
     var ran: Int { state.withLock { $0.ran.count } }
     var most: Int { state.withLock { $0.most } }
     var completed: Int { state.withLock { $0.completed } }
     var completedFirst: Int { state.withLock { $0.completedFirst } }
     var met: Int { state.withLock { $0.met } }
+    var notes: [String] { state.withLock { $0.notes } }
 }
 
 /// The pool against QEMU's thread pool, util/thread-pool.c at d7a65d1793d6.
@@ -86,6 +92,26 @@ struct SCSIOperationPoolTests {
         }
         pool.waitForRunningOperations()
         #expect(record.met == 2)
+    }
+
+    /// An operation that finishes while a pass over the finished ones is
+    /// queued completes in that pass: one hop to the completion queue for all
+    /// of them, as QEMU's pool completes every request it has run in one
+    /// bottom half (thread_pool_completion_bh).
+    @Test func finishedOperationsCompleteInOnePass() {
+        let queue = DispatchQueue(label: "com.apple.containerization.scsi.test")
+        let pool = SCSIOperationPool(completionQueue: queue)
+        let record = Record()
+        queue.suspend()
+        pool.submit({}, completion: { record.note("first") })
+        pool.waitForRunningOperations()
+        // Behind the pass the first operation queued.
+        queue.async { record.note("marker") }
+        pool.submit({}, completion: { record.note("second") })
+        pool.waitForRunningOperations()
+        queue.resume()
+        queue.sync {}
+        #expect(record.notes == ["first", "second", "marker"])
     }
 
     /// More operations than run at once: each runs, at most the pool's
