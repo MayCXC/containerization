@@ -325,7 +325,7 @@ extension IntegrationSuite {
         let filled: UInt64 = 768.mib()
         let buffer = BufferWriter()
         let helpersBefore = try VirtualMachineHelper.running()
-        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
+        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm, vm: VMResources(memoryInBytes: memory)) { config in
             // Memory a guest has never touched is not backed on the host, so a
             // balloon that takes only those pages moves nothing. The guest fills
             // a tmpfs to put real pages behind its memory and frees them again,
@@ -453,7 +453,7 @@ extension IntegrationSuite {
         let memory: UInt64 = 2048.mib()
         let target: UInt64 = 1024.mib()
         let helpersBefore = try VirtualMachineHelper.running()
-        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
+        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm, vm: VMResources(memoryInBytes: memory)) { config in
             config.mounts.append(
                 .any(
                     type: "tmpfs", source: "tmpfs", destination: "/fill",
@@ -539,7 +539,7 @@ extension IntegrationSuite {
         let id = "test-container-memory-compaction"
         let bs = try await bootstrap(id)
 
-        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm) { config in
+        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm, vm: VMResources(memoryInBytes: 2048.mib())) { config in
             config.mounts.append(
                 .any(
                     type: "tmpfs", source: "tmpfs", destination: "/fill",
