@@ -457,6 +457,32 @@ extension VZDiskBlockDeviceStorageDeviceAttachment {
     /// do not recover, so the caller chooses what it hands over.
     /// https://developer.apple.com/documentation/virtualization/vzdiskblockdevicestoragedeviceattachment
     static func mountToVZAttachment(mount: Mount, options: [String]) throws -> VZDiskBlockDeviceStorageDeviceAttachment {
+        let synchronizationMode = try synchronizationMode(options: options)
+
+        // The attachment keeps the handle, and the framework wants it open when
+        // the machine starts. A device meant to be read is opened to be read,
+        // which is what the framework asks of a caller that sets `readOnly`.
+        let handle =
+            mount.readonly
+            ? FileHandle(forReadingAtPath: mount.source)
+            : FileHandle(forUpdatingAtPath: mount.source)
+        guard let handle else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "unable to open block device: \(mount.source)"
+            )
+        }
+
+        return try VZDiskBlockDeviceStorageDeviceAttachment(
+            fileHandle: handle,
+            readOnly: mount.readonly,
+            synchronizationMode: synchronizationMode
+        )
+    }
+
+    /// The synchronization mode a block device mount's runtime options ask
+    /// for.
+    static func synchronizationMode(options: [String]) throws -> VZDiskSynchronizationMode {
         var synchronizationMode: VZDiskSynchronizationMode = .full
 
         for option in options {
@@ -488,26 +514,7 @@ extension VZDiskBlockDeviceStorageDeviceAttachment {
                 )
             }
         }
-
-        // The attachment keeps the handle, and the framework wants it open when
-        // the machine starts. A device meant to be read is opened to be read,
-        // which is what the framework asks of a caller that sets `readOnly`.
-        let handle =
-            mount.readonly
-            ? FileHandle(forReadingAtPath: mount.source)
-            : FileHandle(forUpdatingAtPath: mount.source)
-        guard let handle else {
-            throw ContainerizationError(
-                .invalidArgument,
-                message: "unable to open block device: \(mount.source)"
-            )
-        }
-
-        return try VZDiskBlockDeviceStorageDeviceAttachment(
-            fileHandle: handle,
-            readOnly: mount.readonly,
-            synchronizationMode: synchronizationMode
-        )
+        return synchronizationMode
     }
 }
 
