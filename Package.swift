@@ -144,6 +144,19 @@ let package = Package(
             ]
         ),
         .target(
+            name: "ContainerizationSCSI",
+            dependencies: [
+                "ContainerizationError"
+            ]
+        ),
+        .testTarget(
+            name: "ContainerizationSCSITests",
+            dependencies: [
+                "ContainerizationError",
+                "ContainerizationSCSI",
+            ]
+        ),
+        .target(
             name: "ContainerizationArchive",
             dependencies: [
                 .product(name: "SystemPackage", package: "swift-system"),
