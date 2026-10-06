@@ -16,6 +16,7 @@
 
 import Containerization
 import ContainerizationEXT4
+import ContainerizationError
 import ContainerizationOCI
 import Foundation
 import SystemPackage
@@ -363,6 +364,173 @@ extension IntegrationSuite {
             report += "\n  \(fields[0]) \(fields[1]) \(fields[2]) \(fields[3]) streams: \(rate)"
         }
         print(report)
+    }
+
+    /// Thirty disk images given as volumes to a pod on virtio-scsi are
+    /// logical units beside its container's root, and the machine's initial
+    /// filesystem is its one virtio block device.
+    func testPodContainerDisksOnSCSIHost() async throws {
+        let id = "test-pod-container-disks-on-scsi-host"
+        let names = (0..<30).map { $0 < 10 ? "v0\($0)" : "v\($0)" }
+        let bs = try await bootstrap(id)
+
+        var volumes: [LinuxPod.PodVolume] = []
+        var mounts: [Containerization.Mount] = []
+        var disks: [URL] = []
+        for name in names {
+            let disk = try createEXT4DiskImage(testID: id, name: name, size: 16.mib())
+            disks.append(disk)
+            volumes.append(.init(name: name, source: .diskImage(path: disk), format: "ext4"))
+            mounts.append(.sharedMount(name: name, destination: "/\(name)"))
+        }
+
+        let list = names.joined(separator: " ")
+        let output = try await runPodContainer(
+            podID: id,
+            bootstrap: bs,
+            volumes: volumes,
+            mounts: mounts,
+            script: """
+                for n in \(list); do echo $n > /$n/name; done
+                ok=0; for n in \(list); do [ "$(cat /$n/name)" = "$n" ] && ok=$((ok+1)); done
+                echo "$ok $(ls /sys/block | grep -c '^vd') $(ls /sys/block | grep -c '^sd')"
+                grep ' / ' /proc/mounts | cut -d' ' -f1
+                for n in \(list); do grep " /$n " /proc/mounts | cut -d' ' -f1; done
+                """
+        )
+        let lines = output.split(separator: "\n").map(String.init)
+        guard lines.count == names.count + 2 else {
+            throw IntegrationError.assert(msg: "expected the counts, the root's device and a device for each of \(names.count) volumes, got \(lines)")
+        }
+        let counts = lines[0].split(separator: " ").compactMap { Int($0) }
+        guard counts == [names.count, 1, names.count + 1] else {
+            throw IntegrationError.assert(
+                msg: "expected '\(names.count) 1 \(names.count + 1)' (names read back, virtio block devices, SCSI disks: the volumes and the root), got '\(lines[0])'")
+        }
+        guard lines[1].hasPrefix("/dev/sd") else {
+            throw IntegrationError.assert(msg: "the container's root is mounted from \(lines[1]), expected a /dev/sd* device")
+        }
+        for (index, name) in names.enumerated() {
+            let device = lines[index + 2]
+            guard device.hasPrefix("/dev/sd") else {
+                throw IntegrationError.assert(msg: "volume \(name) is mounted from \(device), expected a /dev/sd* device")
+            }
+        }
+        for (index, disk) in disks.enumerated() {
+            let content = try readFileFromDiskImage(disk, path: "/name")
+            guard content == names[index] else {
+                throw IntegrationError.assert(msg: "disk image \(names[index]) holds '\(content)', expected '\(names[index])'")
+            }
+        }
+    }
+
+    /// A container joining a running pod on virtio-scsi brings a root and a
+    /// volume as logical units; once it stops its root goes while the
+    /// volume, the pod's, stays, and both writes are in their images once the
+    /// pod stops.
+    func testPodHotplugSCSIRootfsAndVolume() async throws {
+        let id = "test-pod-hotplug-scsi-rootfs-volume"
+        let bs = try await bootstrap(id)
+        let volume = try createEXT4DiskImage(testID: id, name: "data")
+
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+            config.blockDeviceDriver = .virtioSCSI
+        }
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+        }
+        let hotRootfs = try cloneRootfs(bs.rootfs, testID: id, containerID: "hot")
+
+        do {
+            try await pod.create()
+            try await pod.startContainer("seed")
+            let before = try await scsiDisks(in: pod, container: "seed")
+            guard before.count == 1 else {
+                throw IntegrationError.assert(msg: "expected the running container's root as the guest's one SCSI disk, the guest has \(before)")
+            }
+
+            let buffer = BufferWriter()
+            try await pod.addContainer("hot", rootfs: hotRootfs) { config in
+                config.process.arguments = [
+                    "/bin/sh", "-c",
+                    "echo hot-write > /hotfile && echo volume-write > /data/file && grep ' / ' /proc/mounts | cut -d' ' -f1 && grep ' /data ' /proc/mounts | cut -d' ' -f1",
+                ]
+                config.process.stdout = buffer
+                config.mounts.append(.block(format: "ext4", source: volume.absolutePath(), destination: "/data"))
+            }
+            let during = try await scsiDisks(in: pod, container: "seed")
+            guard during.count == before.count + 2, Set(before).isSubset(of: during) else {
+                throw IntegrationError.assert(msg: "expected the joining container's root and volume added to \(before), the guest has \(during)")
+            }
+
+            try await pod.startContainer("hot")
+            let status = try await pod.waitContainer("hot")
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "hot container status \(status) != 0")
+            }
+            let devices = (String(data: buffer.data, encoding: .utf8) ?? "").split(whereSeparator: \.isNewline).map(String.init)
+            guard devices.count == 2, devices.allSatisfy({ $0.hasPrefix("/dev/sd") }) else {
+                throw IntegrationError.assert(msg: "expected the joining container's root and volume on SCSI disks, they are on \(devices)")
+            }
+            let rootDisk = String(devices[0].dropFirst("/dev/".count))
+            let volumeDisk = String(devices[1].dropFirst("/dev/".count))
+
+            try await pod.stopContainer("hot")
+            var after = try await scsiDisks(in: pod, container: "seed")
+            for _ in 0..<50 where after.contains(rootDisk) {
+                try await Task.sleep(for: .milliseconds(100))
+                after = try await scsiDisks(in: pod, container: "seed")
+            }
+            guard Set(after) == Set(before + [volumeDisk]) else {
+                throw IntegrationError.assert(
+                    msg: "expected the joining container's root \(rootDisk) gone and its volume \(volumeDisk) held beside \(before), the guest has \(after)")
+            }
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+
+        let written = try readFileFromDiskImage(URL(fileURLWithPath: hotRootfs.source), path: "/hotfile")
+        guard written == "hot-write" else {
+            throw IntegrationError.assert(msg: "the hot container's root filesystem image holds '\(written)', expected 'hot-write'")
+        }
+        let volumeWritten = try readFileFromDiskImage(volume, path: "/file")
+        guard volumeWritten == "volume-write" else {
+            throw IntegrationError.assert(msg: "the volume's image holds '\(volumeWritten)', expected 'volume-write'")
+        }
+    }
+
+    /// A running pod on the default driver refuses a joining container's
+    /// disk, since Virtualization adds no virtio block device to a running
+    /// machine.
+    func testPodDefaultDriverRefusesJoiningDisk() async throws {
+        let id = "test-pod-default-driver-refuses-joining-disk"
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: BlockDeviceDriverMachines.forcing(.virtioBlock, on: bs.vmm), vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+        try await pod.addContainer("seed", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "seed")) { config in
+            config.process.arguments = ["/bin/sleep", "infinity"]
+        }
+        do {
+            try await pod.create()
+            do {
+                try await pod.addContainer("hot", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "hot")) { config in
+                    config.process.arguments = ["/bin/true"]
+                }
+                throw IntegrationError.assert(msg: "a running pod on virtio-blk took a joining container's root")
+            } catch let error as ContainerizationError {
+                guard error.code == .unsupported, error.message.contains("virtio-scsi") else {
+                    throw IntegrationError.assert(msg: "expected the joining root refused as unsupported on virtio-blk, got \(error)")
+                }
+            }
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
     }
 
     // MARK: - Helpers

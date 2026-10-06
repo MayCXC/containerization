@@ -91,6 +91,12 @@ final class VZHotplugProvider: HotplugProvider, @unchecked Sendable {
                 message: "a running machine takes \(block.source) only on the virtio-scsi block device driver: Virtualization adds no virtio block device to a running machine"
             )
         }
+        guard !block.isNetworkBlockDevice else {
+            throw ContainerizationError(
+                .unsupported,
+                message: "\(block.source) is a network block device, which reaches the guest through Virtualization's own attachment alone, and a running machine takes none"
+            )
+        }
         return try await host.hotplug(block, id: id)
     }
 

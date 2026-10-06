@@ -615,6 +615,9 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("pod scsi speed against virtio-blk", testPodSCSISpeed),
                 Test("container disk on the scsi host", testContainerDiskOnSCSIHost),
                 Test("container disk on the default driver", testContainerDiskOnDefaultDriver),
+                Test("pod container disks on the scsi host", testPodContainerDisksOnSCSIHost),
+                Test("pod hotplug scsi rootfs and volume", testPodHotplugSCSIRootfsAndVolume),
+                Test("pod default driver refuses a joining disk", testPodDefaultDriverRefusesJoiningDisk),
                 Test("pod scsi streams against virtio-blk", testPodSCSIStreams),
             ]
         }

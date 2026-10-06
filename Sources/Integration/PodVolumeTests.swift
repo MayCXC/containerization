@@ -79,6 +79,19 @@ extension IntegrationSuite {
         }
     }
 
+    /// A disk a test leaves on the default block device driver is on the
+    /// driver the suite runs on: a SCSI disk on virtio-scsi, a virtio block
+    /// device otherwise.
+    func assertContainerDiskMount(_ output: String, path: String) throws {
+        guard blockDeviceDriver == .virtioSCSI else {
+            try assertVirtioBlockMount(output, path: path)
+            return
+        }
+        guard output.contains("/dev/sd") else {
+            throw IntegrationError.assert(msg: "expected a SCSI disk (/dev/sd*) for \(path), got: \(output)")
+        }
+    }
+
     func testContainerBlockDeviceMount() async throws {
         let id = "test-container-block-device-mount"
         let bs = try await bootstrap(id)
@@ -129,7 +142,7 @@ extension IntegrationSuite {
             throw IntegrationError.assert(msg: "expected 'hello', got '\(lines[0])'")
         }
 
-        try assertVirtioBlockMount(lines[1], path: "/data")
+        try assertContainerDiskMount(lines[1], path: "/data")
 
         // The guest wrote to the device, and the device is the image: what the
         // container put there is in the file once the host has it back.
@@ -233,7 +246,7 @@ extension IntegrationSuite {
             throw IntegrationError.assert(msg: "expected output, got nothing")
         }
 
-        try assertVirtioBlockMount(lines[0], path: "/data")
+        try assertContainerDiskMount(lines[0], path: "/data")
 
         guard !output.contains("exit=0") else {
             throw IntegrationError.assert(msg: "write to a read only block device succeeded: \(output)")
@@ -952,13 +965,13 @@ extension IntegrationSuite {
             throw error
         }
 
-        // Verify writer mounted a virtio block device at /data.
+        // Verify the writer mounted the pod's disk at /data.
         let writerOutput = String(data: writerBuffer.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let writerLines = writerOutput.components(separatedBy: "\n")
         guard !writerLines.isEmpty else {
             throw IntegrationError.assert(msg: "writer produced no output")
         }
-        try assertVirtioBlockMount(writerLines.last!, path: "/data")
+        try assertContainerDiskMount(writerLines.last!, path: "/data")
 
         // Verify the appender read the writer's file.
         let appenderOutput = String(data: appenderBuffer.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -978,7 +991,7 @@ extension IntegrationSuite {
         guard readerLines[1] == "more-content" else {
             throw IntegrationError.assert(msg: "reader: expected 'more-content', got '\(readerLines[1])'")
         }
-        try assertVirtioBlockMount(readerLines[2], path: "/shared")
+        try assertContainerDiskMount(readerLines[2], path: "/shared")
 
         // Verify both writes landed on the host-side EXT4 disk image.
         let firstContent = try readFileFromDiskImage(diskURL, path: "/shared.txt")
