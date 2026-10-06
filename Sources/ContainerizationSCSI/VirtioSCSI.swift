@@ -53,11 +53,32 @@ public protocol VirtioEventQueue: AnyObject {
 /// It is not thread-safe: the device drives it from one serial queue.
 public final class VirtioSCSIController {
     public static let deviceID: UInt16 = 8
-    /// The control queue, the event queue, and one request queue.
-    public static let queueCount: UInt16 = 3
+    /// The control and event queues, ahead of the request queues
+    /// (VIRTIO_SCSI_VQ_NUM_FIXED).
+    public static let fixedQueueCount: UInt16 = 2
     public static let controlQueue: UInt16 = 0
     public static let eventQueue: UInt16 = 1
-    public static let requestQueue: UInt16 = 2
+    /// The entries a queue holds, which the segment limit is sized by: the
+    /// size of the queues of a device on Virtualization's custom virtio
+    /// device interface, and QEMU's virtqueue_size default.
+    public static let virtqueueSize = 256
+    /// The most segments a command takes: its queue's size less the request
+    /// and response headers, the seg_max QEMU reports with seg_max_adjust
+    /// (virtio_scsi_get_config).
+    static let segmentMaximum = virtqueueSize - 2
+    /// The most queues a virtio device has (VIRTIO_QUEUE_MAX in
+    /// include/hw/virtio/virtio.h).
+    static let maximumQueues = 1024
+
+    /// The request queues of a device in a machine of `cpus` vCPUs: one per
+    /// vCPU, as QEMU's virtio-scsi-pci gives a device by default
+    /// (VIRTIO_SCSI_AUTO_NUM_QUEUES, virtio_pci_optimal_num_queues in
+    /// hw/virtio/virtio-pci.c), within the queues a device can have.
+    /// https://github.com/qemu/qemu/blob/d7a65d1793d6/hw/virtio/virtio-scsi-pci.c
+    /// https://github.com/qemu/qemu/blob/d7a65d1793d6/hw/virtio/virtio-pci.c
+    public static func requestQueueCount(cpus: Int) -> Int {
+        min(max(cpus, 1), maximumQueues - Int(fixedQueueCount))
+    }
     /// VIRTIO_SCSI_F_HOTPLUG: logical units come and go, reported as events.
     public static let hotplugFeature: UInt64 = 1 << 1
     /// VIRTIO_SCSI_F_CHANGE: a logical unit's parameters change, reported as
@@ -113,23 +134,28 @@ public final class VirtioSCSIController {
     static let rescan: UInt32 = 1
     static let removed: UInt32 = 2
 
-    /// struct virtio_scsi_config: one request queue, segments as QEMU allows
-    /// them when it does not size them by the queue (its seg_max of 128 - 2),
-    /// QEMU's max_sectors and cmd_per_lun, and the largest targets and LUNs.
-    public static let configurationSpace: [UInt8] = {
+    /// The device's request queues.
+    public let requestQueueCount: Int
+    /// The control queue, the event queue and the request queues.
+    public var queueCount: UInt16 { Self.fixedQueueCount + UInt16(requestQueueCount) }
+
+    /// struct virtio_scsi_config: the request queues, the segments their
+    /// size allows, QEMU's max_sectors and cmd_per_lun, and the largest
+    /// targets and LUNs.
+    public var configurationSpace: [UInt8] {
         var space = [UInt8]()
-        space.appendLittleEndian(UInt32(1))
-        space.appendLittleEndian(UInt32(126))
+        space.appendLittleEndian(UInt32(requestQueueCount))
+        space.appendLittleEndian(UInt32(Self.segmentMaximum))
         space.appendLittleEndian(UInt32(0xffff))
         space.appendLittleEndian(UInt32(128))
-        space.appendLittleEndian(UInt32(eventLength))
-        space.appendLittleEndian(UInt32(senseSize))
-        space.appendLittleEndian(UInt32(cdbSize))
+        space.appendLittleEndian(UInt32(Self.eventLength))
+        space.appendLittleEndian(UInt32(Self.senseSize))
+        space.appendLittleEndian(UInt32(Self.cdbSize))
         space.appendLittleEndian(UInt16(0))
-        space.appendLittleEndian(UInt16(maximumTarget))
-        space.appendLittleEndian(UInt32(maximumLUN))
+        space.appendLittleEndian(UInt16(Self.maximumTarget))
+        space.appendLittleEndian(UInt32(Self.maximumLUN))
         return space
-    }()
+    }
 
     /// Called when the driver broke the transport, with what it did: the
     /// device needs a reset (virtio_error), and takes nothing from its
@@ -148,7 +174,10 @@ public final class VirtioSCSIController {
     /// went out.
     private var eventsDropped = false
 
-    public init() {}
+    /// An adapter with `requestQueues` request queues.
+    public init(requestQueues: Int = 1) {
+        self.requestQueueCount = min(max(requestQueues, 1), Self.maximumQueues - Int(Self.fixedQueueCount))
+    }
 
     // MARK: - Device life cycle
 

@@ -36,12 +36,16 @@ final class VZVirtioSCSI: NSObject, VZCustomVirtioDeviceConfigurationDelegate, V
     private let logger: Logger?
 
     // Touched only on `deviceQueue`.
-    private let controller = VirtioSCSIController()
+    private let controller: VirtioSCSIController
     private var device: VZCustomVirtioDevice?
 
-    init(logger: Logger?) {
+    /// A host adapter for a machine of `cpus` vCPUs, with a request queue
+    /// for each.
+    init(cpus: Int, logger: Logger?) {
         self.logger = logger
         self.deviceQueue = DispatchQueue(label: "com.apple.containerization.vzscsi.\(UUID().uuidString)")
+        let controller = VirtioSCSIController(requestQueues: VirtioSCSIController.requestQueueCount(cpus: cpus))
+        self.controller = controller
 
         let configuration = VZCustomVirtioDeviceConfiguration()
         configuration.deviceID = VirtioSCSIController.deviceID
@@ -49,11 +53,11 @@ final class VZVirtioSCSI: NSObject, VZCustomVirtioDeviceConfigurationDelegate, V
         // https://github.com/qemu/qemu/blob/d7a65d1793d6/hw/virtio/virtio-scsi-pci.c
         configuration.pciClassID = 0x01
         configuration.pciSubclassID = 0x00
-        configuration.virtioQueueCount = VirtioSCSIController.queueCount
+        configuration.virtioQueueCount = controller.queueCount
         configuration.optionalFeatures.subset0 = UInt32(truncatingIfNeeded: VirtioSCSIController.offeredFeatures)
         configuration.optionalFeatures.subset1 = UInt32(truncatingIfNeeded: VirtioSCSIController.offeredFeatures >> 32)
         configuration.deviceSpecificConfiguration = VZVirtioDeviceSpecificConfiguration(
-            configurationData: Data(VirtioSCSIController.configurationSpace)
+            configurationData: Data(controller.configurationSpace)
         )
         self.configuration = configuration
         super.init()
@@ -146,6 +150,16 @@ final class VZVirtioSCSI: NSObject, VZCustomVirtioDeviceConfigurationDelegate, V
     // MARK: - VZCustomVirtioDeviceDelegate
 
     func customVirtioDeviceDidAcceptDriverOk(_ device: VZCustomVirtioDevice) {
+        // The segment limit the device reported is sized for queues of
+        // `virtqueueSize` entries; Virtualization sizes them.
+        for index in 0..<controller.queueCount {
+            if let queue = device.queue(at: index), Int(queue.queueSize) < VirtioSCSIController.virtqueueSize {
+                logger?.error(
+                    "virtio-scsi queue is smaller than its segment limit assumes",
+                    metadata: ["queue": "\(index)", "size": "\(queue.queueSize)", "assumed": "\(VirtioSCSIController.virtqueueSize)"]
+                )
+            }
+        }
         guard let queue = device.queue(at: VirtioSCSIController.eventQueue) else {
             logger?.error("virtio-scsi device has no event queue after DRIVER_OK")
             return

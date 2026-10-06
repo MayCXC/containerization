@@ -104,19 +104,30 @@ private let removed: UInt32 = 2
 /// at d7a65d1793d6) and the virtio specification's section 5.6.
 struct VirtioSCSITests {
     @Test func configurationSpace() {
-        // virtio_scsi_get_config with QEMU's defaults: one request queue,
-        // seg_max 128 - 2, max_sectors 0xFFFF, cmd_per_lun 128, a 16-byte
-        // event, 96 bytes of sense, a 32-byte CDB, channel 0, target 255 and
-        // LUN 16383.
+        // virtio_scsi_get_config with QEMU's defaults: the request queues,
+        // seg_max sized by the queue (256 - 2), max_sectors 0xFFFF,
+        // cmd_per_lun 128, a 16-byte event, 96 bytes of sense, a 32-byte CDB,
+        // channel 0, target 255 and LUN 16383.
+        let controller = VirtioSCSIController(requestQueues: 4)
         #expect(
-            VirtioSCSIController.configurationSpace == [
-                1, 0, 0, 0, 126, 0, 0, 0, 0xff, 0xff, 0, 0, 128, 0, 0, 0, 16, 0, 0, 0, 96, 0, 0, 0, 32, 0, 0, 0, 0, 0, 255, 0, 0xff, 0x3f, 0, 0,
+            controller.configurationSpace == [
+                4, 0, 0, 0, 254, 0, 0, 0, 0xff, 0xff, 0, 0, 128, 0, 0, 0, 16, 0, 0, 0, 96, 0, 0, 0, 32, 0, 0, 0, 0, 0, 255, 0, 0xff, 0x3f, 0, 0,
             ])
         #expect(VirtioSCSIController.deviceID == 8)
-        #expect(VirtioSCSIController.queueCount == 3)
+        // The control and event queues, then the request queues.
+        #expect(controller.queueCount == 6)
         // VIRTIO_SCSI_F_HOTPLUG and VIRTIO_SCSI_F_CHANGE, as QEMU's hotplug
         // and param_change properties default.
         #expect(VirtioSCSIController.offeredFeatures == 1 << 1 | 1 << 2)
+    }
+
+    @Test func aRequestQueueForEachVCPU() {
+        // virtio_pci_optimal_num_queues: one per vCPU, within the 1024
+        // queues a device can have.
+        #expect(VirtioSCSIController.requestQueueCount(cpus: 1) == 1)
+        #expect(VirtioSCSIController.requestQueueCount(cpus: 8) == 8)
+        #expect(VirtioSCSIController.requestQueueCount(cpus: 4096) == 1022)
+        #expect(VirtioSCSIController(requestQueues: 8).configurationSpace.littleEndian32(at: 0) == 8)
     }
 
     // MARK: Request queue
