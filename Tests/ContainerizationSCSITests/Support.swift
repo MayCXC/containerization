@@ -138,22 +138,19 @@ final class MemoryChain: VirtioDescriptorChain {
         return true
     }
 
+    /// The remaining pieces, held in one array and handed over as the
+    /// buffers they were.
     func readRemaining<Result>(_ body: ([UnsafeRawBufferPointer]) throws -> Result) rethrows -> Result {
         let pieces = readable
         readable = []
-        return try Self.withBytes(of: pieces[...], gathered: [], body)
-    }
-
-    private static func withBytes<Result>(
-        of pieces: ArraySlice<[UInt8]>,
-        gathered: [UnsafeRawBufferPointer],
-        _ body: ([UnsafeRawBufferPointer]) throws -> Result
-    ) rethrows -> Result {
-        guard let piece = pieces.first else {
-            return try body(gathered)
-        }
-        return try piece.withUnsafeBytes { bytes in
-            try withBytes(of: pieces.dropFirst(), gathered: gathered + [bytes], body)
+        return try pieces.flatMap { $0 }.withUnsafeBytes { all in
+            var buffers: [UnsafeRawBufferPointer] = []
+            var offset = 0
+            for piece in pieces {
+                buffers.append(UnsafeRawBufferPointer(rebasing: all[offset..<(offset + piece.count)]))
+                offset += piece.count
+            }
+            return try body(buffers)
         }
     }
 

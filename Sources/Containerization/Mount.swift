@@ -329,6 +329,18 @@ extension Mount {
 
 extension VZDiskImageStorageDeviceAttachment {
     static func mountToVZAttachment(mount: Mount, options: [String]) throws -> VZDiskImageStorageDeviceAttachment {
+        let modes = try diskImageModes(options: options)
+        return try VZDiskImageStorageDeviceAttachment(
+            url: URL(filePath: mount.source),
+            readOnly: mount.readonly,
+            cachingMode: modes.caching,
+            synchronizationMode: modes.synchronization
+        )
+    }
+
+    /// The caching and synchronization modes a disk image mount's runtime
+    /// options ask for.
+    static func diskImageModes(options: [String]) throws -> (caching: VZDiskImageCachingMode, synchronization: VZDiskImageSynchronizationMode) {
         var synchronizationMode: VZDiskImageSynchronizationMode = .fsync
         var cachingMode: VZDiskImageCachingMode = .cached
 
@@ -377,12 +389,7 @@ extension VZDiskImageStorageDeviceAttachment {
                 )
             }
         }
-        return try VZDiskImageStorageDeviceAttachment(
-            url: URL(filePath: mount.source),
-            readOnly: mount.readonly,
-            cachingMode: cachingMode,
-            synchronizationMode: synchronizationMode
-        )
+        return (cachingMode, synchronizationMode)
     }
 }
 
@@ -521,7 +528,7 @@ extension VZDiskBlockDeviceStorageDeviceAttachment {
 #endif
 
 extension Mount {
-    fileprivate var readonly: Bool {
+    var readonly: Bool {
         self.options.contains("ro")
     }
 

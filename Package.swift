@@ -75,6 +75,7 @@ let package = Package(
                 "ContainerizationExtras",
                 "ContainerizationEXT4",
                 "ContainerizationNetlink",
+                .target(name: "ContainerizationSCSI", condition: .when(platforms: [.macOS])),
                 "CShim",
             ],
             exclude: [
