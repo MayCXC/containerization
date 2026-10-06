@@ -690,13 +690,15 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
             metadata: [
                 "type": "\(request.type)",
                 "source": "\(request.source)",
+                "scsiAddress": "\(request.hasScsiAddress ? "\(request.scsiAddress.target):\(request.scsiAddress.lun)" : "none")",
                 "destination": "\(request.destination)",
             ])
 
         do {
+            let source = try await mountSource(of: request)
             let mnt = ContainerizationOS.Mount(
                 type: request.type,
-                source: request.source,
+                source: source,
                 target: request.destination,
                 options: request.options
             )
@@ -755,6 +757,26 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
                 ])
             throw RPCError(code: .internalError, message: "mount", cause: error)
         }
+    }
+
+    /// What a mount request mounts: the block device found at its SCSI
+    /// address when it names one, its source otherwise. Finding the disk is
+    /// SCSI's counterpart of the PCI rescan and retry in `mount`: the host
+    /// scan brings in a logical unit attached to the running machine, and
+    /// the finder waits for its block device before the first mount attempt.
+    private func mountSource(of request: Com_Apple_Containerization_Sandbox_V3_MountRequest) async throws -> String {
+        guard request.hasScsiAddress else {
+            return request.source
+        }
+        let address = request.scsiAddress
+        let device = try await SCSIDiskFinder().find(target: address.target, lun: address.lun)
+        log.info(
+            "mount: found the SCSI disk",
+            metadata: [
+                "scsiAddress": "\(address.target):\(address.lun)",
+                "device": "\(device)",
+            ])
+        return device
     }
 
     public func filesystemOperation(request: Com_Apple_Containerization_Sandbox_V3_FilesystemOperationRequest, context: GRPCCore.ServerContext)

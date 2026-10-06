@@ -329,6 +329,34 @@ public nonisolated struct Com_Apple_Containerization_Sandbox_V3_MountRequest: Se
 
   public var options: [String] = []
 
+  /// A disk on the machine's SCSI host. When set, the guest mounts the block
+  /// device it finds at this address, and source is not read.
+  public var scsiAddress: Com_Apple_Containerization_Sandbox_V3_ScsiAddress {
+    get {_scsiAddress ?? Com_Apple_Containerization_Sandbox_V3_ScsiAddress()}
+    set {_scsiAddress = newValue}
+  }
+  /// Returns true if `scsiAddress` has been explicitly set.
+  public var hasScsiAddress: Bool {self._scsiAddress != nil}
+  /// Clears the value of `scsiAddress`. Subsequent reads from it will return its default value.
+  public mutating func clearScsiAddress() {self._scsiAddress = nil}
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _scsiAddress: Com_Apple_Containerization_Sandbox_V3_ScsiAddress? = nil
+}
+
+/// A logical unit's address on the guest's SCSI host, on channel 0.
+public nonisolated struct Com_Apple_Containerization_Sandbox_V3_ScsiAddress: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var target: UInt32 = 0
+
+  public var lun: UInt32 = 0
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -2169,7 +2197,7 @@ nonisolated extension Com_Apple_Containerization_Sandbox_V3_StopVsockProxyRespon
 
 nonisolated extension Com_Apple_Containerization_Sandbox_V3_MountRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".MountRequest"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}type\0\u{1}source\0\u{1}destination\0\u{1}options\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}type\0\u{1}source\0\u{1}destination\0\u{1}options\0\u{3}scsi_address\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2181,12 +2209,17 @@ nonisolated extension Com_Apple_Containerization_Sandbox_V3_MountRequest: SwiftP
       case 2: try { try decoder.decodeSingularStringField(value: &self.source) }()
       case 3: try { try decoder.decodeSingularStringField(value: &self.destination) }()
       case 4: try { try decoder.decodeRepeatedStringField(value: &self.options) }()
+      case 5: try { try decoder.decodeSingularMessageField(value: &self._scsiAddress) }()
       default: break
       }
     }
   }
 
   public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
     if !self.type.isEmpty {
       try visitor.visitSingularStringField(value: self.type, fieldNumber: 1)
     }
@@ -2199,6 +2232,9 @@ nonisolated extension Com_Apple_Containerization_Sandbox_V3_MountRequest: SwiftP
     if !self.options.isEmpty {
       try visitor.visitRepeatedStringField(value: self.options, fieldNumber: 4)
     }
+    try { if let v = self._scsiAddress {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 5)
+    } }()
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -2207,6 +2243,42 @@ nonisolated extension Com_Apple_Containerization_Sandbox_V3_MountRequest: SwiftP
     if lhs.source != rhs.source {return false}
     if lhs.destination != rhs.destination {return false}
     if lhs.options != rhs.options {return false}
+    if lhs._scsiAddress != rhs._scsiAddress {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Com_Apple_Containerization_Sandbox_V3_ScsiAddress: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ScsiAddress"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}target\0\u{1}lun\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt32Field(value: &self.target) }()
+      case 2: try { try decoder.decodeSingularUInt32Field(value: &self.lun) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.target != 0 {
+      try visitor.visitSingularUInt32Field(value: self.target, fieldNumber: 1)
+    }
+    if self.lun != 0 {
+      try visitor.visitSingularUInt32Field(value: self.lun, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Com_Apple_Containerization_Sandbox_V3_ScsiAddress, rhs: Com_Apple_Containerization_Sandbox_V3_ScsiAddress) -> Bool {
+    if lhs.target != rhs.target {return false}
+    if lhs.lun != rhs.lun {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

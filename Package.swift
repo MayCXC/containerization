@@ -349,7 +349,7 @@ let package = Package(
         ),
         .testTarget(
             name: "VminitdCoreTests",
-            dependencies: ["VminitdCore"]
+            dependencies: ["VminitdCore", "ContainerizationError"]
         ),
     ]
 )
