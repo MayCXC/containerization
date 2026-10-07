@@ -62,6 +62,8 @@ public protocol VirtualMachineAgent: Sendable {
     func sync() async throws
     func writeFile(path: String, data: Data, flags: WriteFileFlags, mode: UInt32) async throws
     func sysctl(settings: [String: String]) async throws
+    /// Compact the guest's memory if `policy` calls for it now.
+    func compactMemory(policy: MemoryCompactionPolicy) async throws -> MemoryCompactionPolicy.Outcome
 
     // Process lifecycle
     func createProcess(
@@ -92,6 +94,8 @@ public protocol VirtualMachineAgent: Sendable {
 
     // Container statistics
     func containerStatistics(containerIDs: [String], categories: StatCategory) async throws -> [ContainerStatistics]
+    /// The guest kernel's account of the whole machine's memory.
+    func memoryInfo() async throws -> LinuxMemoryInfo
 
 }
 
@@ -119,6 +123,10 @@ extension VirtualMachineAgent {
         }
     }
 
+    public func compactMemory(policy: MemoryCompactionPolicy) async throws -> MemoryCompactionPolicy.Outcome {
+        throw ContainerizationError(.unsupported, message: "compactMemory")
+    }
+
     public func configureHosts(config: Hosts, location: String) async throws {
         throw ContainerizationError(.unsupported, message: "configureHosts")
     }
@@ -129,6 +137,10 @@ extension VirtualMachineAgent {
 
     public func containerStatistics(containerIDs: [String], categories: StatCategory) async throws -> [ContainerStatistics] {
         throw ContainerizationError(.unsupported, message: "containerStatistics")
+    }
+
+    public func memoryInfo() async throws -> LinuxMemoryInfo {
+        throw ContainerizationError(.unsupported, message: "memoryInfo")
     }
 
     public func sync() async throws {

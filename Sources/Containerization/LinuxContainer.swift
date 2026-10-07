@@ -1366,6 +1366,16 @@ extension LinuxContainer {
         return try await fn(vm)
     }
 
+    /// Ask the machine to hold no more than `bytes`. The balloon takes the
+    /// difference from the guest, and hands it back when the target is raised
+    /// again, so nothing changes until the guest has acted on the request.
+    public func setTargetMemorySize(_ bytes: UInt64) async throws {
+        let vm = try await self.state.withLock { state in
+            try state.vm("setTargetMemorySize")
+        }
+        try await vm.setTargetMemorySize(bytes)
+    }
+
     /// Close the containers standard input to signal no more input is
     /// arriving.
     public func closeStdin() async throws {

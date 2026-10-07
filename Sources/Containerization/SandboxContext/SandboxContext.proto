@@ -18,6 +18,8 @@ service SandboxContext {
   rpc Mkdir(MkdirRequest) returns (MkdirResponse);
   // Set sysctls in the context of the sandbox.
   rpc Sysctl(SysctlRequest) returns (SysctlResponse);
+  // Compact the guest's memory, when Kata's mem-agent would.
+  rpc CompactMemory(CompactMemoryRequest) returns (CompactMemoryResponse);
   // Set time in the guest.
   rpc SetTime(SetTimeRequest) returns (SetTimeResponse);
   // Set up an emulator in the guest for a specific binary format.
@@ -51,6 +53,8 @@ service SandboxContext {
 
   // Get statistics for containers.
   rpc ContainerStatistics(ContainerStatisticsRequest) returns (ContainerStatisticsResponse);
+  // Get the guest kernel's account of its memory from /proc/meminfo.
+  rpc MemoryInfo(MemoryInfoRequest) returns (MemoryInfoResponse);
 
   // Proxy a vsock port to a unix domain socket in the guest, or vice versa.
   rpc ProxyVsock(ProxyVsockRequest) returns (ProxyVsockResponse);
@@ -104,6 +108,40 @@ message SetTimeResponse {}
 message SysctlRequest { map<string, string> settings = 1; }
 
 message SysctlResponse {}
+
+// The configuration of mem-agent's compaction, by its own names:
+// https://github.com/kata-containers/kata-containers/blob/846c6f80343788a057eedc15fae7f3c91ae2d13a/src/libs/mem-agent/src/compact.rs
+message CompactMemoryRequest {
+  // The least seconds from one attempt to the next.
+  uint64 period_secs = 1;
+  // Skip an attempt when memory and IO stalled for more than this percentage
+  // of the time since the last attempt.
+  uint64 period_psi_percent_limit = 2;
+  // Stop a compaction when memory and IO stall for more than this percentage
+  // of a second while it runs.
+  uint64 compact_psi_percent_limit = 3;
+  // Stop a compaction after this many seconds.
+  uint64 compact_sec_max = 4;
+  // The order of the free blocks compaction is for.
+  uint32 compact_order = 5;
+  // How far the guest has to move after one compaction for another to be
+  // worth it, in pages.
+  uint64 compact_threshold = 6;
+}
+
+message CompactMemoryResponse {
+  enum Outcome {
+    // The guest compacted, until done or stopped by its limits.
+    COMPACTED = 0;
+    // Less than period_secs had passed since the last attempt.
+    NOT_DUE = 1;
+    // Memory and IO stalled for more than period_psi_percent_limit.
+    UNDER_PRESSURE = 2;
+    // The guest's memory had not moved far enough since the last compaction.
+    NOT_FRAGMENTED = 3;
+  }
+  Outcome outcome = 1;
+}
 
 message ProxyVsockRequest {
   enum Action {
@@ -527,4 +565,20 @@ message FilesystemStats {
   uint64 inodes = 5;
   // f_ffree: free inodes in the filesystem.
   uint64 free_inodes = 6;
+}
+
+message MemoryInfoRequest {}
+
+// Fields of the guest's /proc/meminfo, in bytes.
+message MemoryInfoResponse {
+  // MemTotal.
+  uint64 total_bytes = 1;
+  // MemFree.
+  uint64 free_bytes = 2;
+  // MemAvailable.
+  uint64 available_bytes = 3;
+  // Committed_AS.
+  uint64 committed_bytes = 4;
+  // Balloon, absent when the kernel does not print it.
+  optional uint64 balloon_bytes = 5;
 }

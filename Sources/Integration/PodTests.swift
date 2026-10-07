@@ -94,6 +94,95 @@ extension IntegrationSuite {
         }
     }
 
+    /// Wait until the pod's balloon policy has gone two seconds without
+    /// changing the machine, then return what it has done and what the guest
+    /// reports.
+    private func settledBalloon(
+        _ pod: LinuxPod,
+        timeout: Duration = .seconds(90)
+    ) async throws -> (report: MemoryBalloonController.Report, info: LinuxMemoryInfo) {
+        let deadline = ContinuousClock.now + timeout
+        var changes = -1
+        var quietSince = ContinuousClock.now
+        while ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(500))
+            guard let report = try await pod.memoryBalloonReport() else {
+                throw IntegrationError.assert(msg: "no balloon policy runs: the machine has no memory balloon")
+            }
+            if report.shrinks + report.grows != changes {
+                changes = report.shrinks + report.grows
+                quietSince = ContinuousClock.now
+            } else if ContinuousClock.now - quietSince >= .seconds(2) {
+                return (report, try await pod.memoryInfo())
+            }
+        }
+        throw IntegrationError.assert(msg: "the balloon policy was still changing the machine after \(timeout)")
+    }
+
+    func testPodMemoryBalloonPolicy() async throws {
+        let id = "test-pod-memory-balloon-policy"
+
+        let bs = try await bootstrap(id)
+        // Short intervals let the policy take its many steps within the test.
+        var policy = MemoryBalloonPolicy()
+        policy.sampleInterval = .milliseconds(250)
+        policy.decisionInterval = .milliseconds(500)
+        policy.sampleHistory = 2
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: VMResources(cpus: 2, memoryInBytes: 2048.mib())) { config in
+            config.bootLog = bs.bootLog
+            config.memoryBalloonPolicy = policy
+        }
+
+        try await pod.addContainer("container1", rootfs: bs.rootfs) { config in
+            config.process.arguments = ["/bin/sleep", "300"]
+        }
+
+        try await pod.create()
+        let shrunk: (report: MemoryBalloonController.Report, info: LinuxMemoryInfo)
+        let grown: (report: MemoryBalloonController.Report, info: LinuxMemoryInfo)
+        do {
+            try await pod.startContainer("container1")
+
+            // An idle guest needs a fraction of the machine, so the policy
+            // shrinks it step by step until it holds that plus the buffer.
+            shrunk = try await settledBalloon(pod)
+
+            // A process that commits 1 GiB without touching it raises what
+            // the guest needs by as much while using no memory, so only the
+            // policy can give the machine memory back for it.
+            let exec = try await pod.execInContainer("container1", processID: "commit") { config in
+                config.arguments = ["sh", "-c", "sleep 300 | dd bs=1073741824 count=1 of=/dev/null"]
+            }
+            try await exec.start()
+            grown = try await settledBalloon(pod)
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+        try await pod.stop()
+
+        log.info("balloon policy, idle: \(String(describing: shrunk))")
+        log.info("balloon policy, 1 GiB committed: \(String(describing: grown))")
+        let shrunkBalloon = shrunk.info.balloonBytes ?? 0
+        let grownBalloon = grown.info.balloonBytes ?? 0
+        guard shrunk.report.shrinks >= 3, shrunkBalloon >= 256.mib() else {
+            throw IntegrationError.assert(msg: "the policy did not shrink the idle machine: \(shrunk)")
+        }
+        // The balloon leaves the guest at least its floor available, as Linux's
+        // Hyper-V balloon does; a sample or two of drift is allowed.
+        let floor = MemoryBalloonPolicy.balloonFloor(shrunk.info.totalBytes - min(shrunkBalloon, shrunk.info.totalBytes))
+        guard shrunk.info.availableBytes + 16.mib() >= floor else {
+            throw IntegrationError.assert(
+                msg: "the policy left the idle guest \(shrunk.info.availableBytes >> 20) MiB available, under its \(floor >> 20) MiB floor")
+        }
+        guard grown.info.committedBytes >= shrunk.info.committedBytes + 1024.mib() - 64.mib() else {
+            throw IntegrationError.assert(msg: "the guest did not commit the 1 GiB: \(shrunk.info.committedBytes) then \(grown.info.committedBytes)")
+        }
+        guard grown.report.grows >= 1, grownBalloon + min(shrunkBalloon, 1024.mib()) <= shrunkBalloon + 64.mib() else {
+            throw IntegrationError.assert(msg: "the policy did not give the machine back what its guest came to need: \(grown)")
+        }
+    }
+
     func testPodMultipleContainers() async throws {
         let id = "test-pod-multiple-containers"
 

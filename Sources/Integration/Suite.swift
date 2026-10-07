@@ -522,7 +522,8 @@ struct IntegrationSuite: AsyncParsableCommand {
         return VZVirtualMachineManager(
             kernel: kernel,
             initialFilesystem: initialFilesystem,
-            group: Self.eventLoop
+            group: Self.eventLoop,
+            logger: log
         )
         #elseif os(Linux)
         return try CHVirtualMachineManager(
@@ -620,6 +621,8 @@ struct IntegrationSuite: AsyncParsableCommand {
         return []
     }
 
+    /// The balloon and the virtio-scsi host are Virtio devices this process
+    /// implements, which Virtualization allows from macOS 27.
     private func macOS27Tests() -> [Test] {
         if #available(macOS 27, *) {
             return hotplugDiskTests() + [
@@ -637,6 +640,10 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("pod hotplug scsi rootfs and volume", testPodHotplugSCSIRootfsAndVolume),
                 Test("pod default driver refuses a joining disk", testPodDefaultDriverRefusesJoiningDisk),
                 Test("pod scsi streams against virtio-blk", testPodSCSIStreams),
+                Test("container memory balloon", testContainerMemoryBalloon),
+                Test("container memory balloon keeps guest data", testContainerMemoryBalloonKeepsGuestData),
+                Test("container memory compaction", testContainerMemoryCompaction),
+                Test("pod memory balloon policy", testPodMemoryBalloonPolicy),
             ]
         }
         return []
