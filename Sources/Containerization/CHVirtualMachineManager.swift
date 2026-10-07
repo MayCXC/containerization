@@ -95,6 +95,12 @@ public struct CHVirtualMachineManager: VirtualMachineManager {
     public func create(config: some VMCreationConfig) async throws -> any VirtualMachineInstance {
         let vmConfig = config.configuration
 
+        // cloud-hypervisor attaches disks as virtio block devices and has no
+        // virtio-scsi host, which is why Kata's configuration for it offers
+        // virtio-blk alone:
+        // https://github.com/kata-containers/kata-containers/blob/ea7aba03b1d48813cae07413c95ab6bc464b7a5f/src/runtime/config/configuration-clh.toml.in#L177-L179
+        try vmConfig.blockDeviceDriver.require(scsiHost: "cloud-hypervisor has no virtio-scsi device")
+
         var instanceConfig = CHVirtualMachineInstance.Configuration()
         instanceConfig.cpus = vmConfig.cpus
         instanceConfig.memoryInBytes = vmConfig.memoryInBytes

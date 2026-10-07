@@ -51,6 +51,10 @@ public protocol VirtualMachineAgent: Sendable {
     func getenv(key: String) async throws -> String
     func setenv(key: String, value: String) async throws
     func mount(_ mount: ContainerizationOCI.Mount) async throws
+    /// Mount the disk the machine's virtio-scsi host has at `scsiAddress`;
+    /// the guest finds the disk by its address, and `mount.source` is not
+    /// read.
+    func mount(_ mount: ContainerizationOCI.Mount, scsiAddress: SCSIAddress) async throws
     func umount(path: String, flags: Int32) async throws
     func mkdir(path: String, all: Bool, perms: UInt32) async throws
     @discardableResult
@@ -97,6 +101,21 @@ extension VirtualMachineAgent {
 
     public func trimContainerRootfs(containerID: String) async throws -> UInt64 {
         throw ContainerizationError(.unsupported, message: "trimContainerRootfs")
+    }
+
+    public func mount(_ mount: ContainerizationOCI.Mount, scsiAddress: SCSIAddress) async throws {
+        throw ContainerizationError(.unsupported, message: "mount by SCSI address")
+    }
+
+    /// Mount `mount` from the filesystem `attachment` describes: the disk at
+    /// its SCSI address when the machine's virtio-scsi host attached it, its
+    /// source otherwise.
+    func mount(_ mount: ContainerizationOCI.Mount, of attachment: AttachedFilesystem) async throws {
+        if let scsiAddress = attachment.scsiAddress {
+            try await self.mount(mount, scsiAddress: scsiAddress)
+        } else {
+            try await self.mount(mount)
+        }
     }
 
     public func configureHosts(config: Hosts, location: String) async throws {

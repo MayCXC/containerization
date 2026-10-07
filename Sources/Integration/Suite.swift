@@ -259,6 +259,18 @@ struct IntegrationSuite: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Only run tests whose names contain this string")
     var filter: String?
 
+    @Option(
+        name: .long,
+        help: "Block device driver for every machine a test leaves on the default: virtio-blk or virtio-scsi",
+        transform: {
+            guard let driver = BlockDeviceDriver(rawValue: $0) else {
+                throw ValidationError("unknown block device driver \($0); expected virtio-blk or virtio-scsi")
+            }
+            return driver
+        }
+    )
+    var blockDeviceDriver: BlockDeviceDriver?
+
     #if os(Linux)
     @Option(name: .long, help: "Path to cloud-hypervisor binary (Linux only). Defaults to PATH lookup.")
     var chBinary: String?
@@ -360,6 +372,27 @@ struct IntegrationSuite: AsyncParsableCommand {
     }
     #endif
 
+    /// The swap area a test hands to a container. A suite that builds its own
+    /// containers owns the file behind them, the way `ContainerManager` owns
+    /// the ones it makes for callers that do not.
+    static func makeSwapDevice(at path: URL, size: UInt64) throws -> Containerization.Mount {
+        guard FileManager.default.createFile(atPath: path.absolutePath(), contents: nil) else {
+            throw IntegrationError.assert(msg: "failed to create swap device at \(path.absolutePath())")
+        }
+        let handle = try FileHandle(forWritingTo: path)
+        defer { try? handle.close() }
+        try handle.truncate(atOffset: size)
+        // A swap area holds nothing that outlives the container, so the host
+        // has no reason to synchronize it to permanent storage.
+        return .block(
+            format: Swap.mountType,
+            source: path.absolutePath(),
+            destination: "",
+            options: [],
+            runtimeOptions: ["vzDiskImageSynchronizationMode=none"]
+        )
+    }
+
     func bootstrap(
         _ testID: String,
         reference: String = "ghcr.io/linuxcontainers/alpine:3.20",
@@ -441,12 +474,15 @@ struct IntegrationSuite: AsyncParsableCommand {
         try? FileManager.default.createDirectory(at: bootlogDirURL, withIntermediateDirectories: true)
         let bootlogURL = bootlogDirURL.appendingPathComponent("\(testID).log")
 
-        let vmm: any VirtualMachineManager = try Self.makeVMM(
+        var vmm: any VirtualMachineManager = try Self.makeVMM(
             kernel: testKernel,
             initialFilesystem: initfsPerTest,
             chBinary: Self.chBinaryOverride(for: self),
             virtiofsdBinary: Self.virtiofsdBinaryOverride(for: self)
         )
+        if let blockDeviceDriver {
+            vmm = BlockDeviceDriverMachines(base: vmm, driver: blockDeviceDriver, overridesConfigured: false)
+        }
 
         return (
             cl,
@@ -530,6 +566,36 @@ struct IntegrationSuite: AsyncParsableCommand {
         }
     }
 
+    /// The block device driver a pod's machine takes disks on while it runs:
+    /// virtio-blk on cloud-hypervisor, which hot-adds virtio block devices
+    /// and has no virtio-scsi host, and virtio-scsi on Virtualization, which
+    /// adds no virtio block device to a running machine.
+    static var hotplugBlockDeviceDriver: BlockDeviceDriver {
+        #if os(macOS)
+        .virtioSCSI
+        #else
+        .virtioBlock
+        #endif
+    }
+
+    /// Disks given to a pod's running machine: cloud-hypervisor adds each as
+    /// a device of its own, Virtualization as a logical unit of the
+    /// machine's virtio-scsi host, which macOS 27 lets this process implement.
+    private func hotplugDiskTests() -> [Test] {
+        [
+            Test("pod hotplug block rootfs", testPodHotplugBlockRootfs),
+            Test("pod hotplug block volume", testPodHotplugBlockVolume),
+            Test("pod hotplug block volume shared", testPodHotplugBlockVolumeShared),
+            Test("pod hotplug block volume read-only", testPodHotplugBlockVolumeReadOnly),
+            Test("pod hotplug block volume counted", testPodHotplugBlockVolumeCounted),
+            Test("pod hotplug writable layer", testPodHotplugWritableLayer),
+            Test("pod hotplug virtiofs share", testPodHotplugVirtiofsShare),
+            Test("pod hotplug virtiofs same share", testPodHotplugVirtiofsSameShare),
+            Test("pod hotplug virtiofs share lifecycle", testPodHotplugVirtiofsShareLifecycle),
+            Test("pod restart stopped container", testPodRestartStoppedContainer),
+        ]
+    }
+
     #if os(macOS)
     private func macOS26Tests() -> [Test] {
         if #available(macOS 26.0, *) {
@@ -544,7 +610,31 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("container IPv6 only default route", testIPv6OnlyDefaultRoute),
                 Test("container IPv6 only gateway outside subnet", testIPv6OnlyGatewayOutsideSubnet),
                 Test("container IPv6 dual stack", testIPv6DualStack),
+                Test("pod shared swap", testPodSharedSwap),
+                Test("pod container swap limit", testPodContainerSwapLimit),
                 Test("pod IPv6 address", testPodIPv6AddressAdd),
+            ]
+        }
+        return []
+    }
+
+    private func macOS27Tests() -> [Test] {
+        if #available(macOS 27, *) {
+            return hotplugDiskTests() + [
+                Test("pod hotplug volume shared by two", testPodHotplugVolumeSharedByTwo),
+                Test("pod hotplug volume held by another machine", testPodHotplugVolumeHeldByAnotherMachine),
+                Test("pod hotplug volume held for the pod's life", testPodHotplugVolumeHeldForPodLife),
+                Test("pod scsi volume across stop and start", testPodSCSIVolumeAcrossStopAndStart),
+                Test("pod forty scsi volumes", testPodFortySCSIVolumes),
+                Test("pod hotplug scsi rootfs", testPodHotplugSCSIRootfs),
+                Test("pod scsi volume keeps unsynced writes", testPodSCSIVolumeKeepsUnsyncedWrites),
+                Test("pod scsi speed against virtio-blk", testPodSCSISpeed),
+                Test("container disk on the scsi host", testContainerDiskOnSCSIHost),
+                Test("container disk on the default driver", testContainerDiskOnDefaultDriver),
+                Test("pod container disks on the scsi host", testPodContainerDisksOnSCSIHost),
+                Test("pod hotplug scsi rootfs and volume", testPodHotplugSCSIRootfsAndVolume),
+                Test("pod default driver refuses a joining disk", testPodDefaultDriverRefusesJoiningDisk),
+                Test("pod scsi streams against virtio-blk", testPodSCSIStreams),
             ]
         }
         return []
@@ -582,6 +672,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("container cgroup delegation", testContainerCgroupDelegation),
             Test("container mount propagation", testContainerMountPropagation),
             Test("container systemd", testContainerSystemd),
+            Test("declared devices", testContainerDeclaredDevices),
             Test("process echo hi", testProcessEchoHi),
             Test("process no executable", testProcessNoExecutable),
             Test("process user", testProcessUser),
@@ -696,6 +787,9 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("pod cgroup delegation", testPodCgroupDelegation),
             Test("pod multiple containers", testPodMultipleContainers),
             Test("pod rootless containers", testPodRootlessContainers),
+            Test("pod boot setup failure is the member's own", testPodBootSetupFailureIsTheMembersOwn),
+            Test("pod boot volume failure is its members'", testPodBootVolumeFailureIsItsMembers),
+            Test("pod removal unmounts an errored member's root", testPodRemovalUnmountsAnErroredMembersRoot),
             Test("pod container output", testPodContainerOutput),
             Test("pod concurrent containers", testPodConcurrentContainers),
             Test("pod exec in container", testPodExecInContainer),
@@ -735,6 +829,8 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("pod sysctl multiple containers", testPodSysctlMultipleContainers),
             Test("pod invalid volume reference", testPodInvalidVolumeReference),
             Test("pod duplicate volume name", testPodDuplicateVolumeName),
+            Test("pod block volume shared by containers", testPodBlockVolumeSharedByContainers),
+            Test("pod block volume of declared image", testPodBlockVolumeOfDeclaredImage),
 
             // Mounts / virtiofs shares (cross-platform: VZ on macOS, virtiofsd on Linux/CH).
             Test("container mount", testMounts),
@@ -829,16 +925,20 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("cctl run without entrypoint or cmd fails", testCctlRunWithoutEntrypointOrCmdFails),
                 Test("cctl run entrypoint override keeps image cmd", testCctlRunEntrypointOverrideKeepsImageCmd),
                 Test("cctl run entrypoint override with command", testCctlRunEntrypointOverrideWithCommand),
-            ] + macOS26Tests()
+
+                // Swap
+                Test("container swap", testContainerSwap),
+                Test("container swap under pressure", testContainerSwapUnderPressure),
+                Test("container swap reclaims freed blocks", testContainerSwapReclaimsFreedBlocks),
+            ] + macOS26Tests() + macOS27Tests()
         let tests: [Test] = crossPlatformTests + macOSOnlyTests
         #else
-        // Hotplug into a running pod VM is CH-only (VZ has no runtime hotplug),
-        // and no pod test elsewhere exercises addContainer-after-create.
-        let linuxOnlyTests: [Test] = [
-            Test("pod hotplug block rootfs", testPodHotplugBlockRootfs),
-            Test("pod hotplug virtiofs rootfs", testPodHotplugVirtiofsRootfs),
-            Test("pod hotplug writable layer", testPodHotplugWritableLayer),
-        ]
+        // A virtiofs rootfs rides its own device, which cloud-hypervisor alone
+        // adds to a running machine.
+        let linuxOnlyTests: [Test] =
+            hotplugDiskTests() + [
+                Test("pod hotplug virtiofs rootfs", testPodHotplugVirtiofsRootfs)
+            ]
         let tests: [Test] = crossPlatformTests + linuxOnlyTests
         #endif
 

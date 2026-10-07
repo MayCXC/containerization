@@ -211,6 +211,9 @@ public struct ContainerManager: Sendable {
     ///   - writableLayerSizeInBytes: Optional size for a separate writable layer. When provided,
     ///     the rootfs becomes read-only and an overlayfs is used with a separate writable layer of this size.
     ///   - readOnly: Whether to mount the root filesystem as read-only.
+    ///   - swapSizeInBytes: Optional size for a swap area. When provided, a raw block
+    ///     device of this size is created and the guest enables it as swap, so a
+    ///     workload exceeding its memory limit reclaims rather than being killed.
     ///   - networking: Whether to create a network interface for this container. Defaults to `true`.
     ///     When `false`, no network resources are allocated and `releaseNetwork`/`delete` remain safe to call.
     ///   - vm: The size of the VM the container runs in.
@@ -220,6 +223,7 @@ public struct ContainerManager: Sendable {
         reference: String,
         rootfsSizeInBytes: UInt64 = 8.gib(),
         writableLayerSizeInBytes: UInt64? = nil,
+        swapSizeInBytes: UInt64? = nil,
         readOnly: Bool = false,
         networking: Bool = true,
         vm: VMResources = .default,
@@ -232,6 +236,7 @@ public struct ContainerManager: Sendable {
             image: image,
             rootfsSizeInBytes: rootfsSizeInBytes,
             writableLayerSizeInBytes: writableLayerSizeInBytes,
+            swapSizeInBytes: swapSizeInBytes,
             readOnly: readOnly,
             networking: networking,
             vm: vm,
@@ -248,6 +253,9 @@ public struct ContainerManager: Sendable {
     ///   - writableLayerSizeInBytes: Optional size for a separate writable layer. When provided,
     ///     the rootfs becomes read-only and an overlayfs is used with a separate writable layer of this size.
     ///   - readOnly: Whether to mount the root filesystem as read-only.
+    ///   - swapSizeInBytes: Optional size for a swap area. When provided, a raw block
+    ///     device of this size is created and the guest enables it as swap, so a
+    ///     workload exceeding its memory limit reclaims rather than being killed.
     ///   - networking: Whether to create a network interface for this container. Defaults to `true`.
     ///     When `false`, no network resources are allocated and `releaseNetwork`/`delete` remain safe to call.
     ///   - vm: The size of the VM the container runs in.
@@ -257,6 +265,7 @@ public struct ContainerManager: Sendable {
         image: Image,
         rootfsSizeInBytes: UInt64 = 8.gib(),
         writableLayerSizeInBytes: UInt64? = nil,
+        swapSizeInBytes: UInt64? = nil,
         readOnly: Bool = false,
         networking: Bool = true,
         vm: VMResources = .default,
@@ -284,15 +293,26 @@ public struct ContainerManager: Sendable {
             )
         }
 
+        // Create the swap device if a size is specified.
+        var swapLayer: Mount? = nil
+        if let swapSize = swapSizeInBytes, swapSize > 0 {
+            swapLayer = try createSwapDevice(
+                at: path.appendingPathComponent("swap.raw"),
+                size: swapSize
+            )
+        }
+
         return try await create(
             id,
             image: image,
             rootfs: rootfs,
             writableLayer: writableLayer,
             networking: networking,
-            vm: vm,
-            configuration: configuration
-        )
+            vm: vm
+        ) { config in
+            config.swapLayer = swapLayer
+            try configuration(&config)
+        }
     }
 
     /// Returns a new container from the provided image and root filesystem mount.
@@ -381,6 +401,37 @@ public struct ContainerManager: Sendable {
             }
             throw err
         }
+    }
+
+    /// Create a raw block file to back a container's swap area.
+    ///
+    /// It carries no filesystem: the agent writes the swap header to the device
+    /// and enables it. The file is sparse, so it costs the host only the pages
+    /// the guest has actually swapped out, and gives them back on discard. A
+    /// swap area held in a file has to be free of holes, since the kernel walks
+    /// its extents; the guest reaches this one as a block device, which the
+    /// kernel takes as a single extent without consulting the host's layout.
+    /// https://github.com/torvalds/linux/blob/master/mm/swapfile.c
+    private func createSwapDevice(at destination: URL, size: UInt64) throws -> Mount {
+        let path = destination.absolutePath()
+        guard !FileManager.default.fileExists(atPath: path) else {
+            throw ContainerizationError(.exists, message: "swap device already exists at \(path)")
+        }
+        guard FileManager.default.createFile(atPath: path, contents: nil) else {
+            throw ContainerizationError(.internalError, message: "failed to create swap device at \(path)")
+        }
+        let handle = try FileHandle(forWritingTo: destination)
+        defer { try? handle.close() }
+        try handle.truncate(atOffset: size)
+        // A swap area holds nothing that outlives the container, so the host
+        // has no reason to synchronize it to permanent storage.
+        return .block(
+            format: Swap.mountType,
+            source: path,
+            destination: "",
+            options: [],
+            runtimeOptions: ["vzDiskImageSynchronizationMode=none"]
+        )
     }
 
     private func createEmptyFilesystem(at destination: URL, size: UInt64) throws -> Mount {

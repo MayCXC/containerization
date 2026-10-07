@@ -204,6 +204,21 @@ extension Vminitd: VirtualMachineAgent {
             })
     }
 
+    /// Mount the disk the machine's virtio-scsi host has at `scsiAddress` in
+    /// the sandbox's environment; the guest finds it by its address.
+    public func mount(_ mount: ContainerizationOCI.Mount, scsiAddress: SCSIAddress) async throws {
+        _ = try await client.mount(
+            .with {
+                $0.type = mount.type
+                $0.destination = mount.destination
+                $0.options = mount.options
+                $0.scsiAddress = .with {
+                    $0.target = UInt32(scsiAddress.target)
+                    $0.lun = UInt32(scsiAddress.lun)
+                }
+            })
+    }
+
     /// Unmount a filesystem in the sandbox's environment.
     public func umount(path: String, flags: Int32) async throws {
         _ = try await client.umount(

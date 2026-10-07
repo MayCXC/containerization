@@ -30,7 +30,7 @@ extension VirtualMachineAgent {
         guard let writableAttachment else {
             var rootfs = rootfsAttachment.to
             rootfs.destination = rootfsPath
-            try await self.mount(rootfs)
+            try await self.mount(rootfs, of: rootfsAttachment)
             return
         }
         try await self.mountOverlayRootfs(
@@ -61,12 +61,12 @@ extension VirtualMachineAgent {
         if !lowerMount.options.contains("ro") {
             lowerMount.options.append("ro")
         }
-        try await self.mount(lowerMount)
+        try await self.mount(lowerMount, of: rootfsAttachment)
 
         // Mount the writable layer.
         var upperMount = writableAttachment.to
         upperMount.destination = upperMountPath
-        try await self.mount(upperMount)
+        try await self.mount(upperMount, of: writableAttachment)
 
         // Create the upper and work directories inside the writable layer.
         try await self.mkdir(path: upperPath, all: true, perms: 0o755)

@@ -303,6 +303,19 @@ extension Mount {
         return .diskImage
     }
 
+    /// Whether the disk is a network block device, which reaches the guest
+    /// through Virtualization's own attachment alone, where an image or a
+    /// device of the host's is a disk this process can open itself.
+    var isNetworkBlockDevice: Bool {
+        storageAttachmentType == .networkBlockDevice
+    }
+
+    /// Whether the disk is a block device of the host's, which takes the
+    /// options its attachment does rather than a disk image's.
+    var isHostBlockDevice: Bool {
+        storageAttachmentType == .blockDevice
+    }
+
     func configure(config: inout VZVirtualMachineConfiguration) throws {
         switch self.runtimeOptions {
         case .virtioblk(let options):
@@ -329,6 +342,18 @@ extension Mount {
 
 extension VZDiskImageStorageDeviceAttachment {
     static func mountToVZAttachment(mount: Mount, options: [String]) throws -> VZDiskImageStorageDeviceAttachment {
+        let modes = try diskImageModes(options: options)
+        return try VZDiskImageStorageDeviceAttachment(
+            url: URL(filePath: mount.source),
+            readOnly: mount.readonly,
+            cachingMode: modes.caching,
+            synchronizationMode: modes.synchronization
+        )
+    }
+
+    /// The caching and synchronization modes a disk image mount's runtime
+    /// options ask for.
+    static func diskImageModes(options: [String]) throws -> (caching: VZDiskImageCachingMode, synchronization: VZDiskImageSynchronizationMode) {
         var synchronizationMode: VZDiskImageSynchronizationMode = .fsync
         var cachingMode: VZDiskImageCachingMode = .cached
 
@@ -377,12 +402,7 @@ extension VZDiskImageStorageDeviceAttachment {
                 )
             }
         }
-        return try VZDiskImageStorageDeviceAttachment(
-            url: URL(filePath: mount.source),
-            readOnly: mount.readonly,
-            cachingMode: cachingMode,
-            synchronizationMode: synchronizationMode
-        )
+        return (cachingMode, synchronizationMode)
     }
 }
 
@@ -521,7 +541,7 @@ extension VZDiskBlockDeviceStorageDeviceAttachment {
 #endif
 
 extension Mount {
-    fileprivate var readonly: Bool {
+    var readonly: Bool {
         self.options.contains("ro")
     }
 
