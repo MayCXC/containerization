@@ -31,23 +31,27 @@ final class NBDServer: Sendable {
     private let group: EventLoopGroup
     let url: String
 
-    init(filePath: String, socketPath: String, logger: Logger? = nil) throws {
+    private let store: NBDBackingStore
+
+    init(store: NBDBackingStore, socketPath: String, logger: Logger? = nil) throws {
         self.socketPath = socketPath
+        self.store = store
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
         try? FileManager.default.removeItem(atPath: socketPath)
 
-        self.channel = try Self.bootstrap(group: self.group, filePath: filePath, logger: logger)
+        self.channel = try Self.bootstrap(group: self.group, store: store, logger: logger)
             .bind(unixDomainSocketPath: socketPath)
             .wait()
         self.url = "nbd+unix:///?socket=\(socketPath)"
     }
 
-    init(filePath: String, port: Int, logger: Logger? = nil) throws {
+    init(store: NBDBackingStore, port: Int, logger: Logger? = nil) throws {
         self.socketPath = nil
+        self.store = store
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
-        self.channel = try Self.bootstrap(group: self.group, filePath: filePath, logger: logger)
+        self.channel = try Self.bootstrap(group: self.group, store: store, logger: logger)
             .bind(host: "127.0.0.1", port: port)
             .wait()
 
@@ -57,21 +61,37 @@ final class NBDServer: Sendable {
         self.url = "nbd://127.0.0.1:\(boundPort)"
     }
 
+    convenience init(filePath: String, socketPath: String, logger: Logger? = nil) throws {
+        try self.init(store: Self.fileStore(filePath), socketPath: socketPath, logger: logger)
+    }
+
+    convenience init(filePath: String, port: Int, logger: Logger? = nil) throws {
+        try self.init(store: Self.fileStore(filePath), port: port, logger: logger)
+    }
+
+    private static func fileStore(_ path: String) throws -> NBDBackingStore {
+        guard let store = NBDFileStore(path: path) else {
+            throw ContainerizationError(.internalError, message: "NBD server failed to open \(path)")
+        }
+        return store
+    }
+
     func stop() {
         try? channel.close().wait()
         try? group.syncShutdownGracefully()
+        self.store.close()
         if let socketPath {
             try? FileManager.default.removeItem(atPath: socketPath)
         }
     }
 
-    private static func bootstrap(group: EventLoopGroup, filePath: String, logger: Logger?) -> ServerBootstrap {
+    private static func bootstrap(group: EventLoopGroup, store: NBDBackingStore, logger: Logger?) -> ServerBootstrap {
         ServerBootstrap(group: group)
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
             .childChannelInitializer { channel in
                 channel.eventLoop.makeCompletedFuture {
                     try channel.pipeline.syncOperations.addHandler(
-                        NBDConnectionHandler(filePath: filePath, logger: logger)
+                        NBDConnectionHandler(store: store, logger: logger)
                     )
                 }
             }
@@ -91,13 +111,34 @@ private final class NBDConnectionHandler: ChannelInboundHandler {
 
     static let optExportName: UInt32 = 1
     static let optAbort: UInt32 = 2
+    static let optList: UInt32 = 3
     static let optInfo: UInt32 = 6
     static let optGo: UInt32 = 7
+    static let optStructuredReply: UInt32 = 8
+    static let optListMetaContext: UInt32 = 9
+    static let optSetMetaContext: UInt32 = 10
+
+    /// The one export a server here serves, which has no name of its own.
+    static let exportName = ""
+    /// The layout context a client asks about, and the only one answered.
+    static let metaContextAllocation = "base:allocation"
+    static let metaContextID: UInt32 = 1
 
     static let cmdRead: UInt16 = 0
     static let cmdWrite: UInt16 = 1
     static let cmdDisc: UInt16 = 2
     static let cmdFlush: UInt16 = 3
+    static let cmdTrim: UInt16 = 4
+    static let cmdCache: UInt16 = 5
+    static let cmdWriteZeroes: UInt16 = 6
+
+    /// Command flags travel in the two bytes after the request magic.
+    /// https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md
+    static let cmdFlagFUA: UInt16 = 0x1
+    static let cmdFlagNoHole: UInt16 = 0x2
+    static let cmdFlagDF: UInt16 = 0x4
+    static let cmdFlagReqOne: UInt16 = 0x8
+    static let cmdBlockStatus: UInt16 = 7
 
     static let flagFixedNewstyle: UInt16 = 0x1
     static let flagNoZeroes: UInt16 = 0x2
@@ -106,23 +147,59 @@ private final class NBDConnectionHandler: ChannelInboundHandler {
     static let transmitHasFlags: UInt16 = 0x1
     static let transmitSendFlush: UInt16 = 0x4
     static let transmitSendFUA: UInt16 = 0x8
+    /// A client is not allowed to send a trim without being told the server
+    /// takes them, so an export that never sets this is never asked to let
+    /// anything go, however much the guest has finished with.
+    /// https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md
+    static let transmitSendTrim: UInt16 = 0x20
+    static let transmitReadOnly: UInt16 = 0x2
+    static let transmitSendWriteZeroes: UInt16 = 0x40
+    static let transmitSendCache: UInt16 = 0x400
+    /// Every connection to an export here serves the one store behind it, so a
+    /// flush on any of them covers what was written on the others, which is
+    /// what lets a client spread its work across several.
+    static let transmitCanMultiConn: UInt16 = 0x100
+    static let transmitSendDF: UInt16 = 0x80
 
     static let repACK: UInt32 = 1
+    static let repServer: UInt32 = 2
     static let repInfo: UInt32 = 3
+    static let repMetaContext: UInt32 = 4
     static let repErrUnsup: UInt32 = 0x8000_0001
+
+    /// Structured replies carry their own framing, so that a read can name the
+    /// offset it answers and a hole can be sent without its zeroes.
+    static let structuredReplyMagic: UInt32 = 0x668e_33ef
+    static let replyFlagDone: UInt16 = 0x1
+    static let replyTypeNone: UInt16 = 0
+    static let replyTypeOffsetData: UInt16 = 1
+    static let replyTypeOffsetHole: UInt16 = 2
+    static let replyTypeBlockStatus: UInt16 = 5
+    static let replyTypeError: UInt16 = 32769
+    static let replyTypeErrorOffset: UInt16 = 32770
     static let infoExport: UInt16 = 0
     static let infoBlockSize: UInt16 = 3
 
     // NBD error codes
     static let errOK: UInt32 = 0
+    static let errPerm: UInt32 = 1
     static let errIO: UInt32 = 5
+    static let errNoMem: UInt32 = 12
+    static let errInval: UInt32 = 22
+    static let errNoSpc: UInt32 = 28
+    static let errOverflow: UInt32 = 75
     static let errNotsup: UInt32 = 95
+    static let errShutdown: UInt32 = 108
 
-    private let fileFD: Int32
+    private let store: NBDBackingStore
     private let fileSize: UInt64
     private let logger: Logger?
     private var buffer: ByteBuffer = ByteBuffer()
     private var state: ConnectionState = .handshake
+    /// Whether the client asked for replies that carry their own framing.
+    private var structuredReplies = false
+    /// Whether the client asked to be told about the export's layout.
+    private var metaContextSelected = false
 
     private enum ConnectionState {
         case handshake
@@ -130,24 +207,14 @@ private final class NBDConnectionHandler: ChannelInboundHandler {
         case transmission
     }
 
-    init(filePath: String, logger: Logger?) {
-        self.fileFD = open(filePath, O_RDWR)
+    init(store: NBDBackingStore, logger: Logger?) {
+        self.store = store
+        self.fileSize = store.size
         self.logger = logger
-        guard fileFD >= 0 else {
-            self.fileSize = 0
-            logger?.error("NBD server: failed to open \(filePath), errno=\(errno)")
-            return
-        }
-        var st = stat()
-        if fstat(self.fileFD, &st) == 0 {
-            self.fileSize = UInt64(st.st_size)
-        } else {
-            self.fileSize = 0
-        }
     }
 
     func channelActive(context: ChannelHandlerContext) {
-        guard fileFD >= 0 else {
+        guard fileSize > 0 else {
             context.close(promise: nil)
             return
         }
@@ -160,9 +227,8 @@ private final class NBDConnectionHandler: ChannelInboundHandler {
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        if fileFD >= 0 {
-            close(fileFD)
-        }
+        // Every connection to an export serves the one store behind it, so a
+        // client going away is not what ends it. The server closes it instead.
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -213,7 +279,13 @@ private final class NBDConnectionHandler: ChannelInboundHandler {
                     return
                 }
 
-                let transmitFlags = Self.transmitHasFlags | Self.transmitSendFlush | Self.transmitSendFUA
+                var transmitFlags =
+                    Self.transmitHasFlags | Self.transmitSendFlush | Self.transmitSendFUA
+                    | Self.transmitSendTrim | Self.transmitSendWriteZeroes | Self.transmitSendCache
+                    | Self.transmitCanMultiConn | Self.transmitSendDF
+                if store.isReadOnly {
+                    transmitFlags |= Self.transmitReadOnly
+                }
 
                 switch optType {
                 case Self.optExportName:
@@ -283,6 +355,49 @@ private final class NBDConnectionHandler: ChannelInboundHandler {
                     context.close(promise: nil)
                     return
 
+                case Self.optList:
+                    // One export, and it goes by no name.
+                    buffer.moveReaderIndex(forwardBy: Int(dataLen))
+                    let name = Self.exportName
+                    var listing = context.channel.allocator.buffer(capacity: 32)
+                    writeOptReply(
+                        &listing, optType: optType, replyType: Self.repServer,
+                        dataLen: UInt32(4 + name.utf8.count))
+                    listing.writeInteger(UInt32(name.utf8.count))
+                    listing.writeString(name)
+                    writeOptReply(&listing, optType: optType, replyType: Self.repACK, dataLen: 0)
+                    context.writeAndFlush(wrapOutboundOut(listing), promise: nil)
+
+                case Self.optStructuredReply:
+                    buffer.moveReaderIndex(forwardBy: Int(dataLen))
+                    structuredReplies = true
+                    var reply = context.channel.allocator.buffer(capacity: 20)
+                    writeOptReply(&reply, optType: optType, replyType: Self.repACK, dataLen: 0)
+                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+
+                case Self.optSetMetaContext, Self.optListMetaContext:
+                    // The queries name what a client wants to ask about later.
+                    // Only the layout of the export is on offer, so a query
+                    // that asks for it, or for everything, is answered and the
+                    // rest are passed over.
+                    let payload = buffer.getSlice(at: buffer.readerIndex, length: Int(dataLen))
+                    buffer.moveReaderIndex(forwardBy: Int(dataLen))
+                    let wanted = Self.queriedContexts(payload)
+                    var reply = context.channel.allocator.buffer(capacity: 64)
+                    if wanted {
+                        let name = Self.metaContextAllocation
+                        writeOptReply(
+                            &reply, optType: optType, replyType: Self.repMetaContext,
+                            dataLen: UInt32(4 + name.utf8.count))
+                        reply.writeInteger(Self.metaContextID)
+                        reply.writeString(name)
+                        if optType == Self.optSetMetaContext {
+                            metaContextSelected = true
+                        }
+                    }
+                    writeOptReply(&reply, optType: optType, replyType: Self.repACK, dataLen: 0)
+                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+
                 default:
                     if dataLen > 0 {
                         buffer.moveReaderIndex(forwardBy: Int(dataLen))
@@ -299,6 +414,7 @@ private final class NBDConnectionHandler: ChannelInboundHandler {
                 }
                 let readerIndex = buffer.readerIndex
                 guard let magic = buffer.getInteger(at: readerIndex, as: UInt32.self),
+                    let cmdFlags = buffer.getInteger(at: readerIndex + 4, as: UInt16.self),
                     let cmdType = buffer.getInteger(at: readerIndex + 6, as: UInt16.self),
                     let cookie = buffer.getInteger(at: readerIndex + 8, as: UInt64.self),
                     let offset = buffer.getInteger(at: readerIndex + 16, as: UInt64.self),
@@ -310,6 +426,56 @@ private final class NBDConnectionHandler: ChannelInboundHandler {
                 guard magic == Self.requestMagic else {
                     context.close(promise: nil)
                     return
+                }
+
+                /// A command that has been dealt with, but whose reply the
+                /// protocol holds back until what it wrote is durable when the
+                /// client asked for that.
+                func replyHonouringFUA(_ error: UInt32) {
+                    if cmdFlags & Self.cmdFlagFUA != 0 && error == Self.errOK {
+                        store.flush()
+                    }
+                    var reply = context.channel.allocator.buffer(capacity: 16)
+                    writeSimpleReply(&reply, cookie: cookie, error: error)
+                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+                }
+
+                // An export that only reads turns away everything that writes,
+                // and a request reaching past the end of one is refused rather
+                // than passed to the store to fail on.
+                let writes =
+                    cmdType == Self.cmdWrite || cmdType == Self.cmdTrim
+                    || cmdType == Self.cmdWriteZeroes
+                let addressed =
+                    cmdType == Self.cmdRead || cmdType == Self.cmdWrite || cmdType == Self.cmdTrim
+                    || cmdType == Self.cmdWriteZeroes || cmdType == Self.cmdCache
+                    || cmdType == Self.cmdBlockStatus
+                if writes && store.isReadOnly {
+                    if cmdType == Self.cmdWrite {
+                        // A refused write is consumed whole, so its payload is
+                        // never read back as the next request's header; the
+                        // refusal waits alongside the acceptance for all of it.
+                        guard buffer.readableBytes >= 28 + Int(length) else {
+                            return
+                        }
+                        buffer.moveReaderIndex(forwardBy: 28 + Int(length))
+                    } else {
+                        buffer.moveReaderIndex(forwardBy: 28)
+                    }
+                    replyHonouringFUA(Self.errPerm)
+                    continue
+                }
+                if addressed && !store.covers(offset: offset, length: Int(length)) {
+                    if cmdType == Self.cmdWrite {
+                        guard buffer.readableBytes >= 28 + Int(length) else {
+                            return
+                        }
+                        buffer.moveReaderIndex(forwardBy: 28 + Int(length))
+                    } else {
+                        buffer.moveReaderIndex(forwardBy: 28)
+                    }
+                    replyHonouringFUA(Self.errInval)
+                    continue
                 }
 
                 switch cmdType {
@@ -329,19 +495,61 @@ private final class NBDConnectionHandler: ChannelInboundHandler {
                         }
                         return Int(length)
                     }
-                    let n = pwrite(fileFD, &writeData, Int(length), off_t(offset))
-                    var reply = context.channel.allocator.buffer(capacity: 16)
-                    writeSimpleReply(&reply, cookie: cookie, error: n < 0 ? Self.errIO : Self.errOK)
-                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+                    let stored = store.write(offset: offset, data: writeData)
+                    replyHonouringFUA(stored ? Self.errOK : Self.errIO)
 
                 case Self.cmdRead:
                     buffer.moveReaderIndex(forwardBy: 28)
-                    var readBuf = [UInt8](repeating: 0, count: Int(length))
-                    let n = pread(fileFD, &readBuf, Int(length), off_t(offset))
-                    var reply = context.channel.allocator.buffer(capacity: 16 + Int(length))
-                    writeSimpleReply(&reply, cookie: cookie, error: n < 0 ? Self.errIO : Self.errOK)
-                    if n >= 0 {
-                        reply.writeBytes(readBuf[0..<Int(length)])
+                    let readBuf = store.read(offset: offset, length: Int(length))
+                    var reply = context.channel.allocator.buffer(capacity: 32 + Int(length))
+                    if structuredReplies {
+                        // A structured read names the offset it answers, and an
+                        // error carries a message rather than a bare number.
+                        if let readBuf {
+                            writeStructuredHeader(
+                                &reply, cookie: cookie, type: Self.replyTypeOffsetData,
+                                payload: UInt32(8 + readBuf.count), done: true)
+                            reply.writeInteger(offset)
+                            reply.writeBytes(readBuf)
+                        } else {
+                            let message = "read failed"
+                            writeStructuredHeader(
+                                &reply, cookie: cookie, type: Self.replyTypeError,
+                                payload: UInt32(6 + message.utf8.count), done: true)
+                            reply.writeInteger(Self.errIO)
+                            reply.writeInteger(UInt16(message.utf8.count))
+                            reply.writeString(message)
+                        }
+                    } else {
+                        writeSimpleReply(
+                            &reply, cookie: cookie, error: readBuf == nil ? Self.errIO : Self.errOK)
+                        if let readBuf {
+                            reply.writeBytes(readBuf)
+                        }
+                    }
+                    context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+
+                case Self.cmdBlockStatus:
+                    buffer.moveReaderIndex(forwardBy: 28)
+                    var reply = context.channel.allocator.buffer(capacity: 64)
+                    guard structuredReplies, metaContextSelected else {
+                        // Layout can only be described in a structured reply,
+                        // and only about a context the client asked for.
+                        writeSimpleReply(&reply, cookie: cookie, error: Self.errInval)
+                        context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+                        continue
+                    }
+                    var runs = store.extents(offset: offset, length: Int(length))
+                    if cmdFlags & Self.cmdFlagReqOne != 0, let first = runs.first {
+                        runs = [first]
+                    }
+                    writeStructuredHeader(
+                        &reply, cookie: cookie, type: Self.replyTypeBlockStatus,
+                        payload: UInt32(4 + runs.count * 8), done: true)
+                    reply.writeInteger(Self.metaContextID)
+                    for run in runs {
+                        reply.writeInteger(run.length)
+                        reply.writeInteger(run.flags)
                     }
                     context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
 
@@ -352,10 +560,36 @@ private final class NBDConnectionHandler: ChannelInboundHandler {
 
                 case Self.cmdFlush:
                     buffer.moveReaderIndex(forwardBy: 28)
-                    fsync(fileFD)
+                    store.flush()
                     var reply = context.channel.allocator.buffer(capacity: 16)
                     writeSimpleReply(&reply, cookie: cookie, error: Self.errOK)
                     context.writeAndFlush(wrapOutboundOut(reply), promise: nil)
+
+                case Self.cmdTrim:
+                    buffer.moveReaderIndex(forwardBy: 28)
+                    let released = store.discard(offset: offset, length: Int(length))
+                    replyHonouringFUA(released ? Self.errOK : Self.errIO)
+
+                case Self.cmdWriteZeroes:
+                    buffer.moveReaderIndex(forwardBy: 28)
+                    // Discarding leaves zeroes behind and costs nothing, so it
+                    // serves unless the client has said it wants the range to
+                    // stay written through, which is what the flag is for.
+                    let zeroed: Bool
+                    if cmdFlags & Self.cmdFlagNoHole != 0 {
+                        zeroed = store.write(
+                            offset: offset, data: [UInt8](repeating: 0, count: Int(length)))
+                    } else {
+                        zeroed = store.discard(offset: offset, length: Int(length))
+                    }
+                    replyHonouringFUA(zeroed ? Self.errOK : Self.errIO)
+
+                case Self.cmdCache:
+                    // A hint that a range is wanted soon. Every store here
+                    // answers a read in the same time whether it was told or
+                    // not, so there is nothing to prepare.
+                    buffer.moveReaderIndex(forwardBy: 28)
+                    replyHonouringFUA(Self.errOK)
 
                 default:
                     buffer.moveReaderIndex(forwardBy: 28)
@@ -378,6 +612,45 @@ private final class NBDConnectionHandler: ChannelInboundHandler {
         buf.writeInteger(Self.simpleReplyMagic)
         buf.writeInteger(error)
         buf.writeInteger(cookie)
+    }
+
+    private func writeStructuredHeader(
+        _ buf: inout ByteBuffer, cookie: UInt64, type: UInt16, payload: UInt32, done: Bool
+    ) {
+        buf.writeInteger(Self.structuredReplyMagic)
+        buf.writeInteger(done ? Self.replyFlagDone : 0)
+        buf.writeInteger(type)
+        buf.writeInteger(cookie)
+        buf.writeInteger(payload)
+    }
+
+    /// Whether the queries a client sent ask about the export's layout, either
+    /// by name or by asking for everything the server has. A request carrying
+    /// no queries at all is asking for the lot.
+    private static func queriedContexts(_ payload: ByteBuffer?) -> Bool {
+        guard var payload else {
+            return false
+        }
+        guard let nameLen = payload.readInteger(as: UInt32.self),
+            payload.readSlice(length: Int(nameLen)) != nil,
+            let queryCount = payload.readInteger(as: UInt32.self)
+        else {
+            return false
+        }
+        if queryCount == 0 {
+            return true
+        }
+        for _ in 0..<queryCount {
+            guard let queryLen = payload.readInteger(as: UInt32.self),
+                let query = payload.readString(length: Int(queryLen))
+            else {
+                return false
+            }
+            if query == Self.metaContextAllocation || query == "base:" {
+                return true
+            }
+        }
+        return false
     }
 }
 #endif
