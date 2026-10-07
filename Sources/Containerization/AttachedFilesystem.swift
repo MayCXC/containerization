@@ -28,6 +28,9 @@ public struct AttachedFilesystem: Sendable {
     public var destination: String
     /// The options to use when mounting the filesystem.
     public var options: [String]
+    /// Where the machine's virtio-scsi host attached the disk, when it did.
+    /// The guest finds such a disk by this address, so `source` is empty.
+    public var scsiAddress: SCSIAddress?
 
     public init(mount: Mount, allocator: any AddressAllocator<Character>) throws {
         guard mount.isBlock else {
@@ -58,6 +61,16 @@ public struct AttachedFilesystem: Sendable {
         self.type = mount.type
         self.options = mount.options
         self.destination = mount.destination
+    }
+
+    /// The disk `mount` names, attached at `scsiAddress` on the machine's
+    /// virtio-scsi host.
+    public init(mount: Mount, scsiAddress: SCSIAddress) {
+        self.type = mount.type
+        self.source = ""
+        self.destination = mount.destination
+        self.options = mount.options
+        self.scsiAddress = scsiAddress
     }
 
     public init(type: String, source: String, destination: String, options: [String]) {

@@ -112,6 +112,8 @@ public final class LinuxContainer: Container, Sendable {
         public var hosts: Hosts?
         /// Enable nested virtualization support.
         public var virtualization: Bool = false
+        /// The device the container's machine attaches its block devices on.
+        public var blockDeviceDriver: BlockDeviceDriver = .virtioBlock
         /// Optional destination for serial boot logs.
         public var bootLog: BootLog?
         /// EXPERIMENTAL: Path in the root filesystem for the virtual
@@ -786,7 +788,8 @@ extension LinuxContainer {
                 interfaces: self.interfaces,
                 storage: MachineMounts(containers: [self.id: containerStorage]),
                 bootLog: self.config.bootLog,
-                nestedVirtualization: self.config.virtualization
+                nestedVirtualization: self.config.virtualization,
+                blockDeviceDriver: self.config.blockDeviceDriver
             )
             let creationConfig = StandardVMConfig(configuration: vmConfig)
             let vm = try await self.vmm.create(config: creationConfig)
@@ -857,6 +860,7 @@ extension LinuxContainer {
                         rootfsPath: rootfsPath
                     )
                     try await self.enableSwap(attached: attached, agent: agent)
+                    try await agent.mountContainerDisks(attached.mounts)
 
                     // Mount file mount holding directories under /run.
                     if fileMountContext.hasFileMounts {
@@ -921,7 +925,8 @@ extension LinuxContainer {
             do {
                 var spec = try self.generateRuntimeSpec(for: .containerInit)
                 // Filter out file mount holding directories. We'll mount those separately under /run.
-                // Transform virtiofs mounts to bind mounts from /run/virtiofs/{tag}
+                // Transform virtiofs mounts to bind mounts from /run/virtiofs/{tag}, and a disk
+                // on the virtio-scsi host to a bind mount from where the guest mounted it.
                 let containerMounts = createdState.vm.storage.containers[self.id]?.mounts ?? []
                 let holdingTags = createdState.fileMountContext.holdingDirectoryTags
                 var mounts: [ContainerizationOCI.Mount] =
@@ -936,6 +941,9 @@ extension LinuxContainer {
                                 destination: attached.destination,
                                 options: ["bind"] + attached.options
                             )
+                        }
+                        if let path = attached.guestDiskPath {
+                            return attached.diskBind(at: path)
                         }
                         return attached.to
                     }
@@ -1059,6 +1067,7 @@ extension LinuxContainer {
 
                     // Today, we leave EBUSY looping and other fun logic up to the
                     // guest agent.
+                    try await agent.unmountContainerDisks(vm.storage.containers[self.id]?.mounts ?? [])
                     try await agent.umount(
                         path: Self.guestRootfsPath(self.id),
                         flags: 0
@@ -1409,6 +1418,51 @@ extension AttachedFilesystem {
             destination: self.destination,
             options: self.options
         )
+    }
+
+    /// Where the guest mounts a disk the machine's virtio-scsi host carries
+    /// for a container's own mount of it, when the host carries it. A
+    /// runtime spec names a disk by its device path, and the guest finds this
+    /// one by its address, so the disk is mounted here by its address and the
+    /// container is given a bind of it. Kata mounts each block device a
+    /// container brings once, at a path of the sandbox's own, and points the
+    /// container's mount at that path:
+    /// https://github.com/kata-containers/kata-containers/blob/ea7aba03b1d48813cae07413c95ab6bc464b7a5f/src/runtime/virtcontainers/kata_agent.go#L2116-L2144
+    var guestDiskPath: String? {
+        scsiAddress.map { "/run/scsi/\($0.target)-\($0.lun)" }
+    }
+
+    /// The runtime spec's mount of the disk mounted at `path`: a bind of it
+    /// at the container's destination.
+    func diskBind(at path: String) -> ContainerizationOCI.Mount {
+        .init(
+            type: "none",
+            source: path,
+            destination: self.destination,
+            options: ["bind"] + self.options
+        )
+    }
+}
+
+extension VirtualMachineAgent {
+    /// Mount each disk among a container's own `mounts` that the machine's
+    /// virtio-scsi host carries at its guest disk path, for the container's
+    /// bind of it.
+    func mountContainerDisks(_ mounts: [AttachedFilesystem]) async throws {
+        for attachment in mounts {
+            guard let path = attachment.guestDiskPath else { continue }
+            var mount = attachment.to
+            mount.destination = path
+            try await self.mount(mount, of: attachment)
+        }
+    }
+
+    /// Unmount the disks `mountContainerDisks` mounted for `mounts`.
+    func unmountContainerDisks(_ mounts: [AttachedFilesystem]) async throws {
+        for attachment in mounts {
+            guard let path = attachment.guestDiskPath else { continue }
+            try await self.umount(path: path, flags: 0)
+        }
     }
 }
 

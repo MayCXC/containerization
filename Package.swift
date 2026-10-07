@@ -75,6 +75,7 @@ let package = Package(
                 "ContainerizationExtras",
                 "ContainerizationEXT4",
                 "ContainerizationNetlink",
+                .target(name: "ContainerizationSCSI", condition: .when(platforms: [.macOS])),
                 "CShim",
             ],
             exclude: [
@@ -141,6 +142,19 @@ let package = Package(
                     "Resources/content/blobs/sha256/c6b39de5b33961661dc939b997cc1d30cda01e38005a6c6625fd9c7e748bab44"),  // layer 1
                 .copy(
                     "Resources/content/blobs/sha256/4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1"),  // layer 2
+            ]
+        ),
+        .target(
+            name: "ContainerizationSCSI",
+            dependencies: [
+                "ContainerizationError"
+            ]
+        ),
+        .testTarget(
+            name: "ContainerizationSCSITests",
+            dependencies: [
+                "ContainerizationError",
+                "ContainerizationSCSI",
             ]
         ),
         .target(
@@ -335,7 +349,7 @@ let package = Package(
         ),
         .testTarget(
             name: "VminitdCoreTests",
-            dependencies: ["VminitdCore"]
+            dependencies: ["VminitdCore", "ContainerizationError"]
         ),
     ]
 )

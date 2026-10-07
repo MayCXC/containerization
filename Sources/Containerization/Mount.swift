@@ -285,6 +285,7 @@ extension Mount {
     private enum StorageAttachmentType {
         case diskImage
         case networkBlockDevice
+        case blockDevice
     }
 
     private var storageAttachmentType: StorageAttachmentType {
@@ -292,7 +293,27 @@ extension Mount {
         if nbdSchemes.contains(where: { self.source.hasPrefix($0) }) {
             return .networkBlockDevice
         }
+        // A block device reaches the guest as the device it already is, where an
+        // image is a file the framework opens and presents as one. Asking the
+        // source what it is leaves the caller no naming convention to observe.
+        var info = stat()
+        if stat(self.source, &info) == 0, (info.st_mode & S_IFMT) == S_IFBLK {
+            return .blockDevice
+        }
         return .diskImage
+    }
+
+    /// Whether the disk is a network block device, which reaches the guest
+    /// through Virtualization's own attachment alone, where an image or a
+    /// device of the host's is a disk this process can open itself.
+    var isNetworkBlockDevice: Bool {
+        storageAttachmentType == .networkBlockDevice
+    }
+
+    /// Whether the disk is a block device of the host's, which takes the
+    /// options its attachment does rather than a disk image's.
+    var isHostBlockDevice: Bool {
+        storageAttachmentType == .blockDevice
     }
 
     func configure(config: inout VZVirtualMachineConfiguration) throws {
@@ -304,6 +325,8 @@ extension Mount {
                 device = try VZNetworkBlockDeviceStorageDeviceAttachment.mountToVZAttachment(mount: self, options: options)
             case .diskImage:
                 device = try VZDiskImageStorageDeviceAttachment.mountToVZAttachment(mount: self, options: options)
+            case .blockDevice:
+                device = try VZDiskBlockDeviceStorageDeviceAttachment.mountToVZAttachment(mount: self, options: options)
             }
             let attachment = VZVirtioBlockDeviceConfiguration(attachment: device)
             config.storageDevices.append(attachment)
@@ -319,6 +342,18 @@ extension Mount {
 
 extension VZDiskImageStorageDeviceAttachment {
     static func mountToVZAttachment(mount: Mount, options: [String]) throws -> VZDiskImageStorageDeviceAttachment {
+        let modes = try diskImageModes(options: options)
+        return try VZDiskImageStorageDeviceAttachment(
+            url: URL(filePath: mount.source),
+            readOnly: mount.readonly,
+            cachingMode: modes.caching,
+            synchronizationMode: modes.synchronization
+        )
+    }
+
+    /// The caching and synchronization modes a disk image mount's runtime
+    /// options ask for.
+    static func diskImageModes(options: [String]) throws -> (caching: VZDiskImageCachingMode, synchronization: VZDiskImageSynchronizationMode) {
         var synchronizationMode: VZDiskImageSynchronizationMode = .fsync
         var cachingMode: VZDiskImageCachingMode = .cached
 
@@ -367,12 +402,7 @@ extension VZDiskImageStorageDeviceAttachment {
                 )
             }
         }
-        return try VZDiskImageStorageDeviceAttachment(
-            url: URL(filePath: mount.source),
-            readOnly: mount.readonly,
-            cachingMode: cachingMode,
-            synchronizationMode: synchronizationMode
-        )
+        return (cachingMode, synchronizationMode)
     }
 }
 
@@ -435,10 +465,83 @@ extension VZNetworkBlockDeviceStorageDeviceAttachment {
     }
 }
 
+extension VZDiskBlockDeviceStorageDeviceAttachment {
+    /// Attach a block device of the host's to the guest.
+    ///
+    /// The guest is given the device itself, so whatever backs it on the host
+    /// backs it in the guest: a disk, a partition, or a memory backed device
+    /// whose pages the host is free to compress and page out as it would any
+    /// other. Nothing here is written through a file of the host's own.
+    ///
+    /// A device holding a filesystem is destroyable by the guest in ways that
+    /// do not recover, so the caller chooses what it hands over.
+    /// https://developer.apple.com/documentation/virtualization/vzdiskblockdevicestoragedeviceattachment
+    static func mountToVZAttachment(mount: Mount, options: [String]) throws -> VZDiskBlockDeviceStorageDeviceAttachment {
+        let synchronizationMode = try synchronizationMode(options: options)
+
+        // The attachment keeps the handle, and the framework wants it open when
+        // the machine starts. A device meant to be read is opened to be read,
+        // which is what the framework asks of a caller that sets `readOnly`.
+        let handle =
+            mount.readonly
+            ? FileHandle(forReadingAtPath: mount.source)
+            : FileHandle(forUpdatingAtPath: mount.source)
+        guard let handle else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "unable to open block device: \(mount.source)"
+            )
+        }
+
+        return try VZDiskBlockDeviceStorageDeviceAttachment(
+            fileHandle: handle,
+            readOnly: mount.readonly,
+            synchronizationMode: synchronizationMode
+        )
+    }
+
+    /// The synchronization mode a block device mount's runtime options ask
+    /// for.
+    static func synchronizationMode(options: [String]) throws -> VZDiskSynchronizationMode {
+        var synchronizationMode: VZDiskSynchronizationMode = .full
+
+        for option in options {
+            let split = option.split(separator: "=")
+            if split.count != 2 {
+                continue
+            }
+
+            let key = String(split[0])
+            let value = String(split[1])
+
+            switch key {
+            case "vzSynchronizationMode":
+                switch value {
+                case "full":
+                    synchronizationMode = .full
+                case "none":
+                    synchronizationMode = .none
+                default:
+                    throw ContainerizationError(
+                        .invalidArgument,
+                        message: "unknown vzSynchronizationMode value for block device: \(value)"
+                    )
+                }
+            default:
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "unknown vmm option encountered: \(key)"
+                )
+            }
+        }
+        return synchronizationMode
+    }
+}
+
 #endif
 
 extension Mount {
-    fileprivate var readonly: Bool {
+    var readonly: Bool {
         self.options.contains("ro")
     }
 

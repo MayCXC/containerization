@@ -128,6 +128,15 @@ message MountRequest {
   string source = 2;
   string destination = 3;
   repeated string options = 4;
+  // A disk on the machine's SCSI host. When set, the guest mounts the block
+  // device it finds at this address, and source is not read.
+  ScsiAddress scsi_address = 5;
+}
+
+// A logical unit's address on the guest's SCSI host, on channel 0.
+message ScsiAddress {
+  uint32 target = 1;
+  uint32 lun = 2;
 }
 
 message MountResponse {}

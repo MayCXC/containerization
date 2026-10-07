@@ -247,6 +247,18 @@ struct IntegrationSuite: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Only run tests whose names contain this string")
     var filter: String?
 
+    @Option(
+        name: .long,
+        help: "Block device driver for every machine a test leaves on the default: virtio-blk or virtio-scsi",
+        transform: {
+            guard let driver = BlockDeviceDriver(rawValue: $0) else {
+                throw ValidationError("unknown block device driver \($0); expected virtio-blk or virtio-scsi")
+            }
+            return driver
+        }
+    )
+    var blockDeviceDriver: BlockDeviceDriver?
+
     #if os(Linux)
     @Option(name: .long, help: "Path to cloud-hypervisor binary (Linux only). Defaults to PATH lookup.")
     var chBinary: String?
@@ -262,6 +274,91 @@ struct IntegrationSuite: AsyncParsableCommand {
     }
 
     static let eventLoop = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+
+    #if os(macOS)
+    /// Attach something to the host as a block device and hand back its path.
+    ///
+    /// A block device attachment takes a device, so a test needs one of its own
+    /// to give. What `hdiutil` attaches belongs to whoever asked for it, which
+    /// is what keeps this off root.
+    private static func attachDevice(describing what: String, arguments: [String]) throws -> String {
+        let pipe = Pipe()
+        let errPipe = Pipe()
+        defer {
+            try? pipe.fileHandleForReading.close()
+            try? errPipe.fileHandleForReading.close()
+        }
+        // The plist output is the one hdiutil defines, where the plain output is
+        // a table whose columns depend on what it found. Its stderr is what says
+        // why something it will not take is something it will not take.
+        var cmd = Command("/usr/bin/hdiutil", arguments: ["attach", "-nomount", "-plist"] + arguments)
+        cmd.stdout = pipe.fileHandleForWriting
+        cmd.stderr = errPipe.fileHandleForWriting
+        try cmd.start()
+        try? pipe.fileHandleForWriting.close()
+        try? errPipe.fileHandleForWriting.close()
+        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+        let errData = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
+        let exit = try cmd.wait()
+        guard exit == 0 else {
+            let reason =
+                String(data: errData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw IntegrationError.assert(msg: "hdiutil attach of \(what) exited \(exit): \(reason)")
+        }
+
+        let plist = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+        guard let root = plist as? [String: Any],
+            let entities = root["system-entities"] as? [[String: Any]]
+        else {
+            throw IntegrationError.assert(msg: "hdiutil attach of \(what) described no entities")
+        }
+        let devices = entities.compactMap { $0["dev-entry"] as? String }
+        // Whatever it found sits under the whole device, and that is the one to
+        // hand over: the guest is the one deciding what the contents mean.
+        guard let device = devices.min(by: { $0.count < $1.count }) else {
+            throw IntegrationError.assert(msg: "hdiutil attach of \(what) named no device")
+        }
+        return device
+    }
+
+    /// Attach a file to the host as a block device.
+    ///
+    /// An image holding a filesystem of the guest's is one hdiutil reads far
+    /// enough to decline, so naming the class tells it to carry the bytes and
+    /// leave the reading to whoever mounts them.
+    static func attachBlockDevice(imagePath: String) throws -> String {
+        try Self.attachDevice(
+            describing: imagePath,
+            arguments: ["-imagekey", "diskimage-class=CRawDiskImage", imagePath])
+    }
+
+    /// Attach a block device the host keeps in memory.
+    ///
+    /// The pages behind it are the host's ordinary memory: taken as they are
+    /// written rather than reserved up front, and left for the host to compress
+    /// and page out under contention as it would any others.
+    static func attachMemoryBlockDevice(size: UInt64) throws -> String {
+        // A ram disk is asked for in units of 512 byte sectors.
+        try Self.attachDevice(
+            describing: "a \(size) byte ram disk",
+            arguments: ["ram://\(size / 512)"])
+    }
+
+    /// Give a block device back to the host.
+    ///
+    /// Called both on the way out of a test and once the guest is done with the
+    /// device, so it tolerates a device that is already gone.
+    static func detachBlockDevice(_ device: String) {
+        let devNull = FileHandle(forWritingAtPath: "/dev/null")
+        defer { try? devNull?.close() }
+        var cmd = Command("/usr/bin/hdiutil", arguments: ["detach", device])
+        cmd.stdout = devNull
+        cmd.stderr = devNull
+        guard (try? cmd.start()) != nil else { return }
+        _ = try? cmd.wait()
+    }
+    #endif
 
     /// The swap area a test hands to a container. A suite that builds its own
     /// containers owns the file behind them, the way `ContainerManager` owns
@@ -362,12 +459,15 @@ struct IntegrationSuite: AsyncParsableCommand {
         try? FileManager.default.createDirectory(at: bootlogDirURL, withIntermediateDirectories: true)
         let bootlogURL = bootlogDirURL.appendingPathComponent("\(testID).log")
 
-        let vmm: any VirtualMachineManager = try Self.makeVMM(
+        var vmm: any VirtualMachineManager = try Self.makeVMM(
             kernel: testKernel,
             initialFilesystem: initfsPerTest,
             chBinary: Self.chBinaryOverride(for: self),
             virtiofsdBinary: Self.virtiofsdBinaryOverride(for: self)
         )
+        if let blockDeviceDriver {
+            vmm = BlockDeviceDriverMachines(base: vmm, driver: blockDeviceDriver, overridesConfigured: false)
+        }
 
         return (
             cl,
@@ -468,6 +568,22 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("pod shared swap", testPodSharedSwap),
                 Test("pod container swap limit", testPodContainerSwapLimit),
                 Test("pod IPv6 address", testPodIPv6AddressAdd),
+            ]
+        }
+        return []
+    }
+
+    private func macOS27Tests() -> [Test] {
+        if #available(macOS 27, *) {
+            return [
+                Test("pod scsi volume across stop and start", testPodSCSIVolumeAcrossStopAndStart),
+                Test("pod forty scsi volumes", testPodFortySCSIVolumes),
+                Test("pod hotplug scsi rootfs", testPodHotplugSCSIRootfs),
+                Test("pod scsi volume keeps unsynced writes", testPodSCSIVolumeKeepsUnsyncedWrites),
+                Test("pod scsi speed against virtio-blk", testPodSCSISpeed),
+                Test("container disk on the scsi host", testContainerDiskOnSCSIHost),
+                Test("container disk on the default driver", testContainerDiskOnDefaultDriver),
+                Test("pod scsi streams against virtio-blk", testPodSCSIStreams),
             ]
         }
         return []
@@ -713,6 +829,9 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("multiple concurrent processes with output stress", testMultipleConcurrentProcessesOutputStress),
 
                 // NBD volumes (test infra is macOS-only)
+                Test("container block device mount", testContainerBlockDeviceMount),
+                Test("container block device read only", testContainerBlockDeviceReadOnly),
+                Test("container memory block device", testContainerMemoryBlockDevice),
                 Test("container NBD mount", testContainerNBDMount),
                 Test("container NBD read-only", testContainerNBDReadOnly),
                 Test("container NBD raw block", testContainerNBDRawBlock),
@@ -744,7 +863,7 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("container swap", testContainerSwap),
                 Test("container swap under pressure", testContainerSwapUnderPressure),
                 Test("container swap reclaims freed blocks", testContainerSwapReclaimsFreedBlocks),
-            ] + macOS26Tests()
+            ] + macOS26Tests() + macOS27Tests()
         let tests: [Test] = crossPlatformTests + macOSOnlyTests
         #else
         // Hotplug into a running pod VM is CH-only (VZ has no runtime hotplug),

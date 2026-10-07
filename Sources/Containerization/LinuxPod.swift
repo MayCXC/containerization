@@ -56,6 +56,9 @@ public final class LinuxPod: Sendable {
         public var interfaces: [any Interface] = []
         /// Whether nested virtualization should be turned on for the pod.
         public var virtualization: Bool = false
+        /// The device the pod's machine attaches its containers' block
+        /// devices on.
+        public var blockDeviceDriver: BlockDeviceDriver = .virtioBlock
         /// Optional file path to store serial boot logs.
         public var bootLog: BootLog?
         /// Whether containers in the pod should share a PID namespace.
@@ -169,7 +172,8 @@ public final class LinuxPod: Sendable {
         public enum Source: Sendable {
             /// A network block device (NBD) volume.
             case nbd(url: URL, timeout: TimeInterval? = nil, readOnly: Bool = false)
-            /// A disk-image file on the host, attached as a virtio-block device.
+            /// A disk-image file on the host, attached on the pod's block
+            /// device driver.
             case diskImage(path: URL, readOnly: Bool = false)
             /// An in-memory (tmpfs) volume mounted inside the guest.
             case tmpfs(sizeBytes: UInt64? = nil)
@@ -1090,7 +1094,8 @@ extension LinuxPod {
                 interfaces: self.config.interfaces,
                 storage: machineStorage,
                 bootLog: self.config.bootLog,
-                nestedVirtualization: self.config.virtualization
+                nestedVirtualization: self.config.virtualization,
+                blockDeviceDriver: self.config.blockDeviceDriver
             )
             vmConfig.extensions = self.config.extensions
             let creationConfig = StandardVMConfig(configuration: vmConfig)
@@ -1255,7 +1260,9 @@ extension LinuxPod {
                                 source: attachment.source,
                                 destination: guestPath,
                                 options: attachment.options
-                            ))
+                            ),
+                            of: attachment
+                        )
                     }
 
                     // Mount the volumes the containers mount, each once.

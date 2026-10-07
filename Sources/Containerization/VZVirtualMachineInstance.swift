@@ -73,6 +73,10 @@ public final class VZVirtualMachineInstance: Sendable {
         public var rosetta: Bool
         /// Toggle nested virtualization support.
         public var nestedVirtualization: Bool
+        /// The device the machine attaches its containers' block devices on.
+        /// virtio-scsi is the host this process implements, which
+        /// Virtualization lets it from macOS 27.
+        public var blockDeviceDriver: BlockDeviceDriver
         /// The machine's storage: each container's mounts by role, and the
         /// volumes and swap its containers share.
         public var storage: MachineMounts
@@ -92,6 +96,7 @@ public final class VZVirtualMachineInstance: Sendable {
             self.memoryInBytes = 1024.mib()
             self.rosetta = false
             self.nestedVirtualization = false
+            self.blockDeviceDriver = .virtioBlock
             self.storage = MachineMounts()
             self.interfaces = []
         }
@@ -105,6 +110,10 @@ public final class VZVirtualMachineInstance: Sendable {
     private let ownsGroup: Bool
     private let timeSyncer: TimeSyncer
     private let logger: Logger?
+    /// The disks of the machine's virtio-scsi host (`VZSCSIHotplugProvider`),
+    /// where Virtualization lets this process implement the host; nil when
+    /// the machine has none.
+    private nonisolated(unsafe) let scsi: AnyObject?
 
     public convenience init(
         group: EventLoopGroup? = nil,
@@ -131,18 +140,49 @@ public final class VZVirtualMachineInstance: Sendable {
         self.logger = logger
         self.timeSyncer = .init(logger: logger)
 
+        let scsi = try Self.makeSCSI(driver: config.blockDeviceDriver, cpus: config.cpus, logger: logger)
+        self.scsi = scsi
+
         let allocator = Character.blockDeviceTagAllocator()
-        let (mountAttachments, _) = try config.mountAttachments(allocator: allocator)
+        let (mountAttachments, _) = try config.mountAttachments(allocator: allocator) { mount in
+            guard #available(macOS 27, *), let host = scsi as? VZSCSIHotplugProvider else {
+                throw ContainerizationError(.unsupported, message: "this machine has no virtio-scsi host for \(mount.source)")
+            }
+            return try host.bootDisk(mount)
+        }
         self._storage = Mutex(mountAttachments)
 
         self.vm = VZVirtualMachine(
-            configuration: try config.toVZ(allocator: allocator),
+            configuration: try config.toVZ(allocator: allocator, attachments: mountAttachments, scsi: scsi),
             queue: self.queue
         )
+
+        if #available(macOS 27, *), let host = scsi as? VZSCSIHotplugProvider {
+            host.setRegistry { [weak self] id, container in
+                self?.withStorage { $0.containers[id] = container }
+            }
+            self.hotplugProvider = host
+        }
 
         for ext in config.extensions.compactMap({ $0 as? any VZInstanceExtension }) {
             try ext.didCreate(self)
         }
+    }
+
+    /// The machine's virtio-scsi host when its block device driver is
+    /// virtio-scsi, with a request queue for each of its `cpus` vCPUs.
+    /// Virtualization's custom virtio devices, which let this process
+    /// implement the host, arrive in macOS 27, so the driver is refused
+    /// before it.
+    private static func makeSCSI(driver: BlockDeviceDriver, cpus: Int, logger: Logger?) throws -> AnyObject? {
+        guard #available(macOS 27, *) else {
+            try driver.require(scsiHost: "Virtualization lets this process implement one from macOS 27")
+            return nil
+        }
+        guard driver == .virtioSCSI else {
+            return nil
+        }
+        return VZSCSIHotplugProvider(device: VZVirtioSCSI(cpus: cpus, logger: logger))
     }
 }
 
@@ -190,7 +230,20 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
             // Do any necessary setup needed prior to starting the guest.
             try await self.prestart()
 
-            try await self.vm.start(queue: self.queue)
+            // The boot disks of the virtio-scsi host are attached before the
+            // guest's driver scans it.
+            if #available(macOS 27, *), let host = self.scsi as? VZSCSIHotplugProvider {
+                try host.attachBootDisks()
+            }
+
+            do {
+                try await self.vm.start(queue: self.queue)
+            } catch {
+                if #available(macOS 27, *), let host = self.scsi as? VZSCSIHotplugProvider {
+                    host.detachAll()
+                }
+                throw error
+            }
 
             let agent = try await Vminitd(
                 connection: try await self.vm.waitForAgent(queue: self.queue),
@@ -233,6 +286,12 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
             }
 
             try await self.vm.stop(queue: self.queue)
+
+            // The stopped machine lets go of the disks of its virtio-scsi
+            // host: each image closes and its lock is released.
+            if #available(macOS 27, *), let host = self.scsi as? VZSCSIHotplugProvider {
+                host.detachAll()
+            }
         }
     }
 
@@ -411,7 +470,9 @@ extension VZVirtualMachineInstance.Configuration {
         return [c]
     }
 
-    func toVZ(allocator: any AddressAllocator<Character>) throws -> VZVirtualMachineConfiguration {
+    /// The Virtualization configuration of the machine whose storage is
+    /// attached as `attachments` describes.
+    func toVZ(allocator: any AddressAllocator<Character>, attachments: MachineAttachments, scsi: AnyObject?) throws -> VZVirtualMachineConfiguration {
         var config = VZVirtualMachineConfiguration()
 
         config.cpuCount = self.cpus
@@ -462,12 +523,22 @@ extension VZVirtualMachineInstance.Configuration {
             #endif
         }
 
-        guard let kernel = self.kernel else {
+        guard var kernel = self.kernel else {
             throw ContainerizationError(.invalidArgument, message: "kernel cannot be nil")
         }
 
         guard let initialFilesystem = self.initialFilesystem else {
             throw ContainerizationError(.invalidArgument, message: "rootfs cannot be nil")
+        }
+
+        // The guest's SCSI layer scans no host at boot: the agent asks for
+        // each disk by its address, which scans for that one logical unit.
+        // Kata's runtime boots with the scan off whenever its block device
+        // driver is virtio-scsi:
+        // https://github.com/kata-containers/kata-containers/blob/ea7aba03b1d48813cae07413c95ab6bc464b7a5f/src/runtime/pkg/katautils/config.go#L1583-L1592
+        // A scan mode already on the command line is left as it is.
+        if self.blockDeviceDriver == .virtioSCSI, !kernel.commandLine.kernelArgs.contains(where: { $0.hasPrefix("scsi_mod.scan=") }) {
+            kernel.commandLine.kernelArgs.append("scsi_mod.scan=none")
         }
 
         let loader = VZLinuxBootLoader(kernelURL: kernel.path)
@@ -481,7 +552,9 @@ extension VZVirtualMachineInstance.Configuration {
         // The walk is the machine's device order, matching the addresses
         // `mountAttachments` hands out walking the same way.
         var usedVirtioFSTags: Set<String> = []
-        for mount in self.storage.ordered {
+        // A disk the virtio-scsi host carries is a logical unit of it, not a
+        // storage device of its own: its attachment has an address.
+        for (mount, attachment) in zip(self.storage.ordered, attachments.ordered) where attachment.scsiAddress == nil {
             if case .virtiofs = mount.runtimeOptions {
                 let tag = try hashFilePath(path: mount.source)
                 if usedVirtioFSTags.contains(tag) {
@@ -511,6 +584,10 @@ extension VZVirtualMachineInstance.Configuration {
         virtiofsDevice.share = multiShare
         config.directorySharingDevices.append(virtiofsDevice)
 
+        if #available(macOS 27, *), let host = scsi as? VZSCSIHotplugProvider {
+            config.customVirtioDevices.append(host.device.configuration)
+        }
+
         let storageDeviceCount = config.storageDevices.count
 
         let platform = VZGenericPlatformConfiguration()
@@ -533,7 +610,22 @@ extension VZVirtualMachineInstance.Configuration {
         return config
     }
 
-    func mountAttachments(allocator: any AddressAllocator<Character>) throws -> (
+    /// Whether the machine's virtio-scsi host carries `mount`: a block device
+    /// its containers bring, when the machine's block device driver is
+    /// virtio-scsi, unless it is a network block device, which reaches the
+    /// guest through Virtualization's own attachment alone.
+    func carriesOnSCSIHost(_ mount: Mount) -> Bool {
+        self.blockDeviceDriver == .virtioSCSI && mount.isBlock && !mount.isNetworkBlockDevice
+    }
+
+    /// The machine's attachments for its mounts: a virtio block device takes
+    /// a device letter from `allocator`, and a disk on the virtio-scsi host
+    /// takes its address from `scsiDisk`, each the name its driver gives it
+    /// to the guest.
+    func mountAttachments(
+        allocator: any AddressAllocator<Character>,
+        scsiDisk: (Mount) throws -> AttachedFilesystem
+    ) throws -> (
         attachments: MachineAttachments, storageDeviceCount: Int
     ) {
         var storageDeviceCount = 0
@@ -548,8 +640,19 @@ extension VZVirtualMachineInstance.Configuration {
         }
 
         // The machine's device order: addresses are handed out in the same
-        // walk `makeConfiguration` creates the devices in.
+        // walk `toVZ` creates the devices in. A disk on the virtio-scsi host
+        // takes its address on that host and no device letter.
         func attach(_ mount: Mount) throws -> AttachedFilesystem {
+            if self.carriesOnSCSIHost(mount) {
+                return try scsiDisk(mount)
+            }
+            return try attachOwn(mount)
+        }
+        // A swap area stays a virtio block device whatever the driver: the
+        // guest enables it by its device path, as Kata attaches its swap
+        // files on virtio-blk:
+        // https://github.com/kata-containers/kata-containers/blob/ea7aba03b1d48813cae07413c95ab6bc464b7a5f/src/runtime/virtcontainers/qemu.go#L2276-L2280
+        func attachOwn(_ mount: Mount) throws -> AttachedFilesystem {
             let attached = try AttachedFilesystem(mount: mount, allocator: allocator)
             if mount.isBlock {
                 storageDeviceCount += 1
@@ -560,14 +663,19 @@ extension VZVirtualMachineInstance.Configuration {
         var containers: [String: ContainerAttachments] = [:]
         for id in self.storage.containers.keys.sorted() {
             guard let container = self.storage.containers[id] else { continue }
-            containers[id] = try container.map(attach)
+            containers[id] = ContainerAttachments(
+                rootfs: try attach(container.rootfs),
+                writableLayer: try container.writableLayer.map(attach),
+                swap: try container.swap.map(attachOwn),
+                mounts: try container.mounts.map(attach)
+            )
         }
         var volumes: [String: AttachedFilesystem] = [:]
         for name in self.storage.volumes.keys.sorted() {
             guard let mount = self.storage.volumes[name] else { continue }
             volumes[name] = try attach(mount)
         }
-        let swap = try self.storage.swap.map(attach)
+        let swap = try self.storage.swap.map(attachOwn)
 
         return (MachineAttachments(containers: containers, volumes: volumes, swap: swap), storageDeviceCount)
     }

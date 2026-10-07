@@ -80,6 +80,10 @@ public struct VMConfiguration: Sendable {
     /// Enable nested virtualization support. If the VirtualMachineManager
     /// does not support this feature, it MUST return an .unsupported ContainerizationError.
     public var nestedVirtualization: Bool
+    /// The device the machine attaches its containers' block devices on. If
+    /// the VirtualMachineManager cannot give the machine that device, it
+    /// MUST return an .unsupported ContainerizationError.
+    public var blockDeviceDriver: BlockDeviceDriver
     /// Extension objects that participate in the VM instance lifecycle.
     /// Extension packages append their types here; VZ-aware extensions
     /// should conform to ``VZInstanceExtension``.
@@ -91,7 +95,8 @@ public struct VMConfiguration: Sendable {
         interfaces: [any Interface] = [],
         storage: MachineMounts = MachineMounts(),
         bootLog: BootLog? = nil,
-        nestedVirtualization: Bool = false
+        nestedVirtualization: Bool = false,
+        blockDeviceDriver: BlockDeviceDriver = .virtioBlock
     ) {
         self.cpus = cpus
         self.memoryInBytes = memoryInBytes
@@ -99,5 +104,6 @@ public struct VMConfiguration: Sendable {
         self.storage = storage
         self.bootLog = bootLog
         self.nestedVirtualization = nestedVirtualization
+        self.blockDeviceDriver = blockDeviceDriver
     }
 }
