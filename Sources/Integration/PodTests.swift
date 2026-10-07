@@ -1386,6 +1386,201 @@ extension IntegrationSuite {
         }
     }
 
+    /// The process list of a pod's container, read with an exec of `ps aux`.
+    private func processList(of containerID: String, in pod: LinuxPod, processID: String) async throws -> String {
+        let buffer = BufferWriter()
+        let exec = try await pod.execInContainer(containerID, processID: processID) { config in
+            config.arguments = ["/bin/sh", "-c", "ps aux"]
+            config.stdout = buffer
+        }
+        try await exec.start()
+        let status = try await exec.wait()
+        try await exec.delete()
+        guard status.exitCode == 0 else {
+            throw IntegrationError.assert(msg: "ps in \(containerID) exited with status \(status)")
+        }
+        return String(data: buffer.data, encoding: .utf8) ?? ""
+    }
+
+    /// A container's init that shares the pod's pid namespace takes the rest
+    /// of its container with it: once its exit is answered, nothing the
+    /// container started is left for the containers beside it to see.
+    func testPodSharedPIDNamespaceInitExitTakesItsProcesses() async throws {
+        let id = "test-pod-shared-pid-init-exit-takes-its-processes"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+            config.shareProcessNamespace = true
+        }
+
+        // Killing this init leaves both sleeps it started running.
+        try await pod.addContainer("leaver", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "leaver")) { config in
+            config.process.arguments = ["/bin/sh", "-c", "sleep 301 & sleep 300"]
+        }
+        try await pod.addContainer("watcher", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "watcher")) { config in
+            config.process.arguments = ["/bin/sleep", "302"]
+        }
+
+        do {
+            try await pod.create()
+            try await pod.startContainer("leaver")
+            try await pod.startContainer("watcher")
+
+            var started = false
+            for attempt in 0..<50 {
+                let before = try await processList(of: "watcher", in: pod, processID: "ps-before-\(attempt)")
+                if before.contains("sleep 301") && before.contains("sleep 300") {
+                    started = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            guard started else {
+                throw IntegrationError.assert(msg: "the leaver's sleeps never showed in the shared pid namespace")
+            }
+
+            try await pod.killContainer("leaver", signal: .kill)
+            _ = try await pod.waitContainer("leaver")
+
+            let after = try await processList(of: "watcher", in: pod, processID: "ps-after")
+            guard !after.contains("sleep 301") && !after.contains("sleep 300") else {
+                throw IntegrationError.assert(msg: "the leaver's processes outlived its init's exit: \(after)")
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// A container whose start fails leaves nothing of itself in the guest:
+    /// its process names a binary its root does not have, so the guest makes
+    /// the container and fails to run it, and once the start has answered
+    /// the guest holds no such container to delete.
+    func testPodFailedStartLeavesNothingInTheGuest() async throws {
+        let id = "test-pod-failed-start-leaves-nothing"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+        try await pod.addContainer("broken", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "broken")) { config in
+            config.process.arguments = ["foo-bar-baz"]
+        }
+
+        do {
+            try await pod.create()
+            var started = false
+            do {
+                try await pod.startContainer("broken")
+                started = true
+            } catch {
+                // The guest cannot run a binary the root does not have.
+            }
+            guard !started else {
+                throw IntegrationError.assert(msg: "a container whose binary is missing started")
+            }
+
+            let agent = try await Vminitd(connection: pod.dialVsock(port: Vminitd.port), group: Self.eventLoop)
+            var held = false
+            do {
+                try await agent.deleteProcess(id: "broken", containerID: "broken")
+                held = true
+            } catch {
+                // The guest holds no such container.
+            }
+            try await agent.close()
+            guard !held else {
+                throw IntegrationError.assert(msg: "the guest still held the container whose start failed")
+            }
+
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
+    /// A pod's stop deletes the processes executed in its containers, as a
+    /// container's own machine deletes the ones it vended: a process still
+    /// running when the pod stops has been deleted by the time the stop
+    /// returns, while the guest that holds it was there to answer.
+    func testPodStopDeletesItsExecs() async throws {
+        let id = "test-pod-stop-deletes-its-execs"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+        try await pod.addContainer("container", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "container")) { config in
+            config.process.arguments = ["/bin/sleep", "300"]
+        }
+
+        let exec: LinuxProcess
+        do {
+            try await pod.create()
+            try await pod.startContainer("container")
+            exec = try await pod.execInContainer("container", processID: "lingerer") { config in
+                config.arguments = ["/bin/sleep", "301"]
+            }
+            try await exec.start()
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+
+        // The stop's deletion is the process's deletion; one made only now
+        // would reach for a guest that is gone.
+        do {
+            try await exec.delete()
+        } catch {
+            throw IntegrationError.assert(msg: "the exec was not deleted by the pod's stop: \(error)")
+        }
+    }
+
+    /// A container's stop deletes the processes executed in it before its
+    /// init, as a container's own machine deletes the ones it vended: a
+    /// process still running when its container stops has been deleted by
+    /// the time the stop returns, while the guest still held the container
+    /// it ran in.
+    func testPodContainerStopDeletesItsExecs() async throws {
+        let id = "test-pod-container-stop-deletes-its-execs"
+
+        let bs = try await bootstrap(id)
+        let pod = try LinuxPod(id, vmm: bs.vmm, vm: .default) { config in
+            config.bootLog = bs.bootLog
+        }
+        try await pod.addContainer("container", rootfs: try cloneRootfs(bs.rootfs, testID: id, containerID: "container")) { config in
+            config.process.arguments = ["/bin/sleep", "300"]
+        }
+
+        do {
+            try await pod.create()
+            try await pod.startContainer("container")
+            let exec = try await pod.execInContainer("container", processID: "lingerer") { config in
+                config.arguments = ["/bin/sleep", "301"]
+            }
+            try await exec.start()
+            try await pod.stopContainer("container")
+
+            // The stop's deletion is the process's deletion; one made only
+            // now would ask the guest for a container it let go of with its
+            // init.
+            do {
+                try await exec.delete()
+            } catch {
+                throw IntegrationError.assert(msg: "the exec was not deleted by its container's stop: \(error)")
+            }
+            try await pod.stop()
+        } catch {
+            try? await pod.stop()
+            throw error
+        }
+    }
+
     func testPodReadOnlyRootfs() async throws {
         let id = "test-pod-readonly-rootfs"
 

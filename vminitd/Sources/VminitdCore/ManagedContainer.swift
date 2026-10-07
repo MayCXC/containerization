@@ -36,6 +36,10 @@ public actor ManagedContainer {
     /// leaving them on vmexec.
     private let runc: Runc?
     private var execs: [String: any ContainerProcess] = [:]
+    /// Whether the init heads a pid namespace of its own. Such an init takes
+    /// every process in its namespace with it when it exits; an init that
+    /// joins another's namespace leaves the rest of its container running.
+    private let ownsPidNamespace: Bool
 
     public var pid: Int32? {
         self.initProcess.pid
@@ -136,6 +140,7 @@ public actor ManagedContainer {
             self.cgroupManager = cgManager
             self.initProcess = initProcess
             self.runc = runc
+            self.ownsPidNamespace = spec.linux?.namespaces.contains { $0.type == .pid && $0.path.isEmpty } ?? false
             self.id = id
             self.bundle = bundle
             self.log = log
@@ -242,7 +247,52 @@ extension ManagedContainer {
 
     func wait(execID: String) async throws -> ContainerExitStatus {
         let proc = try self.getExecOrInit(execID: execID)
-        return await proc.wait()
+        let status = await proc.wait()
+        if execID == self.id && !self.ownsPidNamespace {
+            await self.killRemaining()
+        }
+        return status
+    }
+
+    /// End what the container still runs once its init has exited, so that
+    /// the init's exit is answered with the container empty. An init that
+    /// shares a pid namespace leaves the container's other processes running,
+    /// so they are killed through the container's cgroup, which holds every
+    /// one of them, and the answer waits for the cgroup to empty, bounded by
+    /// the time a container's machine gives its init at a stop. containerd
+    /// publishes such a container's init exit only after `runc kill --all`,
+    /// which writes `cgroup.kill` on cgroup v2.
+    /// https://github.com/containerd/containerd/blob/main/cmd/containerd-shim-runc-v2/task/service.go
+    /// https://github.com/containerd/containerd/blob/main/cmd/containerd-shim-runc-v2/runc/util.go
+    /// https://github.com/opencontainers/runc/blob/main/libcontainer/init_linux.go
+    private func killRemaining() async {
+        do {
+            try self.cgroupManager.kill()
+        } catch let error as Cgroup2Manager.Error {
+            // A cgroup that is gone, or a kernel predating cgroup.kill, holds
+            // nothing to kill this way.
+            if case .errno(let code, _) = error, code == ENOENT {
+                return
+            }
+            self.log.error("failed to kill what the init of container \(self.id) left running: \(error)")
+            return
+        } catch {
+            self.log.error("failed to kill what the init of container \(self.id) left running: \(error)")
+            return
+        }
+
+        for _ in 0..<500 {
+            do {
+                guard try self.cgroupManager.populated() else {
+                    return
+                }
+            } catch {
+                self.log.error("failed to read whether container \(self.id) is empty: \(error)")
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        self.log.warning("processes the init of container \(self.id) left are still running 5 s after they were killed")
     }
 
     func kill(execID: String, _ signal: Int32) async throws {

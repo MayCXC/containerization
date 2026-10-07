@@ -816,6 +816,10 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("pod container PID namespace isolation", testPodContainerPIDNamespaceIsolation),
             Test("pod container independent resource limits", testPodContainerIndependentResourceLimits),
             Test("pod shared PID namespace", testPodSharedPIDNamespace),
+            Test("pod shared PID namespace init exit takes its processes", testPodSharedPIDNamespaceInitExitTakesItsProcesses),
+            Test("pod stop deletes its execs", testPodStopDeletesItsExecs),
+            Test("pod container stop deletes its execs", testPodContainerStopDeletesItsExecs),
+            Test("pod failed start leaves nothing in the guest", testPodFailedStartLeavesNothingInTheGuest),
             Test("pod read-only rootfs", testPodReadOnlyRootfs),
             Test("pod read-only rootfs DNS", testPodReadOnlyRootfsDNSConfigured),
             Test("pod container hosts config", testPodContainerHostsConfig),
@@ -922,6 +926,7 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("pod filesystem operation", testPodFilesystemOperation),
                 Test("pod shared disk image volume", testPodSharedDiskImageVolume),
                 Test("pod shared tmpfs volume", testPodSharedTmpfsVolume),
+                Test("pod stop keeps unsynced writes", testPodStopKeepsUnsyncedWrites),
 
                 // cctl --block CLI wiring
                 Test("cctl block NBD mount", testCctlBlockNBDMount),
