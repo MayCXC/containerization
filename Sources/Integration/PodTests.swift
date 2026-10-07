@@ -2361,6 +2361,10 @@ extension IntegrationSuite {
             try await pod.create()
             try await runToExit("declared", in: pod)
             try await runToExit("block", in: pod)
+            let held = await pod.heldDiskImages()
+            guard held == [image.absolutePath()] else {
+                throw IntegrationError.assert(msg: "the machine says it holds \(held), expected the declared volume's image once")
+            }
             try await pod.stop()
         } catch {
             try? await pod.stop()
@@ -2934,6 +2938,10 @@ extension IntegrationSuite {
             try await runToExit("writer", in: pod)
             try await pod.stopContainer("writer")
             try await pod.removeContainer("writer")
+            let held = await pod.heldDiskImages()
+            guard held == [image.absolutePath()] else {
+                throw IntegrationError.assert(msg: "with the writer removed the machine says it holds \(held), expected [\(image.absolutePath())]")
+            }
 
             let early = try machine("early", ["/bin/true"])
             var refused = false
@@ -2952,6 +2960,10 @@ extension IntegrationSuite {
         } catch {
             try? await pod.stop()
             throw error
+        }
+        let released = await pod.heldDiskImages()
+        guard released.isEmpty else {
+            throw IntegrationError.assert(msg: "the stopped machine says it holds \(released)")
         }
 
         let readBack = BufferWriter()

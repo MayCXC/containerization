@@ -1766,6 +1766,34 @@ extension LinuxPod {
         }
     }
 
+    /// The disk images the pod's machine holds, by host path: those of the
+    /// volumes the pod declares and of the block volumes its containers
+    /// brought, each held from when the machine attached it until the machine
+    /// stops, whether or not a container still mounts it. A machine that is
+    /// not running holds none. A caller deciding whether a volume is free
+    /// asks this rather than the containers it knows of, since a volume
+    /// outlives the container that brought it; the kubelet reports the
+    /// volumes a node has in use apart from the pods that use them the same
+    /// way.
+    /// https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
+    public func heldDiskImages() async -> [String] {
+        await self.state.withLock { state in
+            guard case .created = state.phase else {
+                return []
+            }
+            var paths = Set<String>()
+            for volume in self.config.volumes {
+                if case .diskImage(let path, _) = volume.source {
+                    paths.insert(path.absolutePath())
+                }
+            }
+            for volume in state.blockVolumes.values where volume.attachment != nil {
+                paths.insert(volume.mount.source)
+            }
+            return paths.sorted()
+        }
+    }
+
     /// Get statistics for containers in the pod.
     public func statistics(containerIDs: [String]? = nil, categories: StatCategory = .all) async throws -> [ContainerStatistics] {
         let (createdState, ids) = try await self.state.withLock { state in
