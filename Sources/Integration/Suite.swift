@@ -829,6 +829,7 @@ struct IntegrationSuite: AsyncParsableCommand {
             Test("pod useInit with shared PID namespace", testPodUseInitWithSharedPIDNamespace),
             Test("pod sysctl", testPodSysctl),
             Test("pod sysctl multiple containers", testPodSysctlMultipleContainers),
+            Test("pod sysctl reaches container namespaces", testPodSysctlReachesContainerNamespaces),
             Test("pod invalid volume reference", testPodInvalidVolumeReference),
             Test("pod duplicate volume name", testPodDuplicateVolumeName),
             Test("pod block volume shared by containers", testPodBlockVolumeSharedByContainers),

@@ -79,6 +79,19 @@ public final class LinuxPod: Sendable {
         /// The default hosts file configuration for all containers in the pod.
         /// Individual containers can override this by setting their own `hosts` configuration.
         public var hosts: Hosts?
+        /// The system control options for the pod.
+        ///
+        /// Its containers share one kernel, so a container cannot set a kernel
+        /// parameter for itself alone: the runtime interface carries sysctls on
+        /// the sandbox for that reason, and they are applied once, before any
+        /// container in the pod starts. A parameter a namespace holds applies
+        /// in each namespace of that kind the pod's containers have: they share
+        /// the machine's network namespace, which the pod sets with the rest,
+        /// while each has ipc and uts namespaces of its own, so the parameters
+        /// those hold are also written into every container's spec, under the
+        /// container's own.
+        /// https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto
+        public var sysctl: [String: String] = [:]
         /// Volumes attached to the pod. Can be shared with multiple containers.
         public var volumes: [PodVolume] = []
         /// EXPERIMENTAL: Path in the root filesystem for the virtual machine
@@ -489,7 +502,7 @@ public final class LinuxPod: Sendable {
             annotations[AnnotationKeys.containerizationCgroupDelegation] = "true"
             spec.annotations = annotations
         }
-        spec.linux?.sysctl = config.sysctl
+        spec.linux?.sysctl = Self.containerNamespaced(self.config.sysctl).merging(config.sysctl) { _, own in own }
         spec.linux?.devices = config.devices
         spec.linux?.maskedPaths = config.maskedPaths
         spec.linux?.readonlyPaths = config.readonlyPaths
@@ -541,6 +554,22 @@ public final class LinuxPod: Sendable {
             return .defaultProfile(capabilities: config.process.toOCI().capabilities, arch: arch)
         case .profile(let profile):
             return profile
+        }
+    }
+
+    /// The kernel parameters a container's own ipc and uts namespaces hold,
+    /// as runc's validation of a spec names them: the System V IPC limits,
+    /// the POSIX message queue ones, and the domain name. The hostname has a
+    /// field of its own in the spec.
+    /// https://github.com/opencontainers/runc/blob/main/libcontainer/configs/validate/validator.go
+    private static func containerNamespaced(_ sysctl: [String: String]) -> [String: String] {
+        let ipc: Set<String> = [
+            "kernel.msgmax", "kernel.msgmnb", "kernel.msgmni", "kernel.sem",
+            "kernel.shmall", "kernel.shmmax", "kernel.shmmni", "kernel.shm_rmid_forced",
+        ]
+        return sysctl.filter { key, _ in
+            let name = key.replacingOccurrences(of: "/", with: ".")
+            return ipc.contains(name) || name.hasPrefix("fs.mqueue.") || name == "kernel.domainname"
         }
     }
 
@@ -1347,6 +1376,13 @@ extension LinuxPod {
                         } catch {
                             setupFailures.withLock { $0[id] = error }
                         }
+                    }
+
+                    // The pod's kernel parameters are set once, before any of
+                    // its containers start, because they share the kernel these
+                    // apply to.
+                    if !self.config.sysctl.isEmpty {
+                        try await agent.sysctl(settings: self.config.sysctl)
                     }
 
                     // For every interface asked for:
