@@ -97,12 +97,14 @@ public final class Initd: Sendable {
     public let state: State
     let group: MultiThreadedEventLoopGroup
     let blockingPool: NIOThreadPool
+    let compactor: MemoryCompactor
 
     public init(log: Logger, group: MultiThreadedEventLoopGroup, blockingPool: NIOThreadPool) {
         self.log = log
         self.group = group
         self.blockingPool = blockingPool
         self.state = State()
+        self.compactor = MemoryCompactor(log: log)
     }
 
     public func serve(port: Int, additionalServices: [any RegistrableRPCService] = []) async throws {

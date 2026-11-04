@@ -197,6 +197,46 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
         return .init()
     }
 
+    public func compactMemory(
+        request: Com_Apple_Containerization_Sandbox_V3_CompactMemoryRequest,
+        context: GRPCCore.ServerContext
+    ) async throws -> Com_Apple_Containerization_Sandbox_V3_CompactMemoryResponse {
+        log.debug("compactMemory")
+
+        var policy = MemoryCompactionPolicy()
+        policy.period = .seconds(request.periodSecs)
+        policy.periodPressureLimit = request.periodPsiPercentLimit
+        policy.compactionPressureLimit = request.compactPsiPercentLimit
+        policy.compactionTimeLimit = .seconds(request.compactSecMax)
+        policy.order = Int(request.compactOrder)
+        policy.threshold = request.compactThreshold
+
+        let outcome: MemoryCompactionPolicy.Outcome
+        do {
+            outcome = try await compactor.compact(policy)
+        } catch {
+            log.error(
+                "compactMemory",
+                metadata: [
+                    "error": "\(error)"
+                ])
+            throw RPCError(code: .internalError, message: "compactMemory: \(error)", cause: error)
+        }
+
+        return .with {
+            switch outcome {
+            case .compacted:
+                $0.outcome = .compacted
+            case .notDue:
+                $0.outcome = .notDue
+            case .underPressure:
+                $0.outcome = .underPressure
+            case .notFragmented:
+                $0.outcome = .notFragmented
+            }
+        }
+    }
+
     public func proxyVsock(
         request: Com_Apple_Containerization_Sandbox_V3_ProxyVsockRequest,
         context: GRPCCore.ServerContext
@@ -1808,6 +1848,35 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContext.SimpleServ
                     "error": "\(error)"
                 ])
             throw RPCError(code: .internalError, message: "containerStatistics", cause: error)
+        }
+    }
+
+    public func memoryInfo(
+        request: Com_Apple_Containerization_Sandbox_V3_MemoryInfoRequest,
+        context: GRPCCore.ServerContext
+    ) async throws -> Com_Apple_Containerization_Sandbox_V3_MemoryInfoResponse {
+        log.debug("memoryInfo")
+
+        let info: LinuxMemoryInfo
+        do {
+            info = try LinuxMemoryInfo(meminfo: String(contentsOfFile: "/proc/meminfo", encoding: .utf8))
+        } catch {
+            log.error(
+                "memoryInfo",
+                metadata: [
+                    "error": "\(error)"
+                ])
+            throw RPCError(code: .internalError, message: "memoryInfo: failed to read /proc/meminfo", cause: error)
+        }
+
+        return .with {
+            $0.totalBytes = info.totalBytes
+            $0.freeBytes = info.freeBytes
+            $0.availableBytes = info.availableBytes
+            $0.committedBytes = info.committedBytes
+            if let balloonBytes = info.balloonBytes {
+                $0.balloonBytes = balloonBytes
+            }
         }
     }
 

@@ -79,7 +79,8 @@ let package = Package(
                 "CShim",
             ],
             exclude: [
-                "../Containerization/SandboxContext/SandboxContext.proto"
+                "../Containerization/SandboxContext/SandboxContext.proto",
+                "../Containerization/MemoryBalloonPolicy.rules",
             ]
         ),
         .executableTarget(
@@ -110,6 +111,7 @@ let package = Package(
             resources: [
                 .copy("ImageTests/Resources/scratch.tar"),
                 .copy("ImageTests/Resources/scratch_no_annotations.tar"),
+                .copy("Resources/MemoryBalloonPolicyDecisions.json"),
             ]
         ),
         .target(

@@ -29,6 +29,7 @@ struct Application: AsyncParsableCommand {
         version: "0.1.0",
         subcommands: [
             AgentCommand.self,
+            CompactCommand.self,
             InitCommand.self,
             PauseCommand.self,
         ],
