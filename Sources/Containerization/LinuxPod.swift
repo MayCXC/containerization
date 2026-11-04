@@ -267,6 +267,9 @@ public final class LinuxPod: Sendable {
         /// that its removal unmounts it before the devices under it are given
         /// back, as a block volume's attachment records the volume's mount.
         var rootfsMounted = false
+        /// The processes executed in the container, by id, until each is
+        /// deleted, so that a stop can delete the ones still held.
+        var vendedProcesses: [String: LinuxProcess] = [:]
 
         enum ContainerState: Sendable {
             case registered
@@ -1147,7 +1150,7 @@ extension LinuxPod {
             let creationConfig = StandardVMConfig(configuration: vmConfig)
             let vm = try await self.vmm.create(config: creationConfig)
             let mountsShareAtBoot = hasVirtiofsMount || vm.virtiofsLayout == .unified
-            let relayManager = UnixSocketRelayManager(vm: vm)
+            let relayManager = UnixSocketRelayManager(vm: vm, log: self.logger)
             do {
                 try await vm.start()
                 let containers = state.containers
@@ -1527,6 +1530,7 @@ extension LinuxPod {
             }
 
             let agent = try await createdState.vm.dialAgent()
+            var made: LinuxProcess?
             do {
                 // A container that ran and stopped kept its place: its block
                 // devices are attached and registered, and its guest mounts
@@ -1656,12 +1660,31 @@ extension LinuxPod {
                     vm: createdState.vm,
                     logger: self.logger
                 )
+                made = process
                 try await process.start()
 
                 container.process = process
                 container.state = .started
                 state.containers[containerID] = container
             } catch {
+                // What the guest made of a start that failed is taken back
+                // out of it, since the guest takes a start of a container it
+                // still holds for an exec in it: Kata stops a container whose
+                // start fails, which removes it from the guest, and logs a
+                // failure of that stop. The guest unmounts the container's
+                // root filesystem as it removes the container, so the
+                // container is left stopped with nothing of its mounted.
+                // https://github.com/kata-containers/kata-containers/blob/main/src/runtime/virtcontainers/container.go
+                if let made {
+                    do {
+                        try await made.delete()
+                        container.rootfsMounted = false
+                        container.state = .stopped
+                        state.containers[containerID] = container
+                    } catch {
+                        self.logger?.warning("failed to delete what a failed start of container \(containerID) left in the guest: \(error)")
+                    }
+                }
                 try? await agent.close()
                 throw error
             }
@@ -1703,9 +1726,11 @@ extension LinuxPod {
 
             // Check if the vm is even still running
             if createdState.vm.state == .stopped {
-                // The guest is gone with the container's process, so
-                // deleting it gives back only the host's end of it, and a
-                // failure says no more than that.
+                // The guest is gone with the container's processes, so
+                // deleting them gives back only the host's end of each, and
+                // a failure says no more than that; the ones executed in it
+                // go first, as they do while the guest runs.
+                _ = await self.deleteVendedProcesses(of: &container, id: containerID)
                 if let process = container.process {
                     do {
                         try await process.delete()
@@ -1762,6 +1787,13 @@ extension LinuxPod {
                     self.logger?.error("failed to unmount the root filesystem of container \(containerID): \(error)")
                     firstError = firstError ?? error
                 }
+            }
+
+            // The processes executed in the container go before its init,
+            // while the guest still holds the container they ran in: the
+            // guest lets go of a container with its init process.
+            if let failure = await self.deleteVendedProcesses(of: &container, id: containerID) {
+                firstError = firstError ?? failure
             }
 
             // The process is deleted once and let go of either way, as a
@@ -1887,71 +1919,134 @@ extension LinuxPod {
     }
 
     /// Stop the pod's VM and all containers.
+    ///
+    /// The pod is torn down the way a container's own machine is, for every
+    /// container it holds: the relays stop, every process in the guest is
+    /// killed and each started container's init waited for, the containers'
+    /// root filesystems and the pod's volumes are unmounted, and the guest
+    /// syncs, since the machine's stop does not let the guest shut down; then
+    /// the processes the pod vended are deleted and the machine stops. A step
+    /// that fails is logged and the teardown carries on past it, so that one
+    /// container's failure leaves the others' unmounts and the sync in place,
+    /// and the first failure is thrown once the machine has stopped. The pod
+    /// can be created again whenever its machine stopped.
+    /// https://github.com/apple/containerization/blob/main/Sources/Containerization/LinuxContainer.swift
     public func stop() async throws {
         try await self.state.withLock { state in
             let createdState = try state.phase.createdState("stop")
+            let vm = createdState.vm
+            var firstError: (any Error)?
 
             do {
                 createdState.balloon?.task.cancel()
                 try await createdState.relayManager.stopAll()
+            } catch {
+                self.logger?.error("failed to stop relay manager: \(error)")
+                firstError = firstError ?? error
+            }
 
-                // Stop all containers
-                let containerIDs = Array(state.containers.keys)
+            // The containers whose root filesystems the guest has mounted,
+            // and the started ones among all of them.
+            let placed = state.containers.values.filter(\.rootfsMounted)
+            let started = state.containers.values.filter { $0.state == .started }
+            if vm.state != .stopped {
+                // The pod's volumes: the ones it declares, and the ones its
+                // containers mount that the guest has mounted.
+                let volumes = self.config.volumes.map(\.name) + state.blockVolumes.filter { $0.value.attachment != nil }.map(\.key).sorted()
+                let logger = self.logger
+                do {
+                    let failures = try await vm.withAgent { agent in
+                        var failures: [any Error] = []
+                        func attempt(_ what: String, _ step: () async throws -> Void) async {
+                            do {
+                                try await step()
+                            } catch {
+                                logger?.error("failed to \(what) during guest cleanup: \(error)")
+                                failures.append(error)
+                            }
+                        }
 
-                for containerID in containerIDs {
-                    // Stop the container inline
-                    guard var container = state.containers[containerID] else {
-                        continue
-                    }
+                        // A container's socket relays keep its root filesystem
+                        // from unmounting (EBUSY), so they stop first.
+                        for container in placed where !container.config.sockets.isEmpty {
+                            guard let relayAgent = agent as? SocketRelayAgent else {
+                                failures.append(
+                                    ContainerizationError(
+                                        .unsupported,
+                                        message: "VirtualMachineAgent does not support relaySocket surface"
+                                    ))
+                                break
+                            }
+                            for socket in container.config.sockets {
+                                await attempt("stop the relay of socket \(socket.id) of container \(container.id)") {
+                                    try await relayAgent.stopSocketRelay(configuration: socket)
+                                }
+                            }
+                        }
 
-                    if container.state == .stopped {
-                        continue
-                    }
-
-                    if let process = container.process, container.state == .started {
-                        if createdState.vm.state != .stopped {
-                            try? await process.kill(.kill)
-                            _ = try? await process.wait(timeoutInSeconds: 3)
-
-                            try? await createdState.vm.withAgent { agent in
-                                try await agent.umount(
-                                    path: Self.guestRootfsPath(containerID),
-                                    flags: 0
+                        await attempt("kill the guest's processes") {
+                            _ = try await agent.kill(pid: -1, signal: SIGKILL)
+                        }
+                        for container in started {
+                            await attempt("wait for the init of container \(container.id)") {
+                                _ = try await agent.waitProcess(
+                                    id: container.id,
+                                    containerID: container.id,
+                                    timeoutInSeconds: 5
                                 )
                             }
                         }
 
-                        try? await process.delete()
-                        container.process = nil
-                        container.state = .stopped
-
-                        state.containers[containerID] = container
-                    }
-                }
-
-                // Unmount pod-level volumes.
-                if createdState.vm.state != .stopped && !self.config.volumes.isEmpty {
-                    try? await createdState.vm.withAgent { agent in
-                        for volume in self.config.volumes {
-                            try? await agent.umount(
-                                path: Self.guestVolumePath(volume.name),
-                                flags: 0
-                            )
+                        // The guest agent loops on EBUSY itself. A container's
+                        // root comes down with the layers under it when the
+                        // container was given a writable layer.
+                        for container in placed {
+                            await attempt("unmount the root filesystem of container \(container.id)") {
+                                try await Self.umountRootfs(of: container.id, hasWritableLayer: container.writableLayer != nil, agent: agent)
+                            }
                         }
-                    }
-                }
-
-                // Unmount the volumes the containers mount.
-                let mountedVolumes = state.blockVolumes.filter { $0.value.attachment != nil }.map(\.key)
-                if createdState.vm.state != .stopped && !mountedVolumes.isEmpty {
-                    try? await createdState.vm.withAgent { agent in
-                        for name in mountedVolumes {
-                            try? await agent.umount(path: Self.guestVolumePath(name), flags: 0)
+                        for name in volumes {
+                            await attempt("unmount pod volume \(name)") {
+                                try await agent.umount(path: Self.guestVolumePath(name), flags: 0)
+                            }
                         }
-                    }
-                }
 
-                try await createdState.vm.stop()
+                        await attempt("sync the guest") {
+                            try await agent.sync()
+                        }
+                        return failures
+                    }
+                    firstError = firstError ?? failures.first
+                } catch {
+                    self.logger?.error("failed during guest cleanup: \(error)")
+                    firstError = firstError ?? error
+                }
+            }
+
+            for id in Array(state.containers.keys) {
+                guard var container = state.containers[id] else {
+                    continue
+                }
+                if let failure = await self.deleteVendedProcesses(of: &container, id: id) {
+                    firstError = firstError ?? failure
+                }
+                if let process = container.process {
+                    do {
+                        try await process.delete()
+                    } catch {
+                        self.logger?.error("failed to delete the init process of container \(id): \(error)")
+                        firstError = firstError ?? error
+                    }
+                    container.process = nil
+                }
+                if container.state == .started {
+                    container.state = .stopped
+                }
+                state.containers[id] = container
+            }
+
+            do {
+                try await vm.stop()
                 // The machine's volumes went with it. A pod created again
                 // attaches the ones its containers still mount as it boots.
                 state.blockVolumes = state.blockVolumes.compactMapValues { volume in
@@ -1967,9 +2062,13 @@ extension LinuxPod {
                 }
                 state.phase = .initialized
             } catch {
-                try? await createdState.vm.stop()
-                state.phase.setErrored(error: error)
-                throw error
+                self.logger?.error("failed to stop VM: \(error)")
+                let finalError = firstError ?? error
+                state.phase.setErrored(error: finalError)
+                throw finalError
+            }
+            if let firstError {
+                throw firstError
             }
         }
     }
@@ -2035,6 +2134,9 @@ extension LinuxPod {
     }
 
     /// Execute a new process in a container.
+    ///
+    /// The pod holds the process until it is deleted, so that a stop deletes
+    /// the ones still running, as a container's own machine does.
     public func execInContainer(
         _ containerID: String,
         processID: String,
@@ -2043,7 +2145,7 @@ extension LinuxPod {
         try await self.state.withLock { state in
             let createdState = try state.phase.createdState("execInContainer")
 
-            guard let container = state.containers[containerID] else {
+            guard var container = state.containers[containerID] else {
                 throw ContainerizationError(
                     .notFound,
                     message: "container \(containerID) not found in pod"
@@ -2092,10 +2194,43 @@ extension LinuxPod {
                 ociRuntimePath: self.config.ociRuntimePath,
                 agent: agent,
                 vm: createdState.vm,
-                logger: self.logger
+                logger: self.logger,
+                onDelete: { [weak self = self] in
+                    await self?.removeProcess(id: processID, containerID: containerID)
+                }
             )
+            container.vendedProcesses[processID] = process
+            state.containers[containerID] = container
             return process
         }
+    }
+
+    /// Forget a process executed in a container once it is deleted.
+    private func removeProcess(id: String, containerID: String) async {
+        await self.state.withLock { state in
+            _ = state.containers[containerID]?.vendedProcesses.removeValue(forKey: id)
+        }
+    }
+
+    /// Delete the processes executed in a container, as a container's own
+    /// machine deletes the ones it vended: each deletion is attempted once,
+    /// a failure is logged, and the container lets go of every one of them
+    /// either way, since a process answers any later deletion with the
+    /// outcome of its first. `_delete` leaves out the process's own callback,
+    /// which takes the lock the caller holds. Returns the first failure.
+    /// https://github.com/apple/containerization/blob/main/Sources/Containerization/LinuxContainer.swift
+    private func deleteVendedProcesses(of container: inout PodContainer, id: String) async -> (any Error)? {
+        var firstError: (any Error)?
+        for process in container.vendedProcesses.values {
+            do {
+                try await process._delete()
+            } catch {
+                self.logger?.error("failed to delete process \(process.id) of container \(id): \(error)")
+                firstError = firstError ?? error
+            }
+        }
+        container.vendedProcesses = [:]
+        return firstError
     }
 
     /// List all container IDs in the pod.
