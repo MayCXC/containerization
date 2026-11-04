@@ -1,0 +1,343 @@
+//===----------------------------------------------------------------------===//
+// Copyright © 2026 Apple Inc. and the Containerization project authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//===----------------------------------------------------------------------===//
+
+import Foundation
+import Synchronization
+
+#if os(macOS)
+
+/// Where an NBD export keeps the blocks it serves.
+///
+/// A server holds one of these and every connection to that export shares it,
+/// so what one connection writes another reads back.
+protocol NBDBackingStore: Sendable {
+    /// The size of the export, which the server reports during the handshake.
+    var size: UInt64 { get }
+
+    /// Whether the export only ever reads. A server says so during the
+    /// handshake and turns away everything that would write.
+    var isReadOnly: Bool { get }
+
+    /// Read `length` bytes from `offset`. Returns nil when the read fails.
+    func read(offset: UInt64, length: Int) -> [UInt8]?
+
+    /// Write `data` at `offset`. Returns false when the write fails.
+    func write(offset: UInt64, data: [UInt8]) -> Bool
+
+    /// Let go of `length` bytes at `offset`, which the client has said it no
+    /// longer needs. Returns false only when the range is outside the export.
+    /// A store may release less than was asked, or nothing; what a released
+    /// range reads back as is the store's own affair.
+    ///
+    /// The protocol allows a server to do nothing here, but a swap area is
+    /// rewritten constantly and never shrinks on its own, so a store that
+    /// ignores this grows until the export is closed.
+    /// https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md
+    func discard(offset: UInt64, length: Int) -> Bool
+
+    /// Put anything held back where it belongs before replying to a flush.
+    func flush()
+
+    /// Release whatever the store holds.
+    func close()
+}
+
+/// A run of the export that shares one allocation state, which is what a client
+/// asking about block status is told.
+struct NBDExtent: Sendable {
+    /// The extent is not allocated in the store behind the export.
+    static let stateHole: UInt32 = 0x1
+    /// The extent reads back as zeroes.
+    static let stateZero: UInt32 = 0x2
+
+    var length: UInt32
+    var flags: UInt32
+}
+
+extension NBDBackingStore {
+    /// Most stores are written to, so saying nothing means so.
+    var isReadOnly: Bool { false }
+
+    /// How the export is laid out over `length` bytes from `offset`.
+    ///
+    /// A store that cannot tell says the whole range is allocated, which is
+    /// true of any store and costs a client only the chance to skip a hole.
+    func extents(offset: UInt64, length: Int) -> [NBDExtent] {
+        [NBDExtent(length: UInt32(length), flags: 0)]
+    }
+
+    /// Whether a request of `length` bytes at `offset` lies inside the export.
+    /// The protocol asks a server to turn away one that does not rather than
+    /// let it reach the store.
+    /// https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md
+    func covers(offset: UInt64, length: Int) -> Bool {
+        guard length >= 0 else {
+            return false
+        }
+        let (end, overflowed) = offset.addingReportingOverflow(UInt64(length))
+        return !overflowed && end <= self.size
+    }
+}
+
+/// A store that keeps its blocks in a file.
+final class NBDFileStore: NBDBackingStore {
+    private let fd: Mutex<Int32>
+    let size: UInt64
+
+    init?(path: String) {
+        let descriptor = open(path, O_RDWR)
+        guard descriptor >= 0 else {
+            return nil
+        }
+        var st = stat()
+        guard fstat(descriptor, &st) == 0 else {
+            _ = Foundation.close(descriptor)
+            return nil
+        }
+        self.fd = Mutex(descriptor)
+        self.size = UInt64(st.st_size)
+    }
+
+    func read(offset: UInt64, length: Int) -> [UInt8]? {
+        var buffer = [UInt8](repeating: 0, count: length)
+        let read = self.fd.withLock { descriptor in
+            buffer.withUnsafeMutableBytes {
+                pread(descriptor, $0.baseAddress, length, off_t(offset))
+            }
+        }
+        guard read == length else {
+            return nil
+        }
+        return buffer
+    }
+
+    func write(offset: UInt64, data: [UInt8]) -> Bool {
+        self.fd.withLock { descriptor in
+            data.withUnsafeBytes {
+                pwrite(descriptor, $0.baseAddress, data.count, off_t(offset)) == data.count
+            }
+        }
+    }
+
+    func discard(offset: UInt64, length: Int) -> Bool {
+        guard offset + UInt64(length) <= self.size else {
+            return false
+        }
+        // Punching a hole is how a file gives blocks back without changing the
+        // length the export reports. The punch is best effort: a range the
+        // filesystem will not punch, such as one it cannot align, keeps its
+        // blocks, which the protocol permits.
+        self.fd.withLock { descriptor in
+            var punch = fpunchhole_t(
+                fp_flags: 0, reserved: 0, fp_offset: off_t(offset), fp_length: off_t(length))
+            _ = fcntl(descriptor, F_PUNCHHOLE, &punch)
+        }
+        return true
+    }
+
+    /// A file says where its holes are through the same seeks a sparse copy
+    /// uses, so a client is told what the filesystem already knows.
+    func extents(offset: UInt64, length: Int) -> [NBDExtent] {
+        self.fd.withLock { descriptor in
+            var runs: [NBDExtent] = []
+            var at = off_t(offset)
+            let end = off_t(offset) + off_t(length)
+            while at < end {
+                let nextData = lseek(descriptor, at, SEEK_DATA)
+                if nextData < 0, errno != ENXIO {
+                    // The seek itself failed, so nothing is known about the
+                    // layout; say the range is allocated, which is true of any
+                    // range and costs a client only the chance to skip a hole.
+                    return [NBDExtent(length: UInt32(length), flags: 0)]
+                }
+                if nextData < 0 || nextData >= end {
+                    // Nothing written between here and the end of the range.
+                    runs.append(
+                        NBDExtent(
+                            length: UInt32(end - at),
+                            flags: NBDExtent.stateHole | NBDExtent.stateZero))
+                    break
+                }
+                if nextData > at {
+                    runs.append(
+                        NBDExtent(
+                            length: UInt32(nextData - at),
+                            flags: NBDExtent.stateHole | NBDExtent.stateZero))
+                }
+                let nextHole = lseek(descriptor, nextData, SEEK_HOLE)
+                let dataEnd = (nextHole < 0 || nextHole > end) ? end : nextHole
+                runs.append(NBDExtent(length: UInt32(dataEnd - nextData), flags: 0))
+                at = dataEnd
+            }
+            return runs.isEmpty ? [NBDExtent(length: UInt32(length), flags: 0)] : runs
+        }
+    }
+
+    func flush() {
+        self.fd.withLock { _ = fsync($0) }
+    }
+
+    func close() {
+        self.fd.withLock { descriptor in
+            if descriptor >= 0 {
+                _ = Foundation.close(descriptor)
+            }
+        }
+    }
+}
+
+/// A store that keeps its blocks in the memory of the process serving them.
+///
+/// The point of holding them here rather than in a file is where they end up
+/// under pressure. Memory a host process holds is pageable, so the host decides
+/// when these blocks go to its own swap, and they share the one pool the rest
+/// of the system draws on. Blocks in a file take space of their own instead.
+///
+/// Only the chunks actually written are held, so an export costs nothing until
+/// something is stored in it, the way a sparse file costs nothing until it is
+/// written to.
+final class NBDMemoryStore: NBDBackingStore {
+    /// A chunk is a page, because that is the unit a guest swaps in and out.
+    /// Anything larger rounds every scattered page write up to its size, which
+    /// costs both the memory the rounding wastes and the copying of the part
+    /// that was not written.
+    static let chunkSize = 4096
+
+    private let chunks: Mutex<[UInt64: [UInt8]]> = Mutex([:])
+    let size: UInt64
+
+    init(size: UInt64) {
+        self.size = size
+    }
+
+    /// The bytes actually held, which is what the export costs the host.
+    var allocatedBytes: Int {
+        self.chunks.withLock { $0.count * Self.chunkSize }
+    }
+
+    /// The most the export has ever held.
+    ///
+    /// What it holds right now says nothing about what passed through it, since
+    /// a client that discards what it has finished with leaves an export as
+    /// empty as it started. This is what a reader wanting to know whether
+    /// anything was ever stored should look at.
+    var peakAllocatedBytes: Int {
+        self.peakChunks.withLock { $0 * Self.chunkSize }
+    }
+
+    private let peakChunks: Mutex<Int> = Mutex(0)
+
+    func read(offset: UInt64, length: Int) -> [UInt8]? {
+        guard offset + UInt64(length) <= self.size else {
+            return nil
+        }
+        var out = [UInt8](repeating: 0, count: length)
+        self.chunks.withLock { chunks in
+            self.forEachSpan(offset: offset, length: length) { index, inChunk, inSpan, span in
+                // A chunk never written reads back as the zeroes it started as.
+                guard let chunk = chunks[index] else {
+                    return
+                }
+                out.replaceSubrange(inSpan..<(inSpan + span), with: chunk[inChunk..<(inChunk + span)])
+            }
+        }
+        return out
+    }
+
+    func write(offset: UInt64, data: [UInt8]) -> Bool {
+        guard offset + UInt64(data.count) <= self.size else {
+            return false
+        }
+        let held = self.chunks.withLock { chunks -> Int in
+            self.forEachSpan(offset: offset, length: data.count) { index, inChunk, inSpan, span in
+                var chunk = chunks[index] ?? [UInt8](repeating: 0, count: Self.chunkSize)
+                chunk.replaceSubrange(inChunk..<(inChunk + span), with: data[inSpan..<(inSpan + span)])
+                chunks[index] = chunk
+            }
+            return chunks.count
+        }
+        self.peakChunks.withLock { $0 = max($0, held) }
+        return true
+    }
+
+    func discard(offset: UInt64, length: Int) -> Bool {
+        guard offset + UInt64(length) <= self.size else {
+            return false
+        }
+        self.chunks.withLock { chunks in
+            self.forEachSpan(offset: offset, length: length) { index, inChunk, _, span in
+                // Only a whole chunk can go; a chunk the client still wants part
+                // of keeps its place, with the discarded part zeroed.
+                if inChunk == 0 && span == Self.chunkSize {
+                    chunks.removeValue(forKey: index)
+                } else if var chunk = chunks[index] {
+                    chunk.replaceSubrange(
+                        inChunk..<(inChunk + span), with: [UInt8](repeating: 0, count: span))
+                    chunks[index] = chunk
+                }
+            }
+        }
+        return true
+    }
+
+    /// A store in memory knows exactly which chunks it holds, so it can say
+    /// where the holes are rather than claiming the whole range is written.
+    func extents(offset: UInt64, length: Int) -> [NBDExtent] {
+        var runs: [NBDExtent] = []
+        self.chunks.withLock { chunks in
+            self.forEachSpan(offset: offset, length: length) { index, _, _, span in
+                let flags: UInt32 =
+                    chunks[index] == nil ? (NBDExtent.stateHole | NBDExtent.stateZero) : 0
+                if var last = runs.last, last.flags == flags {
+                    last.length += UInt32(span)
+                    runs[runs.count - 1] = last
+                } else {
+                    runs.append(NBDExtent(length: UInt32(span), flags: flags))
+                }
+            }
+        }
+        return runs
+    }
+
+    /// Nothing is held anywhere else, so a flush has nothing to do.
+    func flush() {}
+
+    func close() {
+        self.chunks.withLock { $0.removeAll() }
+    }
+
+    /// Walk the chunks a request covers, handing each the range it owns.
+    private func forEachSpan(
+        offset: UInt64,
+        length: Int,
+        _ body: (_ index: UInt64, _ inChunk: Int, _ inSpan: Int, _ span: Int) -> Void
+    ) {
+        var remaining = length
+        var at = offset
+        var taken = 0
+        while remaining > 0 {
+            let index = at / UInt64(Self.chunkSize)
+            let inChunk = Int(at % UInt64(Self.chunkSize))
+            let span = min(Self.chunkSize - inChunk, remaining)
+            body(index, inChunk, taken, span)
+            remaining -= span
+            taken += span
+            at += UInt64(span)
+        }
+    }
+}
+
+#endif
