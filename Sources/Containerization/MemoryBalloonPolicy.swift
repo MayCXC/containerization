@@ -36,32 +36,27 @@ import Darwin
 /// That page's formula for the buffer divides where its worked example
 /// multiplies (1000 MB committed with a 20% buffer is 1200 MB); this follows
 /// the example. What the guest needs is measured the way Linux reports it to
-/// Hyper-V (`Sample.init(hostFree:size:info:)`), and the balloon never takes
+/// Hyper-V (`Sample.init(hostPressure:size:info:)`), and the balloon never takes
 /// the guest's available memory below the floor that measure includes, which
 /// Linux's Hyper-V balloon refuses to do itself.
 ///
 /// When the host is short, Hyper-V gives up the buffer first and then relies
-/// on the guest's own paging, without publishing by how much. oVirt's Memory
-/// Overcommitment Manager publishes that for a balloon that takes only a
-/// target size, and its rules decide it here:
+/// on the guest's own paging, without publishing by how much. The host says
+/// it is short by its memory pressure level (`HostPressure`): at a warning the
+/// buffer goes and the machine holds what its guest needs; at critical the
+/// buffer goes negative, so the machine is held under what its guest needs and
+/// the guest pages rather than grows, though the balloon still takes nothing
+/// below the floor. How far under is oVirt's Memory Overcommitment Manager's,
+/// whose rules publish it for a balloon that takes only a target size: MoM's
+/// critical share for a host with nothing free.
 /// https://github.com/oVirt/mom/blob/master/doc/balloon.rules
-/// Below `pressureThreshold` of the host's memory free, the buffer narrows in
-/// proportion to what is free; at or below `pressureCritical` it goes negative,
-/// so the machine is held under what its guest needs and the guest pages rather
-/// than grows, though the balloon still takes nothing below the floor. A
-/// machine shrinks by at most `maxShrink` of what it holds per decision and
+/// A machine shrinks by at most `maxShrink` of what it holds per decision and
 /// grows to its target at once, as MoM grows a guest short of its desired free
 /// memory, and changes under `minChange` are skipped.
 public struct MemoryBalloonPolicy: Sendable, Equatable {
     /// Hyper-V's memory buffer, as a fraction of what the guest needs, the
     /// policy's `memory_buffer`.
     public var buffer: Double = 0.20
-    /// The host free fraction below which the buffer narrows,
-    /// `pressure_threshold`.
-    public var pressureThreshold: Double = 0.20
-    /// The host free fraction at or below which the guest is held under what
-    /// it needs, `pressure_critical`.
-    public var pressureCritical: Double = 0.05
     /// The largest shrink in one decision, as a fraction of what the machine
     /// holds, `max_balloon_change_percent`.
     public var maxShrink: Double = 0.05
@@ -81,10 +76,23 @@ public struct MemoryBalloonPolicy: Sendable, Equatable {
 
     public init() {}
 
+    /// The host's memory pressure level, in the values of macOS's dispatch
+    /// memory-pressure levels (dispatch/source.h), which its kernel reports
+    /// through `kern.memorystatus_vm_pressure_level`:
+    /// https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/kern_memorystatus_notify.c
+    public enum HostPressure: UInt, Sendable, Equatable {
+        /// `DISPATCH_MEMORYPRESSURE_NORMAL`
+        case normal = 0x1
+        /// `DISPATCH_MEMORYPRESSURE_WARN`
+        case warning = 0x2
+        /// `DISPATCH_MEMORYPRESSURE_CRITICAL`
+        case critical = 0x4
+    }
+
     /// One reading of a machine and its host.
     public struct Sample: Sendable, Equatable {
-        /// The fraction of the host's memory that is free.
-        public var hostFree: Double
+        /// The host's memory pressure level.
+        public var hostPressure: HostPressure
         /// What the machine holds now: its size less what its balloon holds.
         public var current: UInt64
         /// What the machine needs, in the same terms as `current`.
@@ -95,8 +103,8 @@ public struct MemoryBalloonPolicy: Sendable, Equatable {
         /// memory it holds.
         public var floor: UInt64
 
-        public init(hostFree: Double, current: UInt64, needs: UInt64, available: UInt64, floor: UInt64) {
-            self.hostFree = hostFree
+        public init(hostPressure: HostPressure, current: UInt64, needs: UInt64, available: UInt64, floor: UInt64) {
+            self.hostPressure = hostPressure
             self.current = current
             self.needs = needs
             self.available = available
@@ -121,13 +129,13 @@ public struct MemoryBalloonPolicy: Sendable, Equatable {
         /// balloon that may give pages back on out-of-memory leaves them in
         /// `MemTotal` (virtio_balloon's `fill_balloon`), so they are taken
         /// out here.
-        public init(hostFree: Double, size: UInt64, info: LinuxMemoryInfo) throws {
+        public init(hostPressure: HostPressure, size: UInt64, info: LinuxMemoryInfo) throws {
             guard let balloon = info.balloonBytes else {
                 throw ContainerizationError(.unsupported, message: "the guest does not report what its balloon holds")
             }
             let floor = MemoryBalloonPolicy.balloonFloor(info.totalBytes - min(balloon, info.totalBytes))
             self.init(
-                hostFree: hostFree,
+                hostPressure: hostPressure,
                 current: size - min(balloon, size),
                 needs: info.committedBytes + floor + (size - min(info.totalBytes, size)),
                 available: info.availableBytes,
@@ -151,11 +159,10 @@ public struct MemoryBalloonPolicy: Sendable, Equatable {
             return nil
         }
         let count = Double(samples.count)
-        let hostFreePercent = samples.map(\.hostFree).reduce(0, +) / count
         let balloonCur = Double(latest.current)
 
         let guestNeeds = max(samples.map { Double($0.needs) }.reduce(0, +) / count, Double(latest.needs))
-        var balloonSize = min(max(guestNeeds * (1 + bufferShare(hostFreePercent)), Double(minimum)), Double(maximum))
+        var balloonSize = min(max(guestNeeds * (1 + bufferShare(latest.hostPressure)), Double(minimum)), Double(maximum))
         if balloonSize < balloonCur {
             // hv_balloon's balloon_up refuses to take the guest's available
             // memory below its floor; virtio_balloon leaves that to the host.
@@ -168,16 +175,18 @@ public struct MemoryBalloonPolicy: Sendable, Equatable {
         return UInt64(balloonSize)
     }
 
-    /// The policy's `buffer_share`: the buffer, scaled back according to host
-    /// pressure as MoM scales a guest's free memory, and made negative to hold
-    /// the guest under its needs when the pressure is critical.
-    func bufferShare(_ hostFreePercent: Double) -> Double {
-        if hostFreePercent >= pressureThreshold {
+    /// The policy's `buffer_share`: the buffer, given up when the host warns of
+    /// memory pressure, and made negative to hold the guest under its needs
+    /// when the pressure is critical, at MoM's critical share for a host with
+    /// nothing free.
+    func bufferShare(_ hostPressure: HostPressure) -> Double {
+        switch hostPressure {
+        case .normal:
             return buffer
-        } else if hostFreePercent > pressureCritical {
-            return buffer * (hostFreePercent / pressureThreshold)
-        } else {
-            return -0.05 + hostFreePercent
+        case .warning:
+            return 0
+        case .critical:
+            return -0.05
         }
     }
 
@@ -205,24 +214,33 @@ public struct MemoryBalloonPolicy: Sendable, Equatable {
         }
     }
 
-    /// The fraction of the host's memory that is free, caches included: on
-    /// macOS the kernel's own figure (`kern.memorystatus_level`, what
-    /// `memory_pressure` prints), on Linux MoM's `(MemFree + Buffers + Cached)
-    /// / MemTotal` (mom/Collectors/HostMemory.py).
-    public static func hostFree() throws -> Double {
+    /// The host's memory pressure level. On macOS it is the kernel's own, read
+    /// as Chromium's macOS memory pressure evaluator reads it:
+    /// https://source.chromium.org/chromium/chromium/src/+/main:components/memory_pressure/system_memory_pressure_evaluator_mac.cc
+    /// On Linux it is MoM's judgment of its host measure, `(MemFree + Buffers
+    /// + Cached) / MemTotal` (mom/Collectors/HostMemory.py): under memory
+    /// pressure below 20% and critical at or below 5% (doc/balloon.rules).
+    public static func hostPressure() throws -> HostPressure {
         #if canImport(Darwin)
         var level: Int32 = 0
         var size = MemoryLayout<Int32>.size
-        guard sysctlbyname("kern.memorystatus_level", &level, &size, nil, 0) == 0 else {
-            throw ContainerizationError(.internalError, message: "reading kern.memorystatus_level failed: errno \(errno)")
+        guard sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &size, nil, 0) == 0 else {
+            throw ContainerizationError(.internalError, message: "reading kern.memorystatus_vm_pressure_level failed: errno \(errno)")
         }
-        return Double(level) / 100
+        guard let value = UInt(exactly: level), let pressure = HostPressure(rawValue: value) else {
+            throw ContainerizationError(.internalError, message: "kern.memorystatus_vm_pressure_level reported an unknown level \(level)")
+        }
+        return pressure
         #else
         let fields = LinuxMemoryInfo.fields(meminfo: try String(contentsOfFile: "/proc/meminfo", encoding: .utf8))
         guard let total = fields["MemTotal"], total > 0 else {
             throw ContainerizationError(.internalError, message: "/proc/meminfo has no MemTotal")
         }
-        return Double((fields["MemFree"] ?? 0) + (fields["Buffers"] ?? 0) + (fields["Cached"] ?? 0)) / Double(total)
+        let free = Double((fields["MemFree"] ?? 0) + (fields["Buffers"] ?? 0) + (fields["Cached"] ?? 0)) / Double(total)
+        if free <= 0.05 {
+            return .critical
+        }
+        return free < 0.20 ? .warning : .normal
         #endif
     }
 }
@@ -263,11 +281,11 @@ public actor MemoryBalloonController {
     /// Sample on the policy's cadence and decide on its own until cancelled.
     /// A failed sample or change is counted and the loop goes on.
     /// - Parameters:
-    ///   - hostFree: The fraction of the host's memory that is free.
+    ///   - hostPressure: The host's memory pressure level.
     ///   - memoryInfo: The guest's account of its memory.
     ///   - apply: Ask the machine to hold `target` bytes, from `current`.
     public func run(
-        hostFree: @Sendable () throws -> Double = MemoryBalloonPolicy.hostFree,
+        hostPressure: @Sendable () throws -> MemoryBalloonPolicy.HostPressure = MemoryBalloonPolicy.hostPressure,
         memoryInfo: @Sendable () async throws -> LinuxMemoryInfo,
         apply: @Sendable (_ target: UInt64, _ current: UInt64) async throws -> Void
     ) async {
@@ -280,7 +298,7 @@ public actor MemoryBalloonController {
                 return
             }
             do {
-                record(try MemoryBalloonPolicy.Sample(hostFree: try hostFree(), size: maximum, info: try await memoryInfo()))
+                record(try MemoryBalloonPolicy.Sample(hostPressure: try hostPressure(), size: maximum, info: try await memoryInfo()))
             } catch {
                 report.failures += 1
                 logger?.debug("memory balloon sample failed", metadata: ["error": "\(error)"])
@@ -308,7 +326,7 @@ public actor MemoryBalloonController {
                         "target": "\(target >> 20) MiB",
                         "current": "\(latest.current >> 20) MiB",
                         "needs": "\(latest.needs >> 20) MiB",
-                        "hostFree": "\(latest.hostFree)",
+                        "hostPressure": "\(latest.hostPressure)",
                     ])
             } catch {
                 report.failures += 1

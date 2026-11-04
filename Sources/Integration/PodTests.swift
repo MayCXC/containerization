@@ -107,7 +107,8 @@ extension IntegrationSuite {
             try await pod.startContainer("container1")
 
             // An idle guest needs a fraction of the machine, so the policy
-            // shrinks it step by step until it holds that plus the buffer.
+            // shrinks it step by step until it holds that plus the buffer the
+            // host's memory pressure leaves it.
             shrunk = try await settledBalloon(pod)
 
             // A process that commits 1 GiB without touching it raises what

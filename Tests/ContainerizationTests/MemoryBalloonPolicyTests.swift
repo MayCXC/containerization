@@ -29,8 +29,10 @@ struct MemoryBalloonPolicyTests {
 
     /// A reading whose guest has everything it holds available unless told
     /// otherwise.
-    private func sample(hostFree: Double = 0.5, current: UInt64, needs: UInt64, available: UInt64? = nil, floor: UInt64 = 0) -> MemoryBalloonPolicy.Sample {
-        .init(hostFree: hostFree, current: current, needs: needs, available: available ?? current, floor: floor)
+    private func sample(
+        hostPressure: MemoryBalloonPolicy.HostPressure = .normal, current: UInt64, needs: UInt64, available: UInt64? = nil, floor: UInt64 = 0
+    ) -> MemoryBalloonPolicy.Sample {
+        .init(hostPressure: hostPressure, current: current, needs: needs, available: available ?? current, floor: floor)
     }
 
     private func target(_ samples: MemoryBalloonPolicy.Sample..., policy: MemoryBalloonPolicy? = nil) -> UInt64? {
@@ -66,24 +68,28 @@ struct MemoryBalloonPolicyTests {
         #expect(target(sample(current: 8 * 1024.mib(), needs: 11 * 1024.mib())) == maximum)
     }
 
-    @Test func narrowsTheBufferAsTheHostRunsShort() {
-        // At 10% free the buffer is 20% * (10% / 20%) = 10%.
-        #expect(near(target(sample(hostFree: 0.10, current: 1120.mib(), needs: 1000.mib())), Double(1000.mib()) * 1.1))
+    @Test func givesUpTheBufferWhenTheHostWarns() {
+        #expect(target(sample(hostPressure: .warning, current: 1040.mib(), needs: 1000.mib())) == 1000.mib())
     }
 
     @Test func holdsTheGuestUnderItsNeedsWhenThePressureIsCritical() {
-        // At 3% free the buffer is -5% + 3% = -2%.
-        #expect(near(target(sample(hostFree: 0.03, current: 1000.mib(), needs: 1000.mib())), Double(1000.mib()) * 0.98))
+        // At critical the buffer is -5%.
+        #expect(near(target(sample(hostPressure: .critical, current: 1000.mib(), needs: 1000.mib())), Double(1000.mib()) * 0.95))
     }
 
-    @Test func averagesTheHostAndTheGuestButMovesFromWhatTheMachineHoldsNow() {
-        // Averaged, the guest needs 1000 MiB and the host has 30% free, so the
-        // whole buffer applies, and the step is from the last sample's size.
-        let next = target(
-            sample(hostFree: 0.10, current: 2000.mib(), needs: 1100.mib()),
-            sample(hostFree: 0.50, current: 1250.mib(), needs: 900.mib())
+    @Test func averagesTheGuestReadsTheHostsLatestLevelAndMovesFromWhatTheMachineHoldsNow() {
+        // Averaged, the guest needs 1000 MiB. The host's latest level decides
+        // the buffer, and the step is from the last sample's size.
+        let normal = target(
+            sample(hostPressure: .warning, current: 2000.mib(), needs: 1100.mib()),
+            sample(hostPressure: .normal, current: 1250.mib(), needs: 900.mib())
         )
-        #expect(near(next, Double(1000.mib()) * 1.2))
+        #expect(near(normal, Double(1000.mib()) * 1.2))
+        let warning = target(
+            sample(hostPressure: .normal, current: 2000.mib(), needs: 1100.mib()),
+            sample(hostPressure: .warning, current: 1250.mib(), needs: 900.mib())
+        )
+        #expect(near(warning, Double(1250.mib()) * 0.95))
     }
 
     @Test func growsForARisingNeedWithoutWaitingForTheAverage() {
@@ -123,14 +129,14 @@ struct MemoryBalloonPolicyTests {
         // 104 MiB + 1024 MiB / 8, and the machine needs the 128 MiB its kernel
         // set aside at boot as well.
         let info = LinuxMemoryInfo(totalBytes: 2048.mib(), freeBytes: 0, availableBytes: 400.mib(), committedBytes: 300.mib(), balloonBytes: 1024.mib())
-        let sample = try MemoryBalloonPolicy.Sample(hostFree: 0.5, size: 2176.mib(), info: info)
-        #expect(sample == .init(hostFree: 0.5, current: 1152.mib(), needs: 300.mib() + 232.mib() + 128.mib(), available: 400.mib(), floor: 232.mib()))
+        let sample = try MemoryBalloonPolicy.Sample(hostPressure: .normal, size: 2176.mib(), info: info)
+        #expect(sample == .init(hostPressure: .normal, current: 1152.mib(), needs: 300.mib() + 232.mib() + 128.mib(), available: 400.mib(), floor: 232.mib()))
     }
 
     @Test func needsTheGuestToReportItsBalloon() {
         let info = LinuxMemoryInfo(totalBytes: 2048.mib(), freeBytes: 0, availableBytes: 400.mib(), committedBytes: 300.mib(), balloonBytes: nil)
         #expect(throws: ContainerizationError.self) {
-            try MemoryBalloonPolicy.Sample(hostFree: 0.5, size: 2176.mib(), info: info)
+            try MemoryBalloonPolicy.Sample(hostPressure: .normal, size: 2176.mib(), info: info)
         }
     }
 
@@ -138,7 +144,7 @@ struct MemoryBalloonPolicyTests {
     /// recorded by scripts/memory-balloon-policy-decisions.py.
     private struct Decisions: Decodable {
         struct Reading: Decodable {
-            var hostFree: Double
+            var hostPressure: UInt
             var current: UInt64
             var needs: UInt64
             var available: UInt64
@@ -163,8 +169,14 @@ struct MemoryBalloonPolicyTests {
         for (index, recorded) in decisions.cases.enumerated() {
             var policy = MemoryBalloonPolicy()
             policy.minimum = recorded.minimum
-            let samples = recorded.samples.map {
-                MemoryBalloonPolicy.Sample(hostFree: $0.hostFree, current: $0.current, needs: $0.needs, available: $0.available, floor: $0.floor)
+            let samples = try recorded.samples.map {
+                MemoryBalloonPolicy.Sample(
+                    hostPressure: try #require(MemoryBalloonPolicy.HostPressure(rawValue: $0.hostPressure)),
+                    current: $0.current,
+                    needs: $0.needs,
+                    available: $0.available,
+                    floor: $0.floor
+                )
             }
             let target = policy.nextTarget(samples: samples, maximum: recorded.maximum)
             #expect(target == recorded.target, "case \(index): \(recorded)")
@@ -225,7 +237,7 @@ struct MemoryBalloonPolicyTests {
         let controller = MemoryBalloonController(policy: policy, maximum: machine.size)
         let task = Task {
             await controller.run(
-                hostFree: { 0.5 },
+                hostPressure: { .normal },
                 memoryInfo: { machine.memoryInfo() },
                 apply: { target, current in machine.apply(target, from: current) }
             )

@@ -24,7 +24,9 @@
 # runs this file on MoM's own engine to record the decisions its tests check.
 #
 # Statistics, each guest's in bytes:
-#   Host free_percent  the fraction of the host's memory that is free
+#   Host pressure      the host's memory pressure as its kernel judges it, in
+#                      the values of macOS's dispatch memory-pressure levels:
+#                      1 normal, 2 warning, 4 critical
 #   guest balloon_cur  what the machine holds: its size less its balloon
 #   guest balloon_min  the least it is asked to hold
 #   guest balloon_max  its size
@@ -36,13 +38,10 @@
 # Hyper-V's memory buffer, as a fraction of what the guest needs
 (defvar memory_buffer 0.20)
 
-# If the percentage of host free memory drops below this value
-# then we will consider the host to be under memory pressure
-(defvar pressure_threshold 0.20)
-
-# If pressure threshold drops below this level, then the pressure
-# is critical and more aggressive ballooning will be employed.
-(defvar pressure_critical 0.05)
+# The host's memory pressure levels past normal, DISPATCH_MEMORYPRESSURE_WARN
+# and DISPATCH_MEMORYPRESSURE_CRITICAL in macOS's dispatch/source.h
+(defvar pressure_warning 2)
+(defvar pressure_critical 4)
 
 # Don't shrink a guest's memory by more than this percent of what it holds
 (defvar max_balloon_change_percent 0.05)
@@ -62,16 +61,17 @@
         1 0)
 })
 
-# The buffer, scaled back according to host pressure as MoM scales a guest's
-# free memory, and made negative to hold the guest under its needs when the
-# pressure is critical
+# The buffer, given up when the host warns of memory pressure, as Hyper-V
+# gives it up first when its host runs short, and made negative to hold the
+# guest under its needs when the pressure is critical, at MoM's critical share
+# for a host with nothing free
 (def buffer_share ()
 {
-    (if (>= host_free_percent pressure_threshold)
-        memory_buffer
-        (if (> host_free_percent pressure_critical)
-            (* memory_buffer (/ host_free_percent pressure_threshold))
-            (+ -0.05 host_free_percent)))
+    (if (== host_pressure pressure_critical)
+        -0.05
+        (if (== host_pressure pressure_warning)
+            0
+            memory_buffer))
 })
 
 (def balloon_guest (guest)
@@ -100,7 +100,9 @@
 })
 
 ### Main script
-(defvar host_free_percent (Host.StatAvg "free_percent"))
+# The host's latest level, as its kernel moves between levels with
+# hysteresis of its own
+(defvar host_pressure (Host.Stat "pressure"))
 
 (with Guests guest
     (if (valid guest.balloon_cur (guest.Stat "needs"))

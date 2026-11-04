@@ -54,7 +54,7 @@ def entity(fields, rows):
 
 
 def decide(policy, case):
-    host = entity({"free_percent"}, [{"free_percent": s["hostFree"]} for s in case["samples"]])
+    host = entity({"pressure"}, [{"pressure": s["hostPressure"]} for s in case["samples"]])
     guest = entity(
         {"balloon_cur", "balloon_min", "balloon_max", "needs", "available", "floor"},
         [
@@ -75,9 +75,14 @@ def decide(policy, case):
     return None if target is None else int(target)
 
 
-def sample(host_free, current, needs, available=None, floor=0):
+# The host's memory pressure levels, in the values of macOS's dispatch
+# memory-pressure levels.
+NORMAL, WARNING, CRITICAL = 1, 2, 4
+
+
+def sample(host_pressure, current, needs, available=None, floor=0):
     return {
-        "hostFree": host_free,
+        "hostPressure": host_pressure,
         "current": current,
         "needs": needs,
         "available": current if available is None else available,
@@ -87,30 +92,32 @@ def sample(host_free, current, needs, available=None, floor=0):
 
 def cases():
     maximum = 12 * 1024 * MIB
-    # Every regime at hand-picked points: the host far from short, narrowing
-    # the buffer, and critical; shrinking within and past the largest step;
-    # growing, capped by the machine; the dead band; the minimum; the floor.
-    for host_free in (0.5, 0.25, 0.2, 0.15, 0.1, 0.06, 0.05, 0.03, 0.0):
-        for current, needs in ((1250, 1000), (8192, 1024), (1024, 3072), (8192, 11264), (1201, 1000), (2100, 1000)):
-            yield {"minimum": 0, "maximum": maximum, "samples": [sample(host_free, current * MIB, needs * MIB)]}
-        yield {"minimum": 2048 * MIB, "maximum": maximum, "samples": [sample(host_free, 2100 * MIB, 1000 * MIB)]}
+    # Every regime at hand-picked points: each host pressure level; shrinking
+    # within and past the largest step; growing, capped by the machine; the
+    # dead band; the minimum; the floor.
+    for host_pressure in (NORMAL, WARNING, CRITICAL):
+        for current, needs in ((1250, 1000), (8192, 1024), (1024, 3072), (8192, 11264), (1201, 1000), (2100, 1000), (1000, 1000), (1030, 1000)):
+            yield {"minimum": 0, "maximum": maximum, "samples": [sample(host_pressure, current * MIB, needs * MIB)]}
+        yield {"minimum": 2048 * MIB, "maximum": maximum, "samples": [sample(host_pressure, 2100 * MIB, 1000 * MIB)]}
         for available, floor in ((280, 250), (200, 250), (250, 250), (1000, 100)):
             yield {
                 "minimum": 0,
                 "maximum": maximum,
-                "samples": [sample(host_free, 1000 * MIB, 500 * MIB, available * MIB, floor * MIB)],
+                "samples": [sample(host_pressure, 1000 * MIB, 500 * MIB, available * MIB, floor * MIB)],
             }
-    # Windows: needs and host free averaged, a need above the average taken
-    # as it is, and the step taken from the last reading's size.
+    # Windows: needs averaged, a need above the average taken as it is, the
+    # host's latest level deciding, and the step taken from the last
+    # reading's size.
+    for earlier, latest in ((WARNING, NORMAL), (NORMAL, WARNING), (NORMAL, CRITICAL), (CRITICAL, WARNING)):
+        yield {
+            "minimum": 0,
+            "maximum": maximum,
+            "samples": [sample(earlier, 2000 * MIB, 1100 * MIB), sample(latest, 1250 * MIB, 900 * MIB)],
+        }
     yield {
         "minimum": 0,
         "maximum": maximum,
-        "samples": [sample(0.10, 2000 * MIB, 1100 * MIB), sample(0.50, 1250 * MIB, 900 * MIB)],
-    }
-    yield {
-        "minimum": 0,
-        "maximum": maximum,
-        "samples": [sample(0.5, 1250 * MIB, 1000 * MIB)] * 3 + [sample(0.5, 1250 * MIB, 3000 * MIB)],
+        "samples": [sample(NORMAL, 1250 * MIB, 1000 * MIB)] * 3 + [sample(NORMAL, 1250 * MIB, 3000 * MIB)],
     }
     # Everything else from a fixed seed, so a slip in how the pieces combine
     # has no hand-picked gap to hide in.
@@ -124,7 +131,7 @@ def cases():
             floor = rng.randint(0, 512 * MIB)
             window.append(
                 sample(
-                    round(rng.uniform(0.0, 0.6), 4),
+                    rng.choice((NORMAL, WARNING, CRITICAL)),
                     current,
                     rng.randint(16 * MIB, maximum),
                     rng.randint(0, current),
