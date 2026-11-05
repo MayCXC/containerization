@@ -44,12 +44,15 @@ import Logging
 /// Virtualization's own balloon advises merged ranges, which is why it gives
 /// back only what macOS had already compressed.
 ///
-/// The guest drives the device with the stock Linux `virtio_balloon` driver.
-/// It follows section 5.5 of the Virtio specification:
+/// The guest drives the device with Linux's `virtio_balloon` driver. It
+/// follows section 5.5 of the Virtio specification:
 /// https://docs.oasis-open.org/virtio/virtio/v1.3/csd01/virtio-v1.3-csd01.html
-/// It offers deflate-on-OOM, as Cloud Hypervisor's balloon does. It does not
-/// offer free page reporting: the guest reports free pages in buffers the
-/// device writes, and a custom Virtio device is not told where those are.
+/// It offers deflate-on-OOM and free page reporting, as Cloud Hypervisor's
+/// balloon does: the guest reports pages it holds free, and the device
+/// releases the host pages they cover until the guest writes to them again.
+/// A custom Virtio device is given the memory of the buffers it reads and
+/// only a destination for the buffers it writes, so the guest reports its free
+/// pages in buffers the device reads (kernel/patches/0004).
 @available(macOS 27, *)
 final class VZVirtioBalloon: NSObject, VZCustomVirtioDeviceConfigurationDelegate, VZCustomVirtioDeviceDelegate, @unchecked Sendable {
     /// VIRTIO_ID_BALLOON, include/uapi/linux/virtio_ids.h.
@@ -59,9 +62,18 @@ final class VZVirtioBalloon: NSObject, VZCustomVirtioDeviceConfigurationDelegate
     static let pfnShift: UInt64 = 12
     static let inflateQueue: UInt16 = 0
     static let deflateQueue: UInt16 = 1
+    /// The free page reporting queue. The guest numbers queues in order among
+    /// those its features enable, so with no statistics queue it follows the
+    /// deflate queue (vp_find_vqs, drivers/virtio/virtio_pci_common.c), as
+    /// Cloud Hypervisor's balloon orders it ("the guest transport compresses
+    /// out disabled queues"):
+    /// https://github.com/cloud-hypervisor/cloud-hypervisor/blob/66b8e382d844/virtio-devices/src/balloon.rs
+    static let reportingQueue: UInt16 = 2
     /// VIRTIO_BALLOON_F_DEFLATE_ON_OOM: the guest takes pages back from the
     /// balloon instead of invoking the OOM killer.
     static let deflateOnOOMFeature: UInt32 = 1 << 2
+    /// VIRTIO_BALLOON_F_REPORTING: the guest reports the pages it holds free.
+    static let reportingFeature: UInt32 = 1 << 5
 
     let configuration: VZCustomVirtioDeviceConfiguration
     private let deviceQueue: DispatchQueue
@@ -125,8 +137,8 @@ final class VZVirtioBalloon: NSObject, VZCustomVirtioDeviceConfigurationDelegate
         // QEMU's virtio-balloon-pci reports PCI_CLASS_OTHERS (hw/virtio/virtio-balloon-pci.c).
         configuration.pciClassID = 0x00
         configuration.pciSubclassID = 0xff
-        configuration.virtioQueueCount = 2
-        configuration.optionalFeatures.subset0 = Self.deflateOnOOMFeature
+        configuration.virtioQueueCount = 3
+        configuration.optionalFeatures.subset0 = Self.deflateOnOOMFeature | Self.reportingFeature
         configuration.deviceSpecificConfiguration = VZVirtioDeviceSpecificConfiguration(
             configurationData: Self.configurationData(pages: 0)
         )
@@ -175,12 +187,18 @@ final class VZVirtioBalloon: NSObject, VZCustomVirtioDeviceConfigurationDelegate
     func customVirtioDevice(_ device: VZCustomVirtioDevice, didReceiveNotificationFor queue: VZVirtioQueue) {
         let index = queue.queueIndex
         while let element = queue.nextElement() {
-            let length = element.readBuffersByteCount
-            if length > 0, let data = try? element.readBytes(withExactLength: length) {
-                switch index {
-                case Self.inflateQueue: forEachPFN(data) { inflate(device, pfn: $0) }
-                case Self.deflateQueue: forEachPFN(data) { deflate(device, pfn: $0) }
-                default: break
+            if index == Self.reportingQueue {
+                // The buffers are the free pages themselves, released where
+                // they lie and never read.
+                element.readBuffers().forEach(release(reported:))
+            } else {
+                let length = element.readBuffersByteCount
+                if length > 0, let data = try? element.readBytes(withExactLength: length) {
+                    switch index {
+                    case Self.inflateQueue: forEachPFN(data) { inflate(device, pfn: $0) }
+                    case Self.deflateQueue: forEachPFN(data) { deflate(device, pfn: $0) }
+                    default: break
+                    }
                 }
             }
             element.returnToQueue()
@@ -245,6 +263,32 @@ final class VZVirtioBalloon: NSObject, VZCustomVirtioDeviceConfigurationDelegate
             return
         }
         released.insert(address / hostPageSize)
+    }
+
+    /// Hand back the host pages a free page report covers, one call per page
+    /// as `release` makes, the way Cloud Hypervisor's balloon releases each
+    /// reported range (`process_reporting_queue`). The guest takes a reported
+    /// page back by writing to it, with no word to the device; XNU's pageout
+    /// reads a written reusable page as reused and keeps it
+    /// (`vm_pageout_scan_handle_reusable_page`):
+    /// https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/osfmk/vm/vm_pageout.c
+    private func release(reported buffer: Data) {
+        buffer.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else {
+                return
+            }
+            let size = UInt(hostPageSize)
+            let start = UInt(bitPattern: base)
+            var page = (start + size - 1) & ~(size - 1)
+            let end = (start + UInt(raw.count)) & ~(size - 1)
+            while page < end {
+                guard madvise(UnsafeMutableRawPointer(bitPattern: page), Int(size), MADV_FREE_REUSABLE) == 0 else {
+                    logger?.error("balloon could not release a reported page: errno \(errno)")
+                    return
+                }
+                page += size
+            }
+        }
     }
 
     private func reuse(_ device: VZCustomVirtioDevice, address: UInt64) {
