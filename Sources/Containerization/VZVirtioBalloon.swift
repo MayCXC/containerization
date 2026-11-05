@@ -66,7 +66,9 @@ final class VZVirtioBalloon: NSObject, VZCustomVirtioDeviceConfigurationDelegate
     let configuration: VZCustomVirtioDeviceConfiguration
     private let deviceQueue: DispatchQueue
     private let memorySize: UInt64
-    private let hostPageSize: UInt64
+    /// The unit the device releases memory in: a host page goes back once the
+    /// balloon holds every 4 KiB page of it.
+    let hostPageSize: UInt64
     private let logger: Logger?
 
     // Touched only on `deviceQueue`.

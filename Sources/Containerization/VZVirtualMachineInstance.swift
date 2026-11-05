@@ -570,9 +570,11 @@ extension VZVirtualMachineInstance.Configuration {
         // short and compresses them as it would any cold memory, keeping pages
         // the guest would have given up for nothing.
         var hasBalloon = false
+        var balloonPageSize: UInt64 = 0
         if #available(macOS 27, *), let balloon = balloon as? VZVirtioBalloon {
             config.customVirtioDevices = [balloon.configuration]
             hasBalloon = true
+            balloonPageSize = balloon.hostPageSize
         }
 
         if let bootLog = self.bootLog {
@@ -643,6 +645,21 @@ extension VZVirtualMachineInstance.Configuration {
         // A psi= already on the command line is left as it is.
         if hasBalloon, !kernel.commandLine.kernelArgs.contains(where: { $0.hasPrefix("psi=") }) {
             kernel.commandLine.kernelArgs.append("psi=1")
+        }
+
+        // The device gives memory back a host page at a time, so a guest whose
+        // pages are smaller balloons blocks of the host's page size first when
+        // told that size (kernel/patches/0003), as Hyper-V's balloon driver
+        // balloons 2 MiB blocks first (drivers/hv/hv_balloon.c, alloc_balloon_pages).
+        // virtio_balloon's own source names the host's base page size as the
+        // value its block sizes should follow:
+        // https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/virtio/virtio_balloon.c?h=v6.18.5#n1046
+        // A driver built into the kernel takes its parameters on the kernel
+        // command line as <module>.<parameter>=<value>:
+        // https://docs.kernel.org/admin-guide/kernel-parameters.html
+        // A host_page_size already on the command line is left as it is.
+        if hasBalloon, !kernel.commandLine.kernelArgs.contains(where: { $0.hasPrefix("virtio_balloon.host_page_size=") }) {
+            kernel.commandLine.kernelArgs.append("virtio_balloon.host_page_size=\(balloonPageSize)")
         }
 
         let loader = VZLinuxBootLoader(kernelURL: kernel.path)
