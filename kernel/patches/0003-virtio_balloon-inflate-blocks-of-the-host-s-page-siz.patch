@@ -1,0 +1,70 @@
+From 8fabca499c3170eced10e5ffcaad280f24172872 Mon Sep 17 00:00:00 2001
+From: Aaron Paterson <apaterson@pm.me>
+Date: Wed, 4 Nov 2026 18:57:28 -0600
+Subject: [PATCH] virtio_balloon: inflate blocks of the host's page size first
+
+A host that backs guest memory with pages larger than the guest's can give a page back only once the balloon holds every guest page in it. The balloon takes one guest page at a time, which the page allocator hands out from wherever it has them, so on a 4 KiB guest of a 16 KiB host about half of a long-running balloon was found in host pages the guest still partly used, none of which the host can take.
+
+hv_balloon meets the same mismatch by taking 2 MiB blocks first and splitting them, falling back to single pages (alloc_balloon_pages). Do the same: given the host's page size as virtio_balloon.host_page_size, fill_balloon takes blocks of that size with the flags balloon_page_alloc uses, splits them into the balloon's pages, and takes single pages when no block is free. Without the parameter, or with a host page no larger than the guest's, the balloon takes single pages as before.
+---
+ drivers/virtio/virtio_balloon.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
+index 1b93d8c..d79faed 100644
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@ -30,6 +30,17 @@
+ #define VIRTIO_BALLOON_OOM_NR_PAGES 256
+ #define VIRTIO_BALLOON_OOM_NOTIFY_PRIORITY 80
+ 
++/*
++ * The page size of the host backing the guest's memory, in bytes. A host
++ * whose pages are larger than the guest's gets a page back only once the
++ * balloon holds all of it, so the balloon takes blocks of that size first,
++ * as hv_balloon takes 2 MiB blocks first, and single pages when no block
++ * is free. 0 takes single pages.
++ */
++static unsigned int host_page_size;
++module_param(host_page_size, uint, 0444);
++MODULE_PARM_DESC(host_page_size, "Page size of the host backing guest memory, in bytes");
++
+ #define VIRTIO_BALLOON_FREE_PAGE_ALLOC_FLAG (__GFP_NORETRY | __GFP_NOWARN | \
+ 					     __GFP_NOMEMALLOC)
+ /* The order of free page blocks to report to host */
+@@ -241,6 +252,8 @@ static void set_page_pfns(struct virtio_balloon *vb,
+ 
+ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
+ {
++	unsigned int order = host_page_size > PAGE_SIZE ?
++			     get_order(host_page_size) : 0;
+ 	unsigned int num_allocated_pages;
+ 	unsigned int num_pfns;
+ 	struct page *page;
+@@ -251,6 +264,23 @@ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
+ 
+ 	for (num_pfns = 0; num_pfns < num;
+ 	     num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
++		if (order &&
++		    num - num_pfns >= (VIRTIO_BALLOON_PAGES_PER_PAGE << order)) {
++			page = alloc_pages(balloon_mapping_gfp_mask() |
++					   __GFP_NOMEMALLOC | __GFP_NORETRY |
++					   __GFP_NOWARN, order);
++			if (page) {
++				unsigned int i;
++
++				split_page(page, order);
++				for (i = 0; i < (1U << order); i++)
++					balloon_page_push(&pages, page + i);
++				num_pfns += (VIRTIO_BALLOON_PAGES_PER_PAGE << order) -
++					    VIRTIO_BALLOON_PAGES_PER_PAGE;
++				continue;
++			}
++		}
++
+ 		page = balloon_page_alloc();
+ 
+ 		if (!page) {
+-- 
+2.56.0.86.g3634a68f37
+
