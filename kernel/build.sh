@@ -40,6 +40,10 @@ esac
 
 mkdir -p /kbuild
 tar -xf /kernel/source.tar.xz -C /kbuild --strip-components=1
+for p in /kernel/patches/*.patch; do
+  [ -e "$p" ] || continue
+  patch -d /kbuild -p1 < "$p"
+done
 cp "/kernel/${CONFIG}" /kbuild/.config
 
 (
