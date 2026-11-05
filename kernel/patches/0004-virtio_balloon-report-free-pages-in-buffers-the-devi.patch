@@ -1,0 +1,33 @@
+From c5a4336f3a16bd62c575a3ec3c009c19a4452edd Mon Sep 17 00:00:00 2001
+From: Aaron Paterson <apaterson@pm.me>
+Date: Wed, 4 Nov 2026 21:47:40 -0600
+Subject: [PATCH] virtio_balloon: report free pages in buffers the device reads
+
+Free page reporting hands the device scatterlists of free pages as device-writable buffers, and the device needs only their addresses to release the memory behind them. A device implemented on a transport that gives it the addresses of readable buffers alone, as macOS's Virtualization framework does for a custom Virtio device (VZVirtioQueueElement exposes read buffers as memory and write buffers only as a destination to copy into), cannot act on writable ones. Reporting the pages as readable buffers lets such a device release them; the device returns each buffer when it is done, as before.
+---
+ drivers/virtio/virtio_balloon.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
+index 1b93d8c..5784f6f 100644
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@ -204,8 +204,13 @@ static int virtballoon_free_page_report(struct page_reporting_dev_info *pr_dev_i
+ 	struct virtqueue *vq = vb->reporting_vq;
+ 	unsigned int unused, err;
+ 
+-	/* We should always be able to add these buffers to an empty queue. */
+-	err = virtqueue_add_inbuf(vq, sg, nents, vb, GFP_NOWAIT);
++	/*
++	 * We should always be able to add these buffers to an empty queue.
++	 * They go to the device as buffers it reads: the device only needs
++	 * where the free pages are, and a device whose transport hands it the
++	 * addresses of readable buffers alone can then release them.
++	 */
++	err = virtqueue_add_outbuf(vq, sg, nents, vb, GFP_NOWAIT);
+ 
+ 	/*
+ 	 * In the extremely unlikely case that something has occurred and we
+-- 
+2.56.0.86.g3634a68f37
+

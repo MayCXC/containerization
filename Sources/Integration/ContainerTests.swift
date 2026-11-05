@@ -553,11 +553,15 @@ extension IntegrationSuite {
         do {
             try await container.create()
             try await container.start()
-            // The helper's footprint says what reached macOS.
+            // The helper's footprint says what reached macOS. It is read once the
+            // guest has filled its memory, before it frees it: the guest reports
+            // the pages it frees, so they start to leave before the balloon is
+            // asked for them.
             let helper = try await VirtualMachineHelper.started(after: helpersBefore)
-            try await waitForLines(2)
+            try await waitForLines(1)
             try await Task.sleep(for: .seconds(1))
-            let freed = try helper.usage()
+            let filledUsage = try helper.usage()
+            try await waitForLines(2)
             let mib: UInt64 = 1.mib()
 
             try await container.setTargetMemorySize(target)
@@ -572,9 +576,9 @@ extension IntegrationSuite {
             var decided = false
             func observe() throws {
                 let now = try helper.usage()
-                fallen = max(fallen, freed.ri_phys_footprint.saturatingSubtract(now.ri_phys_footprint))
-                evicted = max(evicted, freed.ri_resident_size.saturatingSubtract(now.ri_resident_size))
-                decided = fallen >= filled * 3 / 4 || evicted + 64.mib() >= freed.ri_resident_size
+                fallen = max(fallen, filledUsage.ri_phys_footprint.saturatingSubtract(now.ri_phys_footprint))
+                evicted = max(evicted, filledUsage.ri_resident_size.saturatingSubtract(now.ri_resident_size))
+                decided = fallen >= filled * 3 / 4 || evicted + 64.mib() >= filledUsage.ri_resident_size
             }
             do {
                 let pressure = HostMemoryPressure()
@@ -704,6 +708,188 @@ extension IntegrationSuite {
                     evicted = max(evicted, before.ri_resident_size.saturatingSubtract(now.ri_resident_size))
                     atRisk = evicted + 64.mib() >= before.ri_resident_size
                     log.info("balloon data under \(pressure.bytes / mib) MiB of pressure: resident=\(now.ri_resident_size / mib) footprint=\(now.ri_phys_footprint / mib)")
+                }
+            }
+
+            let read = digest(try await run("read", "sha256sum /fill/data"))
+            try await container.kill(.kill)
+            _ = try await container.wait()
+            try await container.stop()
+
+            guard !written.isEmpty, written == read else {
+                throw IntegrationError.assert(msg: "guest data changed under host pressure: wrote \(written), read \(read)")
+            }
+            guard atRisk else {
+                throw SkipTest(reason: "macOS took only \(evicted / mib) MiB of the machine out of RAM under 4 GiB of pressure, so the data was never at risk")
+            }
+        } catch {
+            try? await container.stop()
+            throw error
+        }
+    }
+
+    func testContainerFreePageReporting() async throws {
+        let id = "test-container-free-page-reporting"
+        let bs = try await bootstrap(id)
+
+        let memory: UInt64 = 2048.mib()
+        let filled: UInt64 = 768.mib()
+        let buffer = BufferWriter()
+        let helpersBefore = try VirtualMachineHelper.running()
+        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm, vm: VMResources(memoryInBytes: memory)) { config in
+            // The guest puts real pages behind its memory and frees them, with
+            // no balloon target set, so whatever leaves the machine is what the
+            // guest reported free. Linux reports a free block two seconds after
+            // it frees it (PAGE_REPORTING_DELAY, mm/page_reporting.c).
+            config.mounts.append(
+                .any(
+                    type: "tmpfs", source: "tmpfs", destination: "/fill",
+                    options: ["rw", "size=1g"]))
+            config.process.arguments = [
+                "/bin/sh", "-c",
+                "dd if=/dev/urandom of=/fill/pages bs=1M count=\(filled / 1.mib()) 2>/dev/null; "
+                    + "echo filled; sleep 3; rm /fill/pages; echo freed; sleep 75",
+            ]
+            config.process.stdout = buffer
+            config.memoryInBytes = memory
+            config.bootLog = bs.bootLog
+        }
+
+        func lines() -> [Substring] {
+            (String(data: buffer.data, encoding: .utf8) ?? "").split(separator: "\n")
+        }
+        func waitForLines(_ count: Int) async throws {
+            let deadline = ContinuousClock.now + .seconds(120)
+            while lines().count < count {
+                guard ContinuousClock.now < deadline else {
+                    throw IntegrationError.assert(msg: "workload printed \(lines()) before timing out")
+                }
+                try await Task.sleep(for: .milliseconds(200))
+            }
+        }
+
+        do {
+            try await container.create()
+            try await container.start()
+            let helper = try await VirtualMachineHelper.started(after: helpersBefore)
+            try await waitForLines(1)
+            try await Task.sleep(for: .seconds(1))
+            let filledUsage = try helper.usage()
+            try await waitForLines(2)
+            try await Task.sleep(for: .seconds(5))
+            let mib: UInt64 = 1.mib()
+
+            // A reported page still in memory leaves the footprint the next
+            // time macOS runs short, as a ballooned one does, so the host is made
+            // short until it has given back what the guest freed or taken nearly
+            // all of this machine out of RAM.
+            var fallen: UInt64 = 0
+            var evicted: UInt64 = 0
+            var decided = false
+            func observe() throws {
+                let now = try helper.usage()
+                fallen = max(fallen, filledUsage.ri_phys_footprint.saturatingSubtract(now.ri_phys_footprint))
+                evicted = max(evicted, filledUsage.ri_resident_size.saturatingSubtract(now.ri_resident_size))
+                decided = fallen >= filled * 3 / 4 || evicted + 64.mib() >= filledUsage.ri_resident_size
+            }
+            do {
+                let pressure = HostMemoryPressure()
+                defer { pressure.release() }
+                try observe()
+                while !decided, pressure.bytes < 4.gib() {
+                    try pressure.grow(by: Int(256.mib()))
+                    try await Task.sleep(for: .milliseconds(500))
+                    try observe()
+                    let described = try helper.describe()
+                    log.info("free page reporting under \(pressure.bytes / mib) MiB of pressure: \(described)")
+                }
+            }
+
+            try await container.kill(.kill)
+            _ = try await container.wait()
+            try await container.stop()
+            log.info("free page reporting: footprint fell \(fallen / mib) MiB and resident \(evicted / mib) MiB of the \(filled / mib) MiB filled and freed")
+
+            // The pages the guest filled and freed are what macOS was paying for;
+            // reported, they leave the footprint at once or when macOS takes them
+            // out of RAM.
+            guard fallen < filled * 3 / 4 else {
+                return
+            }
+            guard decided else {
+                throw SkipTest(reason: "macOS never ran short enough under 4 GiB of pressure to take this machine's memory, so the release went unobserved")
+            }
+            throw IntegrationError.assert(
+                msg: "macOS took \(evicted / mib) MiB of the machine out of RAM but its footprint fell only \(fallen / mib) MiB: the freed pages were never released")
+        } catch {
+            try? await container.stop()
+            throw error
+        }
+    }
+
+    func testContainerFreePageReportingKeepsGuestData() async throws {
+        let id = "test-container-free-page-reporting-data"
+        let bs = try await bootstrap(id)
+
+        let memory: UInt64 = 2048.mib()
+        let helpersBefore = try VirtualMachineHelper.running()
+        let container = try LinuxContainer(id, rootfs: bs.rootfs, vmm: bs.vmm, vm: VMResources(memoryInBytes: memory)) { config in
+            config.mounts.append(
+                .any(
+                    type: "tmpfs", source: "tmpfs", destination: "/fill",
+                    options: ["rw", "size=1536m"]))
+            config.process.arguments = ["/bin/sleep", "1000"]
+            config.memoryInBytes = memory
+            config.bootLog = bs.bootLog
+        }
+        func run(_ name: String, _ script: String) async throws -> String {
+            let buffer = BufferWriter()
+            let exec = try await container.exec(name) { config in
+                config.arguments = ["/bin/sh", "-c", script]
+                config.stdout = buffer
+            }
+            try await exec.start()
+            let status = try await exec.wait()
+            try await exec.delete()
+            guard status.exitCode == 0 else {
+                throw IntegrationError.assert(msg: "\(name) exited with \(status)")
+            }
+            return String(data: buffer.data, encoding: .utf8) ?? ""
+        }
+        func digest(_ output: String) -> Substring {
+            output.split(separator: " ").first ?? ""
+        }
+
+        do {
+            try await container.create()
+            try await container.start()
+            let helper = try await VirtualMachineHelper.started(after: helpersBefore)
+            let mib: UInt64 = 1.mib()
+
+            // Put host pages behind guest memory and free it, so the guest
+            // reports the pages and its next writes land on reported pages.
+            _ = try await run("fill", "dd if=/dev/urandom of=/fill/pages bs=1M count=768 2>/dev/null; rm /fill/pages")
+            try await Task.sleep(for: .seconds(5))
+
+            // A reported page is reusable as far as macOS knows, and the guest
+            // writes to it with no word to the device, so only macOS noticing
+            // the write keeps it from freeing the page, and the data on it,
+            // when it next runs short.
+            let written = digest(try await run("write", "dd if=/dev/urandom bs=1M count=1024 2>/dev/null | tee /fill/data | sha256sum"))
+
+            var evicted: UInt64 = 0
+            var atRisk = false
+            do {
+                let before = try helper.usage()
+                let pressure = HostMemoryPressure()
+                defer { pressure.release() }
+                while !atRisk, pressure.bytes < 4.gib() {
+                    try pressure.grow(by: Int(256.mib()))
+                    try await Task.sleep(for: .milliseconds(500))
+                    let now = try helper.usage()
+                    evicted = max(evicted, before.ri_resident_size.saturatingSubtract(now.ri_resident_size))
+                    atRisk = evicted + 64.mib() >= before.ri_resident_size
+                    log.info("free page reporting data under \(pressure.bytes / mib) MiB of pressure: resident=\(now.ri_resident_size / mib) footprint=\(now.ri_phys_footprint / mib)")
                 }
             }
 

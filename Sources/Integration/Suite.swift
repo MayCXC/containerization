@@ -642,6 +642,8 @@ struct IntegrationSuite: AsyncParsableCommand {
                 Test("pod scsi streams against virtio-blk", testPodSCSIStreams),
                 Test("container memory balloon", testContainerMemoryBalloon),
                 Test("container memory balloon keeps guest data", testContainerMemoryBalloonKeepsGuestData),
+                Test("container free page reporting", testContainerFreePageReporting),
+                Test("container free page reporting keeps guest data", testContainerFreePageReportingKeepsGuestData),
                 Test("container memory compaction", testContainerMemoryCompaction),
                 Test("pod memory balloon policy", testPodMemoryBalloonPolicy),
             ]
