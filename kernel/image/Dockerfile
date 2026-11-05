@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     libncurses-dev \
     make \
     openssl \
+    patch \
     python-is-python3 \
 &&  apt-get clean \
 &&  rm -rf /var/lib/apt/lists/*
