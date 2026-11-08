@@ -29,11 +29,14 @@
 # a proc/self/exe -> sbin/vminitd symlink ("hack for swift init's booting").
 # sbin/runc is staged too, but only when --runc is passed — opt-in, not part
 # of the default rootfs.
+# sbin/mem-agent-srv, and bin/busybox with bin/sh, are staged too, but only
+# when --mem-agent and --busybox are passed; they are opt-in and not part of
+# the default rootfs.
 
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 --vminitd PATH --vmexec PATH --ext4 OUT.ext4 [--tar OUT.tar.gz] [--runc PATH] [--size 512M]" >&2
+    echo "usage: $0 --vminitd PATH --vmexec PATH --ext4 OUT.ext4 [--tar OUT.tar.gz] [--runc PATH] [--mem-agent PATH --busybox PATH] [--size 512M]" >&2
     exit 2
 }
 
@@ -42,16 +45,20 @@ VMEXEC=
 EXT4=
 TAR=
 RUNC=
+MEM_AGENT=
+BUSYBOX=
 SIZE=512M
 while [ $# -gt 0 ]; do
     case "$1" in
-        --vminitd) VMINITD=$2; shift 2 ;;
-        --vmexec)  VMEXEC=$2;  shift 2 ;;
-        --ext4)    EXT4=$2;    shift 2 ;;
-        --tar)     TAR=$2;     shift 2 ;;
-        --runc)    RUNC=$2;    shift 2 ;;
-        --size)    SIZE=$2;    shift 2 ;;
-        *)         usage ;;
+        --vminitd)   VMINITD=$2;   shift 2 ;;
+        --vmexec)    VMEXEC=$2;    shift 2 ;;
+        --ext4)      EXT4=$2;      shift 2 ;;
+        --tar)       TAR=$2;       shift 2 ;;
+        --runc)      RUNC=$2;      shift 2 ;;
+        --mem-agent) MEM_AGENT=$2; shift 2 ;;
+        --busybox)   BUSYBOX=$2;   shift 2 ;;
+        --size)      SIZE=$2;      shift 2 ;;
+        *)           usage ;;
     esac
 done
 
@@ -59,6 +66,10 @@ done
 [ -f "$VMINITD" ] || { echo "ERROR: vminitd not found: $VMINITD" >&2; exit 1; }
 [ -f "$VMEXEC" ]  || { echo "ERROR: vmexec not found: $VMEXEC"   >&2; exit 1; }
 [ -z "$RUNC" ] || [ -f "$RUNC" ] || { echo "ERROR: runc not found: $RUNC" >&2; exit 1; }
+[ -z "$MEM_AGENT" ] || [ -f "$MEM_AGENT" ] || { echo "ERROR: mem-agent-srv not found: $MEM_AGENT" >&2; exit 1; }
+[ -z "$BUSYBOX" ] || [ -f "$BUSYBOX" ] || { echo "ERROR: busybox not found: $BUSYBOX" >&2; exit 1; }
+# mem-agent compacts memory through a child `sh`.
+[ -z "$MEM_AGENT" ] || [ -n "$BUSYBOX" ] || { echo "ERROR: --mem-agent needs --busybox for its sh" >&2; exit 1; }
 
 umask 022
 STAGING=$(mktemp -d)
@@ -80,6 +91,12 @@ install -m 0755 "$VMINITD" "$STAGING/sbin/vminitd"
 install -m 0755 "$VMEXEC" "$STAGING/sbin/vmexec"
 # Optional; selected per-container with `--oci-runtime-path /sbin/runc`.
 [ -z "$RUNC" ] || install -m 0755 "$RUNC" "$STAGING/sbin/runc"
+# Optional; started by vminitd when the kernel command line asks for it.
+[ -z "$MEM_AGENT" ] || install -m 0755 "$MEM_AGENT" "$STAGING/sbin/mem-agent-srv"
+if [ -n "$BUSYBOX" ]; then
+    install -m 0755 "$BUSYBOX" "$STAGING/bin/busybox"
+    ln -sf busybox "$STAGING/bin/sh"
+fi
 ln -sf sbin/vminitd "$STAGING/proc/self/exe"
 
 mkdir -p "$(dirname "$EXT4")"
